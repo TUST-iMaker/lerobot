@@ -16,15 +16,19 @@ from typing import Any, Literal
 from app.backend.config import StudioConfig
 from app.backend.hardware import CAMERA_IO_LOCK, HardwareManager
 from app.backend.process_manager import ProcessRegistry
+from app.backend.realtime_bridge import SO101RealBridge, SyncDirection
 from app.backend.simulation import (
     JOINT_NAMES,
     Arm101Simulator,
+    compute_fk_details,
     default_joints,
+    encoder_to_deg,
+    solve_ik_target,
     validate_joint_dict,
 )
 
 
-WorkflowName = Literal["idle", "calibrate", "teleop", "teaching_replay", "collect"]
+WorkflowName = Literal["idle", "calibrate", "teleop", "teaching_replay", "collect", "demo_routine"]
 
 
 class WorkflowConflictError(Exception):
@@ -50,6 +54,7 @@ class WorkflowManager:
         self.hardware = hardware
         self.simulator = simulator
         self.process_registry = process_registry
+        self.bridge = SO101RealBridge(config, simulator)
 
         self.active_workflow: WorkflowName = "idle"
         self.state: str = "idle"
@@ -177,12 +182,32 @@ class WorkflowManager:
     def get_telemetry_frame(self) -> dict[str, Any]:
         self._sync_process_state()
         leader, follower, sim_steps = self.simulator.snapshot()
+        leader_fk = compute_fk_details(leader)
+        follower_fk = compute_fk_details(follower)
+        bridge_st = self.bridge.status()
+        hw_ready = bool(self.hardware.last_probe.get("hardware_ready", False))
         return {
             "timestamp": round(time.time(), 3),
             "mode": self.hardware.active_mode,
             "active_workflow": self.active_workflow,
             "leader_joints": leader,
             "follower_joints": follower,
+            "leader_fk": leader_fk,
+            "follower_fk": follower_fk,
+            "linked_arms": self.simulator.linked_arms,
+            "safety": {
+                "estop_latched": self.simulator.estop_latched,
+                "torque_enabled": self.simulator.torque_enabled,
+                "max_step_deg": self.simulator.max_step_deg,
+                "sync_direction": bridge_st["direction"],
+            },
+            "connection_status": {
+                "hardware_ready": hw_ready,
+                "follower_port": self.config.follower_port,
+                "leader_port": self.config.leader_port,
+                "follower_connected": bridge_st["connected_follower"] or (self.hardware.active_mode == "real" and hw_ready),
+                "leader_connected": bridge_st["connected_leader"] or (self.hardware.active_mode == "real" and hw_ready),
+            },
             "calibration": self.get_calibration_snapshot(),
             "workflow_status": {
                 "state": self.state,
@@ -366,6 +391,15 @@ class WorkflowManager:
                 "pos": vpos,
                 "max": vmax,
             }
+            try:
+                deg_val = encoder_to_deg(motor, float(vpos))
+                target = self._cal_state.get("target", "follower")
+                if target == "leader":
+                    self.simulator.set_leader_joints({motor: deg_val}, step_immediately=False)
+                else:
+                    self.simulator.set_follower_joints({motor: deg_val})
+            except Exception:
+                pass
             return
 
         self.log(line)
@@ -443,6 +477,7 @@ class WorkflowManager:
         }
 
         if self.hardware.active_mode == "real":
+            self.bridge.disconnect(return_to_rest=False, keep_torque=False)
             proc_id = "workflow_calibrate"
             self.process_registry.spawn(
                 proc_id,
@@ -613,6 +648,7 @@ class WorkflowManager:
         )
 
         if self.hardware.active_mode == "real":
+            self.bridge.disconnect(return_to_rest=False, keep_torque=False)
             proc_id = "workflow_teleop"
             self.process_registry.spawn(
                 proc_id, "lerobot_teleoperate", cmd, cwd=self.config.workspace_root, on_line=self.log
@@ -826,6 +862,7 @@ class WorkflowManager:
         self.last_error = None
 
         if self.hardware.active_mode == "real":
+            self.bridge.disconnect(return_to_rest=False, keep_torque=False)
             cmd = self.build_record_cmd(
                 dataset_name=dataset_name,
                 single_task=single_task,
@@ -1059,8 +1096,307 @@ class WorkflowManager:
         )
 
     async def shutdown(self) -> None:
+        self.bridge.disconnect(return_to_rest=False, keep_torque=False)
         self._stop_active_process()
         await self._cancel_background_task()
         self._flush_dry_run_episode()
         self.active_workflow = "idle"
         self.state = "idle"
+
+    # ------------------------------------------------------------------
+    # Safety Controls, Independent Dual-Arm Sim, IK, Presets & Demo Routines
+    # ------------------------------------------------------------------
+    async def trigger_estop(self, reason: str = "Web Studio E-Stop") -> dict[str, Any]:
+        self._stop_active_process()
+        await self._cancel_background_task()
+        self.bridge.trigger_estop(reason=reason)
+        self.simulator.estop_latched = True
+        self.simulator.torque_enabled = False
+        self.active_workflow = "idle"
+        self.state = "estop"
+        self.log(f"[SAFETY] E-STOP triggered: {reason}")
+        return {
+            "status": "estop_latched",
+            "estop_latched": True,
+            "torque_enabled": False,
+            "reason": reason,
+        }
+
+    async def reset_estop(self) -> dict[str, Any]:
+        self.bridge.reset_estop()
+        self.simulator.estop_latched = False
+        self.state = "idle"
+        self.log("[SAFETY] E-STOP reset cleared.")
+        return {
+            "status": "ok",
+            "estop_latched": False,
+            "torque_enabled": self.simulator.torque_enabled,
+        }
+
+    async def set_torque(self, enabled: bool) -> dict[str, Any]:
+        if enabled and self.simulator.estop_latched:
+            raise WorkflowConflictError("急停已锁定，请先解除急停后再使能扭矩。", code="ESTOP_LATCHED")
+        self.bridge.set_torque(enabled)
+        self.simulator.torque_enabled = bool(enabled)
+        self.log(f"[SAFETY] Torque {'enabled' if enabled else 'disabled (sleep)'}.")
+        return {
+            "status": "ok",
+            "torque_enabled": self.simulator.torque_enabled,
+            "estop_latched": self.simulator.estop_latched,
+        }
+
+    def set_sim_joints(
+        self,
+        *,
+        arm: Literal["leader", "follower", "both"],
+        raw_joints: dict[str, Any],
+        linked: bool | None = None,
+    ) -> dict[str, Any]:
+        if self.simulator.estop_latched and arm in ("follower", "both"):
+            raise WorkflowConflictError("急停已锁定 (E-STOP)，无法驱动从臂。", code="ESTOP_LATCHED")
+        if linked is not None:
+            self.simulator.set_linked_arms(linked)
+        validated = validate_joint_dict(raw_joints, require_non_empty=True)
+        leader, follower = self.simulator.set_arm_joints(arm, validated, step_immediately=True)
+        real_dispatched = False
+        if arm in ("follower", "both") or (arm == "leader" and self.simulator.linked_arms):
+            real_dispatched = self.bridge.send_follower_target_deg(follower)
+        return {
+            "status": "ok",
+            "arm": arm,
+            "linked_arms": self.simulator.linked_arms,
+            "leader_joints": leader,
+            "follower_joints": follower,
+            "leader_fk": compute_fk_details(leader),
+            "follower_fk": compute_fk_details(follower),
+            "real_dispatched": real_dispatched,
+        }
+
+    def apply_ik_target(
+        self,
+        *,
+        arm: Literal["leader", "follower", "both"],
+        x_mm: float,
+        y_mm: float,
+        z_mm: float,
+        pitch_deg: float | None = None,
+        gripper: float | None = None,
+    ) -> dict[str, Any]:
+        if self.simulator.estop_latched and arm in ("follower", "both"):
+            raise WorkflowConflictError("急停已锁定 (E-STOP)，无法执行 IK 驱动。", code="ESTOP_LATCHED")
+        leader_cur, follower_cur, _ = self.simulator.snapshot()
+        base_joints = leader_cur if arm == "leader" else follower_cur
+        solved = solve_ik_target(
+            x_mm=x_mm,
+            y_mm=y_mm,
+            z_mm=z_mm,
+            current_joints=base_joints,
+            pitch_deg=pitch_deg,
+            gripper=gripper,
+        )
+        leader, follower = self.simulator.set_arm_joints(arm, solved, step_immediately=True)
+        real_dispatched = False
+        if arm in ("follower", "both"):
+            real_dispatched = self.bridge.send_follower_target_deg(follower)
+        return {
+            "status": "ok",
+            "arm": arm,
+            "solved_joints": solved,
+            "leader_joints": leader,
+            "follower_joints": follower,
+            "leader_fk": compute_fk_details(leader),
+            "follower_fk": compute_fk_details(follower),
+            "real_dispatched": real_dispatched,
+        }
+
+    def set_sync_mode(
+        self,
+        *,
+        direction: SyncDirection,
+        safety_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        res = self.bridge.set_sync_mode(
+            direction,
+            is_real_mode=self.hardware.active_mode == "real",
+            safety_confirmed=safety_confirmed,
+        )
+        self.log(f"[SYNC] Bidirectional sync mode set to '{direction}'.")
+        return res
+
+    def send_control_key(self, key: str, step_mm: float = 8.0) -> dict[str, Any]:
+        res = self.simulator.step_cartesian_key(key, step_mm=step_mm)
+        if res.get("action") == "estop":
+            self.bridge.trigger_estop("Keyboard SPACE E-Stop")
+            self.log("[SAFETY] Keyboard SPACE triggered E-STOP.")
+        else:
+            self.bridge.send_follower_target_deg(res["follower_joints"])
+        return res
+
+    def _load_preset_pose_deg(self, pose_name: str) -> dict[str, float]:
+        try:
+            from core.data_types import JointUnit as SwUnit
+            from core.presets import get_preset_pose
+
+            raw_deg = get_preset_pose(pose_name, unit=SwUnit.DEGREE)
+            out = default_joints()
+            for k in JOINT_NAMES[:5]:
+                if k in raw_deg:
+                    out[k] = round(max(-180.0, min(180.0, float(raw_deg[k]))), 2)
+            if "gripper" in raw_deg:
+                out["gripper"] = round(max(0.0, min(100.0, float(raw_deg["gripper"]))), 2)
+            return out
+        except Exception:
+            fallback: dict[str, dict[str, float]] = {
+                "home": default_joints(),
+                "rest": {
+                    "shoulder_pan": 0.0,
+                    "shoulder_lift": -63.0,
+                    "elbow_flex": 77.0,
+                    "wrist_flex": 12.0,
+                    "wrist_roll": 0.0,
+                    "gripper": 5.0,
+                },
+                "inspect": {
+                    "shoulder_pan": 0.0,
+                    "shoulder_lift": 20.0,
+                    "elbow_flex": 15.0,
+                    "wrist_flex": -35.0,
+                    "wrist_roll": 0.0,
+                    "gripper": 20.0,
+                },
+                "pick_hover": {
+                    "shoulder_pan": 0.0,
+                    "shoulder_lift": 28.0,
+                    "elbow_flex": 23.0,
+                    "wrist_flex": -52.0,
+                    "wrist_roll": 0.0,
+                    "gripper": 75.0,
+                },
+                "wave": {
+                    "shoulder_pan": 0.0,
+                    "shoulder_lift": 37.0,
+                    "elbow_flex": -17.0,
+                    "wrist_flex": 6.0,
+                    "wrist_roll": 40.0,
+                    "gripper": 30.0,
+                },
+            }
+            if pose_name not in fallback:
+                raise ValueError(f"Unknown preset pose '{pose_name}'.")
+            return fallback[pose_name]
+
+    async def run_preset_pose(self, pose_name: str, duration_s: float = 1.2) -> dict[str, Any]:
+        if self.simulator.estop_latched:
+            raise WorkflowConflictError("急停已锁定，请先解除急停。", code="ESTOP_LATCHED")
+        await self._ensure_idle()
+        target = self._load_preset_pose_deg(pose_name)
+        self.active_workflow = "demo_routine"
+        self.state = "running"
+        self.log(f"[PRESET] Moving to '{pose_name}' (S-curve, {duration_s:.1f}s)...")
+
+        async def _animate() -> None:
+            steps = max(8, int(duration_s * 20))
+            _, start_j, _ = self.simulator.snapshot()
+            try:
+                for i in range(1, steps + 1):
+                    alpha = 0.5 * (1.0 - math.cos(math.pi * (i / steps)))
+                    interp = {
+                        k: round(start_j[k] + (target[k] - start_j[k]) * alpha, 2)
+                        for k in JOINT_NAMES
+                    }
+                    self.simulator.set_follower_joints(interp)
+                    if self.simulator.linked_arms:
+                        self.simulator.set_leader_joints(interp, step_immediately=False)
+                    self.bridge.send_follower_target_deg(interp)
+                    await asyncio.sleep(max(0.02, duration_s / steps))
+                if pose_name == "rest":
+                    self.simulator.torque_enabled = False
+                    self.bridge.set_torque(False)
+                    self.log("[PRESET] Reached rest pose & disabled torque.")
+                else:
+                    self.log(f"[PRESET] Reached '{pose_name}'.")
+            except asyncio.CancelledError:
+                raise
+            finally:
+                if self.active_workflow == "demo_routine":
+                    self.active_workflow = "idle"
+                    self.state = "idle"
+
+        self._task = asyncio.create_task(_animate())
+        return {"status": "started", "pose": pose_name, "target_joints": target}
+
+    async def run_demo_routine(self, routine: Literal["wave", "pick"]) -> dict[str, Any]:
+        if self.simulator.estop_latched:
+            raise WorkflowConflictError("急停已锁定，请先解除急停。", code="ESTOP_LATCHED")
+        await self._ensure_idle()
+        self.active_workflow = "demo_routine"
+        self.state = "running"
+        self.log(f"[DEMO] Starting routine '{routine}'...")
+
+        if routine == "wave":
+            w_base = self._load_preset_pose_deg("wave")
+            w_left = {**w_base, "wrist_roll": -45.0, "shoulder_pan": -15.0}
+            w_right = {**w_base, "wrist_roll": 45.0, "shoulder_pan": 15.0}
+            seq = [w_base, w_left, w_right, w_left, w_right, self._load_preset_pose_deg("rest")]
+        else:
+            hover = self._load_preset_pose_deg("pick_hover")
+            grasp = {**hover, "shoulder_lift": hover["shoulder_lift"] + 12.0, "gripper": 12.0}
+            lift = {**hover, "gripper": 12.0}
+            place = {**hover, "shoulder_pan": 35.0, "gripper": 75.0}
+            seq = [hover, grasp, lift, place, self._load_preset_pose_deg("rest")]
+
+        async def _run_seq() -> None:
+            try:
+                for tgt in seq:
+                    _, start_j, _ = self.simulator.snapshot()
+                    for i in range(1, 9):
+                        alpha = 0.5 * (1.0 - math.cos(math.pi * (i / 8)))
+                        interp = {
+                            k: round(start_j[k] + (tgt[k] - start_j[k]) * alpha, 2)
+                            for k in JOINT_NAMES
+                        }
+                        self.simulator.set_follower_joints(interp)
+                        if self.simulator.linked_arms:
+                            self.simulator.set_leader_joints(interp, step_immediately=False)
+                        self.bridge.send_follower_target_deg(interp)
+                        await asyncio.sleep(0.03)
+                self.simulator.torque_enabled = False
+                self.bridge.set_torque(False)
+                self.log(f"[DEMO] Routine '{routine}' finished (parked at rest, torque disabled).")
+            except asyncio.CancelledError:
+                raise
+            finally:
+                if self.active_workflow == "demo_routine":
+                    self.active_workflow = "idle"
+                    self.state = "idle"
+
+        self._task = asyncio.create_task(_run_seq())
+        return {"status": "started", "routine": routine, "steps": len(seq)}
+
+    def save_custom_pose(self, target: Literal["home", "rest"]) -> dict[str, Any]:
+        _, follower, _ = self.simulator.snapshot()
+        filename = "upright_pose.json" if target == "home" else "rest_pose.json"
+        out_path = self.config.workspace_root / "software" / filename
+        payload = {
+            "unit": "degree",
+            "joints": {f"{k}.pos": follower[k] for k in JOINT_NAMES},
+        }
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.log(f"[POSE] Saved current follower pose to software/{filename}.")
+        return {"status": "saved", "target": target, "path": f"software/{filename}", "joints": follower}
+
+    def get_episode_frames(self, dataset_name: str, episode_index: int) -> dict[str, Any]:
+        if ".." in dataset_name or "/" in dataset_name or "\\" in dataset_name:
+            raise ValueError("Invalid dataset_name.")
+        ep_file = (
+            self.config.dry_run_dir
+            / "datasets"
+            / dataset_name
+            / "episodes"
+            / f"episode_{episode_index:04d}.json"
+        )
+        if not ep_file.is_file():
+            raise FileNotFoundError(f"Episode {episode_index} not found in dataset '{dataset_name}'.")
+        data = json.loads(ep_file.read_text(encoding="utf-8"))
+        return data

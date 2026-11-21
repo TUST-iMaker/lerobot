@@ -8,10 +8,14 @@
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows does not provide fcntl / V4L2
+    fcntl = None  # type: ignore[assignment]
 import glob
 import logging
 import os
+import platform
 import struct
 from pathlib import Path
 
@@ -30,12 +34,37 @@ V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
 
 
 def discover_cameras() -> list[CameraDeviceInfo]:
-    """探测系统上所有物理 USB 相机设备节点.
+    """探测系统上所有物理 USB 相机设备节点 (Linux V4L2 / Windows DirectShow).
     
     Returns:
         包含硬件名称、驱动属性、支持格式列表的 CameraDeviceInfo 列表 (按 index 排序).
     """
     discovered: list[CameraDeviceInfo] = []
+
+    if fcntl is None or platform.system() == "Windows":
+        try:
+            import cv2
+        except ImportError:
+            return discovered
+        for idx in range(4):
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            try:
+                if cap.isOpened():
+                    discovered.append(
+                        CameraDeviceInfo(
+                            index=idx,
+                            device_path=str(idx),
+                            card_name=f"Camera {idx} (DirectShow)",
+                            driver_name="dshow",
+                            bus_info=f"dshow:{idx}",
+                            is_capture=True,
+                            is_metadata=False,
+                            supported_formats=["MJPG"],
+                        )
+                    )
+            finally:
+                cap.release()
+        return discovered
 
     # 1. 建立 /dev/v4l/by-id 的真实物理路径映射 (如果存在)
     by_id_map: dict[str, str] = {}

@@ -25,11 +25,16 @@ import argparse
 import math
 import select
 import sys
-import termios
 import time
-import tty
 from pathlib import Path
 from typing import Any
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 
 # Ensure software root is on sys.path
 _here = Path(__file__).resolve().parent
@@ -61,21 +66,30 @@ from teleop.coordinate_tool import (
 
 
 class NonBlockingTerminal:
-    """Linux 终端无缓冲非阻塞读取上下文管理器."""
+    """跨平台终端无缓冲非阻塞读取上下文管理器 (Linux termios / Windows msvcrt)."""
 
     def __enter__(self) -> NonBlockingTerminal:
-        if sys.stdin.isatty():
+        self.old_settings = None
+        if termios is not None and tty is not None and sys.stdin.isatty():
             self.old_settings = termios.tcgetattr(sys.stdin)
             tty.setcbreak(sys.stdin.fileno())
-        else:
-            self.old_settings = None
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if self.old_settings is not None:
+        if termios is not None and self.old_settings is not None:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
 
     def read_key(self, timeout_s: float = 0.05) -> str | None:
+        if sys.platform == "win32":
+            import msvcrt
+
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                if msvcrt.kbhit():
+                    char = msvcrt.getwch()
+                    return "ESC" if char == "\x1b" else char
+                time.sleep(0.01)
+            return None
         rlist, _, _ = select.select([sys.stdin], [], [], timeout_s)
         if rlist:
             char = sys.stdin.read(1)
