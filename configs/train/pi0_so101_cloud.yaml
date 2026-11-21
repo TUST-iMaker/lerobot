@@ -1,0 +1,57 @@
+# Pi0 Fine-Tuning Config for SO-ARM101 (Cloud GPU: A100 40/80GB or L40S/4090 with freeze/LoRA)
+# Schema: lerobot v0.7.1 TrainPipelineConfig + PI0Config
+# Reference: docs/source/pi0.mdx & src/lerobot/policies/pi0/configuration_pi0.py
+# NOTE: Uses `policy.type: pi0` + `policy.pretrained_path: lerobot/pi0_base` (weights only),
+# so observation/action feature shapes are inferred directly from your SO-101 dataset.
+#
+# Run:
+#   lerobot-train --config_path=configs/train/pi0_so101_cloud.yaml \
+#     --dataset.repo_id=${HF_USER}/arm101_task
+
+dataset:
+  repo_id: your_hf_user/arm101_demo_dataset
+
+policy:
+  type: pi0
+  pretrained_path: lerobot/pi0_base
+  device: cuda
+  dtype: bfloat16
+  push_to_hub: false
+  repo_id: your_hf_user/pi0_arm101_demo
+  chunk_size: 50
+  n_action_steps: 50
+  max_state_dim: 32
+  max_action_dim: 32
+  gradient_checkpointing: true
+  compile_model: true
+  freeze_vision_encoder: false  # Set true + train_expert_only: true for lower VRAM (~24GB)
+  train_expert_only: false
+  optimizer_lr: 2.5e-5
+  optimizer_fused: true
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 30000
+  scheduler_decay_lr: 2.5e-6
+
+# Optional: map SO-101 camera names if using checkpoints expecting specific camera keys
+# rename_map:
+#   observation.images.front: observation.images.base_0_rgb
+#   observation.images.wrist: observation.images.left_wrist_0_rgb
+
+output_dir: models/checkpoints/pi0_so101
+job_name: pi0_so101_cloud
+seed: 1000
+batch_size: 32  # Reduce to 8-16 on 24-40GB GPUs
+num_workers: 4
+steps: 3000
+log_freq: 100
+save_checkpoint: true
+save_freq: 1000
+use_policy_training_preset: true
+
+trackio:
+  enable: false
+  project: tust-arm101
+
+job:
+  target: null  # e.g. "a100-large" for HF Jobs
+  timeout: 24h

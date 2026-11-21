@@ -1,0 +1,49 @@
+# ==============================================================================
+# Non-Duplicate Upstream Repository Registry (`scripts/common/bootstrap_repos.py`)
+# Add new upstream dependencies here instead of manually cloning ad-hoc folders.
+# ==============================================================================
+repos:
+  - name: lerobot
+    url: https://github.com/huggingface/lerobot.git
+    branch: main
+    depth: 1
+    submodules: false
+    lfs_skip_smudge: true
+    os_support: [windows, ubuntu]
+    purpose: Official Hugging Face LeRobot core framework (SO-101, ACT, SmolVLA, Pi0, Pi0.5)
+
+  - name: leLab
+    url: https://github.com/huggingface/leLab.git
+    branch: main
+    depth: 1
+    submodules: false
+    lfs_skip_smudge: false
+    os_support: [windows, ubuntu]
+    purpose: Official Hugging Face LeRobot Web Studio frontend (optional isolated tool)
+
+  - name: openpi
+    url: https://github.com/Physical-Intelligence/openpi.git
+    branch: main
+    depth: 1
+    submodules: false
+    lfs_skip_smudge: false
+    os_support: [ubuntu]
+    purpose: Physical Intelligence OpenPI (pi0 / pi0-FAST / pi0.5 JAX & PyTorch, Ubuntu/Cloud only)
+
+  - name: SO-ARM100
+    url: https://github.com/TheRobotStudio/SO-ARM100.git
+    branch: main
+    depth: 1
+    submodules: false
+    lfs_skip_smudge: false
+    os_support: [windows, ubuntu]
+    purpose: Official SO-ARM100 / SO-ARM101 (arm101) CAD, STL/STEP, URDF, and hardware docs
+
+  - name: feetech-motorlab
+    url: https://github.com/Nori-Robotics/feetech-motorlab.git
+    branch: main
+    depth: 1
+    submodules: false
+    lfs_skip_smudge: false
+    os_support: [windows, ubuntu]
+    purpose: Feetech STS3215 servo ID setup, bus scan, and motor diagnostics Web UI

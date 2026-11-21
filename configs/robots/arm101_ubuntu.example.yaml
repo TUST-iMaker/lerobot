@@ -1,0 +1,56 @@
+# SO-ARM101 (arm101) Ubuntu Teleoperation & Robot Profile
+# Schema: lerobot v0.7.1 TeleoperateConfig (src/lerobot/scripts/lerobot_teleoperate.py)
+# Usage:
+#   1. Copy to configs/robots/arm101_ubuntu.yaml and set /dev/ttyACM* (or udev symlinks).
+#   2. Discover ports: lerobot-find-port  (ensure user is in `dialout` group / udev rules applied)
+#   3. Discover cameras: lerobot-find-cameras opencv
+#   4. Teleoperate: lerobot-teleoperate --config_path=configs/robots/arm101_ubuntu.yaml
+#   Note: lerobot-calibrate accepts ONLY --robot.* OR --teleop.* (not both in one config).
+
+robot:
+  type: so101_follower
+  port: /dev/ttyACM0  # Or persistent udev symlink e.g. /dev/arm101_follower
+  id: arm101_follower_01
+  calibration_dir: data/calibration/robots/so_follower
+  disable_torque_on_disconnect: true
+  # max_relative_target: 10.0
+  use_degrees: true
+  position_p_coefficient: 16
+  position_i_coefficient: 0
+  position_d_coefficient: 32
+  num_read_retries: 2
+  cameras:
+    front:
+      type: opencv
+      index_or_path: 0  # Or V4L2 device path e.g. /dev/video0
+      width: 640
+      height: 480
+      fps: 30
+      color_mode: rgb
+      rotation: 0
+      warmup_s: 1
+      # fourcc: MJPG
+      # backend: 200  # OpenCV Cv2Backends: 0=ANY, 200=V4L2 (Linux)
+    wrist:
+      type: opencv
+      index_or_path: 2  # Often even indices on Linux V4L2 (/dev/video0, /dev/video2)
+      width: 640
+      height: 480
+      fps: 30
+      color_mode: rgb
+      rotation: 0
+      warmup_s: 1
+
+teleop:
+  type: so101_leader
+  port: /dev/ttyACM1  # Or persistent udev symlink e.g. /dev/arm101_leader
+  id: arm101_leader_01
+  calibration_dir: data/calibration/teleoperators/so_leader
+  use_degrees: true
+  num_read_retries: 2
+
+fps: 60
+teleop_time_s: null
+display_data: true
+display_mode: rerun  # "rerun" or "foxglove"
+display_compressed_images: false

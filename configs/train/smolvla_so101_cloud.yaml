@@ -1,0 +1,51 @@
+# SmolVLA Fine-Tuning Config for SO-ARM101 (Cloud GPU: A10G / L4 / 4090 >= 16-24 GB VRAM)
+# Schema: lerobot v0.7.1 TrainPipelineConfig + SmolVLAConfig (loaded via policy.path)
+# Reference: docs/source/smolvla.mdx & tests/test_yaml_policy_path.py
+# NOTE: Because `policy.path` is used, `policy.type` is omitted; parser.py extracts
+# `policy.path` and passes sibling keys as overrides to PreTrainedConfig.from_pretrained().
+#
+# Run locally on rented GPU (AutoDL / Featurize):
+#   lerobot-train --config_path=configs/train/smolvla_so101_cloud.yaml \
+#     --dataset.repo_id=${HF_USER}/arm101_task
+# Run via Hugging Face Jobs:
+#   lerobot-train --config_path=configs/train/smolvla_so101_cloud.yaml \
+#     --dataset.repo_id=${HF_USER}/arm101_task --job.target=a10g-small
+
+dataset:
+  repo_id: your_hf_user/arm101_demo_dataset
+
+policy:
+  path: lerobot/smolvla_base
+  device: cuda
+  push_to_hub: false
+  repo_id: your_hf_user/smolvla_arm101_demo
+  freeze_vision_encoder: true
+  train_expert_only: true
+  train_state_proj: true
+  chunk_size: 50
+  n_action_steps: 50
+  # Adjust camera key mapping to match your recorded dataset vs smolvla_base (camera1, camera2, camera3)
+
+rename_map:
+  observation.images.front: observation.images.camera1
+  observation.images.wrist: observation.images.camera2
+
+output_dir: models/checkpoints/smolvla_so101
+job_name: smolvla_so101_cloud
+seed: 1000
+batch_size: 64
+num_workers: 4
+steps: 20000
+log_freq: 200
+save_checkpoint: true
+save_freq: 5000
+use_policy_training_preset: true
+
+trackio:
+  enable: false
+  project: tust-arm101
+  # space_id: your_hf_user/tust-trackio  # Required if using --job.target
+
+job:
+  target: null  # Set to e.g. "a10g-small" or "l4x1" for HF Jobs
+  timeout: 12h

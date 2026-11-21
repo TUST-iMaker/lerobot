@@ -1,0 +1,74 @@
+# ==============================================================================
+# TUST-iMaker LeRobot Workspace .gitignore
+# ==============================================================================
+
+# Cloned upstream repositories & OS-specific virtualenvs (provisioned locally)
+repos/
+envs/
+.venv/
+venv/
+
+# Python caches & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+develop-eggs/
+eggs/
+.eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment secrets & local overrides
+.env
+.env.local
+.env.*.local
+
+# Personalized hardware profiles (keep *.example.yaml templates tracked!)
+configs/robots/*.yaml
+!configs/robots/*.example.yaml
+
+# Data, calibration, dry-run artifacts (keep README.md and folder skeleton via .gitkeep)
+data/*
+!data/README.md
+!data/datasets/
+data/datasets/*
+!data/datasets/.gitkeep
+!data/calibration/
+data/calibration/*
+!data/calibration/.gitkeep
+!data/dry_run/
+data/dry_run/*
+!data/dry_run/.gitkeep
+
+# Models & checkpoints (keep README.md and folder skeleton via .gitkeep)
+models/*
+!models/README.md
+!models/pretrained/
+models/pretrained/*
+!models/pretrained/.gitkeep
+!models/checkpoints/
+models/checkpoints/*
+!models/checkpoints/.gitkeep
+
+# Runtime logs (keep README.md and .gitkeep)
+logs/*
+!logs/README.md
+!logs/.gitkeep
+
+# Editors & OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
