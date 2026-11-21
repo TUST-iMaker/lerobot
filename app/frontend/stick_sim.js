@@ -81,7 +81,7 @@ export function computeStickFK(joints) {
       y: pts.tcp[1],
       z: pts.tcp[2],
       r: r4,
-      pitchDeg: ((Math.PI / 2 - phi4) * 180) / Math.PI,
+      pitchDeg: ((phi4 - Math.PI / 2) * 180) / Math.PI,
       rollDeg: wristR,
       gripperPct: grip,
     },
@@ -147,12 +147,18 @@ export class StickArmCanvas {
     this._lastTcpScreen = null;
     this._dragMode = null; // "orbit" | "ik"
     this._lastMouse = { x: 0, y: 0 };
+    this._dragStartMouse = null;
+    this._dragStartTcp = null;
     this._ikThrottleTs = 0;
 
     if (this.canvas) {
       this._bindPointerEvents();
       this.render();
     }
+  }
+
+  isDraggingIk() {
+    return this._dragMode === "ik";
   }
 
   setIkEnabled(enabled) {
@@ -214,7 +220,15 @@ export class StickArmCanvas {
         const dx = pos.x - this._lastTcpScreen.x;
         const dy = pos.y - this._lastTcpScreen.y;
         if (Math.hypot(dx, dy) <= 28) {
+          const fk = computeStickFK(this.joints);
           this._dragMode = "ik";
+          this._dragStartMouse = pos;
+          this._dragStartTcp = {
+            r: fk.tcp.r,
+            z: fk.tcp.z,
+            pan: fk.pan,
+            pitchDeg: fk.tcp.pitchDeg,
+          };
           this.canvas.setPointerCapture(ev.pointerId);
           return;
         }
@@ -234,22 +248,24 @@ export class StickArmCanvas {
         this.camYaw += dx * 0.01;
         this.camPitch = Math.max(-0.5, Math.min(1.2, this.camPitch + dy * 0.008));
         this.render();
-      } else if (this._dragMode === "ik" && this.onIkDrag) {
+      } else if (this._dragMode === "ik" && this.onIkDrag && this._dragStartMouse && this._dragStartTcp) {
         const now = performance.now();
-        if (now - this._ikThrottleTs < 55) return;
+        if (now - this._ikThrottleTs < 45) return;
         this._ikThrottleTs = now;
-        const fk = computeStickFK(this.joints);
         const scale = Math.min(this.canvas.width, this.canvas.height) / 460;
-        const dForward = dx / Math.max(0.2, scale);
-        const dUp = -dy / Math.max(0.2, scale);
-        const pan = fk.pan;
-        const newR = Math.max(60, Math.min(315, fk.tcp.r + dForward));
-        const newZ = Math.max(30, Math.min(360, fk.tcp.z + dUp));
+        const totalDx = pos.x - this._dragStartMouse.x;
+        const totalDy = pos.y - this._dragStartMouse.y;
+        const dForward = totalDx / Math.max(0.2, scale);
+        const dUp = -totalDy / Math.max(0.2, scale);
+        const pan = this._dragStartTcp.pan;
+        const newR = Math.max(60, Math.min(315, this._dragStartTcp.r + dForward));
+        const newZ = Math.max(30, Math.min(360, this._dragStartTcp.z + dUp));
         this.onIkDrag({
           arm: this.role,
           x_mm: Number((newR * Math.cos(pan)).toFixed(1)),
           y_mm: Number((newR * Math.sin(pan)).toFixed(1)),
           z_mm: Number(newZ.toFixed(1)),
+          pitch_deg: Number(this._dragStartTcp.pitchDeg.toFixed(1)),
           gripper: this.joints.gripper,
         });
       }
@@ -257,6 +273,8 @@ export class StickArmCanvas {
 
     const endDrag = () => {
       this._dragMode = null;
+      this._dragStartMouse = null;
+      this._dragStartTcp = null;
     };
     this.canvas.addEventListener("pointerup", endDrag);
     this.canvas.addEventListener("pointercancel", endDrag);

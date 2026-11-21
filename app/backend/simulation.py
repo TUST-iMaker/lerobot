@@ -140,7 +140,7 @@ def compute_fk_details(joints: dict[str, float]) -> dict[str, Any]:
         "wrist": [round(r3 * cp, 2), round(r3 * sp, 2), round(z3, 2)],
         "tcp": [round(r4 * cp, 2), round(r4 * sp, 2), round(z4, 2)],
     }
-    pitch_deg = round(math.degrees(math.pi / 2.0 - phi4), 2)
+    pitch_deg = round(math.degrees(phi4 - math.pi / 2.0), 2)
     body_errors = [abs(float(joints.get(k, 0.0))) for k in JOINT_NAMES[:5]]
     max_homing_err = round(max(body_errors), 2) if body_errors else 0.0
 
@@ -201,9 +201,14 @@ def solve_ik_target(
                 or f"目标点 ({x_mm:.1f}, {y_mm:.1f}, {z_mm:.1f}) mm 超出 SO-101 物理工作空间范围。"
             )
         result: dict[str, float] = {}
+        max_step = 24.0
         for k in JOINT_NAMES[:5]:
             lo, hi, _ = JOINT_SPECS[k]
-            deg_val = math.degrees(float(solved_rad[k]))
+            deg_val = max(lo, min(hi, math.degrees(float(solved_rad[k]))))
+            cur_val = float(current_joints.get(k, 0.0))
+            delta = deg_val - cur_val
+            if abs(delta) > max_step:
+                deg_val = cur_val + math.copysign(max_step, delta)
             result[k] = round(max(lo, min(hi, deg_val)), 2)
         result["gripper"] = round(target_grip, 2)
         return result
