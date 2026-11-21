@@ -65,6 +65,10 @@ logs/*
 !logs/README.md
 !logs/.gitkeep
 
+# aguiya software/ local-only files
+software/AGENTS.md
+software/recording/data/*
+
 # Editors & OS metadata
 .vscode/
 .idea/
