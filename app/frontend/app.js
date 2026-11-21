@@ -162,12 +162,14 @@ function initStickCanvases() {
     title: "主臂 Leader 6-DOF (独立控制)",
     accent: "#3b82f6",
   });
-  stickViews.simFollower = new StickArmCanvas($("canvas-sim-follower"), {
-    role: "follower",
-    title: "从臂 Follower 6-DOF (拖拽红圈=IK)",
-    accent: "#10b981",
-    enableIkDrag: true,
-    onIkDrag: async (req) => {
+  let ikInFlight = false;
+  let ikPendingReq = null;
+  const drainIkQueue = async () => {
+    if (ikInFlight || !ikPendingReq) return;
+    ikInFlight = true;
+    while (ikPendingReq) {
+      const req = ikPendingReq;
+      ikPendingReq = null;
       const res = await apiFetch("/api/sim/ik", {
         method: "POST",
         body: JSON.stringify(req),
@@ -178,6 +180,18 @@ function initStickCanvases() {
         if ($("ik-y")) $("ik-y").value = String(req.y_mm);
         if ($("ik-z")) $("ik-z").value = String(req.z_mm);
       }
+    }
+    ikInFlight = false;
+  };
+
+  stickViews.simFollower = new StickArmCanvas($("canvas-sim-follower"), {
+    role: "follower",
+    title: "从臂 Follower 6-DOF (拖拽红圈=IK)",
+    accent: "#10b981",
+    enableIkDrag: true,
+    onIkDrag: (req) => {
+      ikPendingReq = req;
+      drainIkQueue();
     },
   });
   stickViews.teach = new StickArmCanvas($("canvas-teach-stick"), {
@@ -936,11 +950,15 @@ function connectWebSocket() {
         }
         if (msg.safety) updateSafetyUI(msg.safety);
         if (msg.connection_status) updateConnectionBadge(msg.connection_status);
+        const isDraggingIk = Boolean(stickViews.simFollower?.isDraggingIk?.());
         const shouldSyncSliders =
-          wf === "teaching_replay" ||
-          wf === "demo_routine" ||
-          msg.safety?.sync_direction === "real_to_sim";
-        updateJointGauges(msg.leader_joints, msg.follower_joints, shouldSyncSliders);
+          !isDraggingIk &&
+          (wf === "teaching_replay" ||
+            wf === "demo_routine" ||
+            msg.safety?.sync_direction === "real_to_sim");
+        if (!isDraggingIk) {
+          updateJointGauges(msg.leader_joints, msg.follower_joints, shouldSyncSliders);
+        }
         if (msg.workflow_status) {
           const colProg = $("collect-progress-text");
           if (colProg) {

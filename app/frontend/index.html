@@ -388,17 +388,17 @@
           </div>
         </div>
 
-        <!-- Team Multi-Person Data Specification Card -->
+        <!-- Official LeRobotDataset v3.0 Specification Card -->
         <div class="spec-box" data-testid="data-spec-card" id="data-spec-card">
           <div class="panel-toolbar">
-            <strong>📋 TUST-iMaker 多人协作数据采集规范（详见 docs/02_arm101_workflow/05_data_spec.md）</strong>
+            <strong>📋 官方 LeRobotDataset v3.0 标准数据模板（对齐 repos/lerobot v0.7.1，详见 docs/02_arm101_workflow/05_data_spec.md）</strong>
             <span id="spec-check-badge" class="pill pill-ok">规范校验: 通过</span>
           </div>
           <ul class="spec-list">
-            <li><strong>数据集命名</strong>：建议 <code>&lt;成员&gt;_&lt;动词&gt;_&lt;物体&gt;_&lt;日期&gt;</code>（如 <code>yyzmiao_pick_cube_20261121</code>），严禁 <code>eval_</code> 前缀、中文或空格。</li>
-            <li><strong>必采 6-DOF 特征</strong>：<code>observation.state</code>（从臂）+ <code>action</code>（主臂），统一 <code>use_degrees=true</code>，固定顺序 <code>shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper</code>。</li>
-            <li><strong>必采相机键名</strong>：标准双视角固定为 <code>observation.images.front</code> + <code>observation.images.wrist</code>（<code>640×480 @ 30fps</code>）；单相机也必须命名为 <code>front</code>（禁用不统一键名）。</li>
-            <li><strong>指令与质检</strong>：固定 <code>fps=30</code>；同一任务使用完全一致的英文 <code>single_task</code>；建议每任务 ≥ 50 条有效回合，上传前确保 <code>meta/stats.json</code> 含 <code>q01/q99</code>（兼容 <code>pi0.5</code>）。</li>
+            <li><strong>官方目录结构</strong>：<code>meta/info.json</code>（<code>codebase_version="v3.0"</code>）+ <code>meta/stats.json</code> + <code>meta/tasks.parquet</code> + <code>meta/episodes/chunk-000/file-000.parquet</code> + <code>data/chunk-000/file-000.parquet</code> + <code>videos/&lt;key&gt;/chunk-000/file-000.mp4</code> + <code>README.md</code>（官方 <code>card_template.md</code>）。</li>
+            <li><strong>官方必采特征（DEFAULT_FEATURES + SO-101）</strong>：<code>observation.state</code> &amp; <code>action</code>（<code>float32[6]</code>，顺序 <code>shoulder_pan.pos, shoulder_lift.pos, elbow_flex.pos, wrist_flex.pos, wrist_roll.pos, gripper.pos</code>）+ <code>timestamp, frame_index, episode_index, index, task_index</code>。</li>
+            <li><strong>官方相机键名</strong>：<code>observation.images.front</code> + <code>observation.images.wrist</code>（<code>video [480, 640, 3] @ 30fps</code>）；单相机统一命名为 <code>front</code>。</li>
+            <li><strong>Hugging Face Hub 命名与上传</strong>：<code>repo_id="${HF_USER}/&lt;dataset_name&gt;"</code>，严禁 <code>eval_</code> 前缀；登录 <code>hf auth login</code> 后通过 <code>--dataset.push_to_hub=true</code> 推送至云端，支持浏览器在线可视化与 <code>--dataset.streaming=true</code> 流式训练。</li>
           </ul>
         </div>
 
