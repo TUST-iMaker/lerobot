@@ -46,12 +46,30 @@ class CalibrateStartRequest(BaseModel):
         return self
 
 
+class CalibrateInputRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    value: str = ""
+
+
+class HardwareConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    follower_port: str | None = None
+    leader_port: str | None = None
+    follower_id: str | None = None
+    leader_id: str | None = None
+    front_camera_id: str | None = None
+    wrist_camera_id: str | None = None
+    persist_env: bool = True
+    auto_detect: bool = False
+
+
 class TeleopStartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     fps: int = Field(default=60, ge=1, le=120)
     follower_port: str | None = None
     leader_port: str | None = None
     display_data: bool = False
+    use_cameras: bool = False
 
 
 class TeleopJointsRequest(BaseModel):
@@ -217,14 +235,85 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     @fastapi_app.get("/api/hardware/probe")
     async def hardware_probe() -> dict[str, Any]:
         rt = _rt()
-        data = rt.hardware.probe()
+        data = await asyncio.to_thread(rt.hardware.probe)
         data["robot_profile"] = rt.config.load_robot_profile()
         return data
+
+    @fastapi_app.post("/api/hardware/config")
+    async def hardware_config(req: HardwareConfigRequest) -> dict[str, Any]:
+        rt = _rt()
+        if req.auto_detect:
+            serial_ports = await asyncio.to_thread(rt.hardware.probe_serial_ports)
+            cameras = await asyncio.to_thread(rt.hardware.probe_cameras)
+            rt.hardware.auto_match_devices(serial_ports, cameras, force=True)
+        else:
+            f_port = (
+                req.follower_port.strip()
+                if req.follower_port is not None
+                else rt.config.follower_port
+            )
+            l_port = (
+                req.leader_port.strip()
+                if req.leader_port is not None
+                else rt.config.leader_port
+            )
+            if f_port and l_port and f_port == l_port:
+                raise HTTPException(
+                    status_code=422,
+                    detail="从臂串口与主臂串口不能选择同一个端口。",
+                )
+
+            front_cam = (
+                req.front_camera_id.strip()
+                if req.front_camera_id is not None
+                else rt.config.front_camera_id
+            )
+            wrist_cam = (
+                req.wrist_camera_id.strip()
+                if req.wrist_camera_id is not None
+                else rt.config.wrist_camera_id
+            )
+            if (
+                front_cam
+                and wrist_cam
+                and front_cam.lower() != "none"
+                and wrist_cam.lower() != "none"
+                and front_cam == wrist_cam
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="前置相机与腕部相机不能选择同一个摄像头设备。",
+                )
+
+            if f_port:
+                rt.config.follower_port = f_port
+            if l_port:
+                rt.config.leader_port = l_port
+            if req.follower_id is not None and req.follower_id.strip():
+                rt.config.follower_id = req.follower_id.strip()
+            if req.leader_id is not None and req.leader_id.strip():
+                rt.config.leader_id = req.leader_id.strip()
+            if req.front_camera_id is not None:
+                rt.config.front_camera_id = front_cam or "none"
+            if req.wrist_camera_id is not None:
+                rt.config.wrist_camera_id = wrist_cam or "none"
+
+        saved_env = rt.config.save_device_overrides(persist_env=req.persist_env)
+        probe_data = await asyncio.to_thread(rt.hardware.probe)
+        probe_data["robot_profile"] = rt.config.load_robot_profile()
+        probe_data["saved_env"] = saved_env
+        probe_data["persisted_to_env"] = req.persist_env
+        rt.workflows.log(
+            f"Updated device mapping: follower={rt.config.follower_port}, "
+            f"leader={rt.config.leader_port}, front_cam={rt.config.front_camera_id}, "
+            f"wrist_cam={rt.config.wrist_camera_id}."
+        )
+        return probe_data
 
     @fastapi_app.post("/api/mode")
     async def set_mode(req: ModeRequest) -> JSONResponse:
         rt = _rt()
-        ok, payload = rt.hardware.set_mode(req.mode)
+        ok, payload = await asyncio.to_thread(rt.hardware.set_mode, req.mode)
         if not ok:
             rt.workflows.log(f"Mode switch to '{req.mode}' rejected: hardware not ready.")
             return JSONResponse(status_code=409, content=payload)
@@ -251,6 +340,14 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
         except WorkflowConflictError as exc:
             raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
 
+    @fastapi_app.post("/api/workflows/calibrate/input")
+    async def calibrate_input(req: CalibrateInputRequest | None = None) -> dict[str, Any]:
+        body = req or CalibrateInputRequest()
+        try:
+            return await _rt().workflows.send_calibrate_input(body.value)
+        except WorkflowConflictError as exc:
+            raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
+
     @fastapi_app.post("/api/workflows/calibrate/stop")
     async def calibrate_stop() -> dict[str, Any]:
         return await _rt().workflows.stop_calibrate()
@@ -264,6 +361,7 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
                 follower_port=body.follower_port,
                 leader_port=body.leader_port,
                 display_data=body.display_data,
+                use_cameras=body.use_cameras,
             )
         except WorkflowConflictError as exc:
             raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
@@ -328,7 +426,7 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     @fastapi_app.get("/api/cameras/{cam_id}/frame")
     async def camera_frame(cam_id: str) -> Response:
         try:
-            jpg = _rt().workflows.get_camera_jpeg(cam_id)
+            jpg = await asyncio.to_thread(_rt().workflows.get_camera_jpeg, cam_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
         return Response(

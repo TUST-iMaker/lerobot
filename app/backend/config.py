@@ -41,6 +41,7 @@ class StudioConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     workspace_root: Path
+    env_file: Path
     data_dir: Path
     datasets_dir: Path
     calibration_dir: Path
@@ -102,6 +103,48 @@ class StudioConfig(BaseModel):
         except Exception:
             pass
         return {}
+
+    def save_device_overrides(self, *, persist_env: bool = True) -> dict[str, str]:
+        """Persist current arm ports, IDs, and camera selections to env_file."""
+        is_win = platform.system() == "Windows"
+        updates = {
+            ("ARM101_FOLLOWER_PORT_WIN" if is_win else "ARM101_FOLLOWER_PORT_UBUNTU"): self.follower_port,
+            ("ARM101_LEADER_PORT_WIN" if is_win else "ARM101_LEADER_PORT_UBUNTU"): self.leader_port,
+            "ARM101_FOLLOWER_ID": self.follower_id,
+            "ARM101_LEADER_ID": self.leader_id,
+            "ARM101_FRONT_CAMERA_ID": self.front_camera_id,
+            "ARM101_WRIST_CAMERA_ID": self.wrist_camera_id,
+        }
+        if not persist_env:
+            return updates
+
+        example_file = self.workspace_root / ".env.example"
+        if self.env_file.exists():
+            raw_lines = self.env_file.read_text(encoding="utf-8").splitlines()
+        elif example_file.exists():
+            raw_lines = example_file.read_text(encoding="utf-8").splitlines()
+        else:
+            raw_lines = []
+
+        seen: set[str] = set()
+        out_lines: list[str] = []
+        for line in raw_lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in line:
+                key = line.split("=", 1)[0].strip()
+                if key in updates:
+                    out_lines.append(f"{key}={updates[key]}")
+                    seen.add(key)
+                    continue
+            out_lines.append(line)
+
+        for key, val in updates.items():
+            if key not in seen:
+                out_lines.append(f"{key}={val}")
+
+        self.env_file.parent.mkdir(parents=True, exist_ok=True)
+        self.env_file.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        return updates
 
     def load_vla_configs(self) -> list[dict[str, Any]]:
         """Read versioned VLA/training YAML profiles from configs/train/."""
@@ -197,6 +240,7 @@ def load_config() -> StudioConfig:
 
     cfg = StudioConfig(
         workspace_root=root,
+        env_file=env_file,
         data_dir=data_dir,
         datasets_dir=data_dir / "datasets",
         calibration_dir=data_dir / "calibration",

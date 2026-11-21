@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import re
 import sys
 import time
 from collections import deque
@@ -12,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from app.backend.config import StudioConfig
-from app.backend.hardware import HardwareManager
+from app.backend.hardware import CAMERA_IO_LOCK, HardwareManager
 from app.backend.process_manager import ProcessRegistry
 from app.backend.simulation import (
     JOINT_NAMES,
@@ -60,8 +62,38 @@ class WorkflowManager:
         self._task: asyncio.Task[None] | None = None
         self._active_proc_id: str | None = None
         self._collect_ctx: dict[str, Any] | None = None
+        self._dry_cal_queue: asyncio.Queue[str] | None = None
+        self._cal_state: dict[str, Any] = self._empty_cal_state()
         self._waypoints: list[dict[str, Any]] = []
         self._load_waypoints()
+
+    @staticmethod
+    def _empty_cal_state() -> dict[str, Any]:
+        return {
+            "active": False,
+            "target": "follower",
+            "port": "",
+            "arm_id": "",
+            "mode": "dry_run",
+            "stage": "idle",
+            "prompt": "",
+            "waiting_for_input": False,
+            "allow_recalibrate": False,
+            "live_table": {},
+            "saved_path": None,
+        }
+
+    def get_calibration_snapshot(self) -> dict[str, Any]:
+        table_rows = [
+            self._cal_state["live_table"][name]
+            for name in JOINT_NAMES
+            if name in self._cal_state["live_table"]
+        ]
+        return {
+            **self._cal_state,
+            "active": self.active_workflow == "calibrate",
+            "live_table": table_rows,
+        }
 
     @property
     def waypoints_path(self) -> Path:
@@ -111,6 +143,15 @@ class WorkflowManager:
                 self.log(self.last_error)
             self._active_proc_id = None
             if self.active_workflow != "idle":
+                if self.active_workflow == "calibrate":
+                    if rc == 0:
+                        self._cal_state["stage"] = "completed"
+                        self._cal_state["waiting_for_input"] = False
+                        self._cal_state["prompt"] = "标定已完成并写入电机与本地配置文件。"
+                    elif rc is not None:
+                        self._cal_state["stage"] = "error"
+                        self._cal_state["waiting_for_input"] = False
+                        self._cal_state["prompt"] = self.last_error or f"标定异常退出 (code={rc})。"
                 self.active_workflow = "idle"
                 self.state = "idle"
 
@@ -128,6 +169,7 @@ class WorkflowManager:
             "target_episodes": self.target_episodes,
             "current_step": self.current_step,
             "waypoint_count": len(self._waypoints),
+            "calibration": self.get_calibration_snapshot(),
             "last_error": self.last_error,
             "logs": list(self.logs),
         }
@@ -141,6 +183,7 @@ class WorkflowManager:
             "active_workflow": self.active_workflow,
             "leader_joints": leader,
             "follower_joints": follower,
+            "calibration": self.get_calibration_snapshot(),
             "workflow_status": {
                 "state": self.state,
                 "current_episode": self.current_episode,
@@ -170,6 +213,25 @@ class WorkflowManager:
     # ------------------------------------------------------------------
     # Command builders for real-mode lerobot v0.7.1 CLIs
     # ------------------------------------------------------------------
+    def build_cameras_dict(self) -> dict[str, dict[str, Any]]:
+        cams: dict[str, dict[str, Any]] = {}
+        for name, raw in (
+            ("front", self.config.front_camera_id),
+            ("wrist", self.config.wrist_camera_id),
+        ):
+            cleaned = (raw or "").strip()
+            if not cleaned or cleaned.lower() == "none":
+                continue
+            idx_or_path: int | str = int(cleaned) if cleaned.isdigit() else cleaned
+            cams[name] = {
+                "type": "opencv",
+                "index_or_path": idx_or_path,
+                "width": 640,
+                "height": 480,
+                "fps": 30,
+            }
+        return cams
+
     def build_calibrate_cmd(
         self,
         *,
@@ -178,7 +240,7 @@ class WorkflowManager:
         arm_id: str | None = None,
         calibration_dir: str | None = None,
     ) -> list[str]:
-        """Build lerobot-calibrate CLI args (strictly ONE of --robot.* or --teleop.*)."""
+        """Build interactive calibrate CLI args (strictly ONE of --robot.* or --teleop.*)."""
         if target == "follower":
             resolved_port = port or self.config.follower_port
             resolved_id = arm_id or self.config.follower_id
@@ -188,7 +250,7 @@ class WorkflowManager:
             return [
                 sys.executable,
                 "-m",
-                "lerobot.scripts.lerobot_calibrate",
+                "app.backend.calibrate_runner",
                 "--robot.type=so101_follower",
                 f"--robot.port={resolved_port}",
                 f"--robot.id={resolved_id}",
@@ -202,7 +264,7 @@ class WorkflowManager:
         return [
             sys.executable,
             "-m",
-            "lerobot.scripts.lerobot_calibrate",
+            "app.backend.calibrate_runner",
             "--teleop.type=so101_leader",
             f"--teleop.port={resolved_port}",
             f"--teleop.id={resolved_id}",
@@ -216,12 +278,13 @@ class WorkflowManager:
         follower_port: str | None = None,
         leader_port: str | None = None,
         display_data: bool = False,
+        use_cameras: bool = False,
     ) -> list[str]:
         f_port = follower_port or self.config.follower_port
         l_port = leader_port or self.config.leader_port
         f_cal = str(self.config.calibration_dir / "robots" / "so_follower")
         l_cal = str(self.config.calibration_dir / "teleoperators" / "so_leader")
-        return [
+        cmd = [
             sys.executable,
             "-m",
             "lerobot.scripts.lerobot_teleoperate",
@@ -239,6 +302,11 @@ class WorkflowManager:
             f"--display_data={'true' if display_data else 'false'}",
             "--display_mode=rerun",
         ]
+        if use_cameras or display_data:
+            cams = self.build_cameras_dict()
+            if cams:
+                cmd.append(f"--robot.cameras={json.dumps(cams, separators=(',', ':'))}")
+        return cmd
 
     def build_record_cmd(
         self,
@@ -252,7 +320,7 @@ class WorkflowManager:
     ) -> list[str]:
         f_cal = str(self.config.calibration_dir / "robots" / "so_follower")
         l_cal = str(self.config.calibration_dir / "teleoperators" / "so_leader")
-        return [
+        cmd = [
             sys.executable,
             "-m",
             "lerobot.scripts.lerobot_record",
@@ -275,10 +343,68 @@ class WorkflowManager:
             "--play_sounds=false",
             "--display_data=false",
         ]
+        cams = self.build_cameras_dict()
+        if cams:
+            cmd.append(f"--robot.cameras={json.dumps(cams, separators=(',', ':'))}")
+        return cmd
 
     # ------------------------------------------------------------------
     # Calibrate
     # ------------------------------------------------------------------
+    _CAL_TABLE_ROW_RE = re.compile(
+        r"^\s*(shoulder_pan|shoulder_lift|elbow_flex|wrist_flex|wrist_roll|gripper)\s*\|\s*"
+        r"(-?\d+(?:\.\d+)?)\s*\|\s*(-?\d+(?:\.\d+)?)\s*\|\s*(-?\d+(?:\.\d+)?)\s*$"
+    )
+
+    def _on_calibrate_line(self, line: str) -> None:
+        m = self._CAL_TABLE_ROW_RE.match(line)
+        if m:
+            motor, vmin, vpos, vmax = m.groups()
+            self._cal_state["live_table"][motor] = {
+                "name": motor,
+                "min": vmin,
+                "pos": vpos,
+                "max": vmax,
+            }
+            return
+
+        self.log(line)
+        if "[CAL_PROMPT]" in line:
+            raw_prompt = line.split("[CAL_PROMPT]", 1)[1].strip()
+            low = raw_prompt.lower()
+            self._cal_state["waiting_for_input"] = True
+            if "calibration file" in low or "type 'c'" in low:
+                self._cal_state["stage"] = "existing_file_prompt"
+                self._cal_state["allow_recalibrate"] = True
+                self._cal_state["prompt"] = (
+                    "检测到已有标定文件：点击【确认 / 下一步 (Enter)】直接写入电机，"
+                    "或点击【重新标定 (c)】重新采集。"
+                )
+            elif "middle" in low:
+                self._cal_state["stage"] = "waiting_middle"
+                self._cal_state["allow_recalibrate"] = False
+                self._cal_state["prompt"] = (
+                    "第 1 步（中位归零）：请用手将机械臂所有关节摆到活动范围正中间，"
+                    "然后点击【确认 / 下一步 (Enter)】。"
+                )
+            else:
+                self._cal_state["stage"] = "waiting_input"
+                self._cal_state["allow_recalibrate"] = False
+                self._cal_state["prompt"] = raw_prompt
+        elif "Recording positions" in line or "Press ENTER to stop" in line:
+            self._cal_state["stage"] = "recording_range"
+            self._cal_state["waiting_for_input"] = True
+            self._cal_state["allow_recalibrate"] = False
+            self._cal_state["prompt"] = (
+                "第 2 步（行程录制）：请逐个掰动所有关节到最小与最大极限位置，"
+                "确认下方各关节 MIN/MAX 均有变化后，点击【确认 / 下一步 (Enter)】完成保存。"
+            )
+        elif "Calibration saved to" in line:
+            self._cal_state["stage"] = "completed"
+            self._cal_state["waiting_for_input"] = False
+            self._cal_state["saved_path"] = line.split("Calibration saved to", 1)[1].strip()
+            self._cal_state["prompt"] = f"标定成功！已保存到 {self._cal_state['saved_path']}"
+
     async def start_calibrate(
         self,
         *,
@@ -290,47 +416,105 @@ class WorkflowManager:
         self._sync_process_state()
         await self._ensure_idle()
         self.last_error = None
-        cmd = self.build_calibrate_cmd(
-            target=target, port=port, arm_id=arm_id, calibration_dir=calibration_dir
+        resolved_port = port or (
+            self.config.follower_port if target == "follower" else self.config.leader_port
         )
+        resolved_id = arm_id or (
+            self.config.follower_id if target == "follower" else self.config.leader_id
+        )
+        cmd = self.build_calibrate_cmd(
+            target=target,
+            port=resolved_port,
+            arm_id=resolved_id,
+            calibration_dir=calibration_dir,
+        )
+        self._cal_state = {
+            "active": True,
+            "target": target,
+            "port": resolved_port,
+            "arm_id": resolved_id,
+            "mode": self.hardware.active_mode,
+            "stage": "connecting",
+            "prompt": f"正在连接 {target} ({resolved_port})，请稍候...",
+            "waiting_for_input": False,
+            "allow_recalibrate": False,
+            "live_table": {},
+            "saved_path": None,
+        }
 
         if self.hardware.active_mode == "real":
             proc_id = "workflow_calibrate"
             self.process_registry.spawn(
-                proc_id, "lerobot_calibrate", cmd, cwd=self.config.workspace_root, on_line=self.log
+                proc_id,
+                "lerobot_calibrate",
+                cmd,
+                cwd=self.config.workspace_root,
+                on_line=self._on_calibrate_line,
+                stdin_pipe=True,
             )
             self._active_proc_id = proc_id
             self.active_workflow = "calibrate"
             self.state = "running"
-            self.log(f"Started real calibration for {target}.")
+            self.log(f"Started real calibration for {target} on {resolved_port}.")
             return {
                 "status": "started",
                 "workflow": "calibrate",
                 "mode": "real",
                 "target": target,
+                "port": resolved_port,
                 "command": cmd,
             }
 
         self.active_workflow = "calibrate"
         self.state = "running"
-        self.current_step = 0
-        resolved_id = arm_id or (
-            self.config.follower_id if target == "follower" else self.config.leader_id
+        self.current_step = 1
+        self._cal_state["stage"] = "waiting_middle"
+        self._cal_state["waiting_for_input"] = True
+        self._cal_state["prompt"] = (
+            "【模拟标定 1/2】请摆好中位，然后点击【确认 / 下一步 (Enter)】。"
         )
+        self._dry_cal_queue = asyncio.Queue()
+        cal_queue = self._dry_cal_queue
         self.log(f"Started dry_run calibration for {target} ({resolved_id}).")
 
         async def _sim_calibrate() -> None:
             try:
-                for step_idx in range(1, 4):
-                    await asyncio.sleep(0.25)
-                    self.current_step = step_idx
-                    self.log(f"[dry_run] Calibrating {target} step {step_idx}/3...")
+                await cal_queue.get()
+
+                self._cal_state["stage"] = "recording_range"
+                self._cal_state["waiting_for_input"] = True
+                self._cal_state["prompt"] = (
+                    "【模拟标定 2/2】正在模拟活动各关节限位，点击【确认 / 下一步 (Enter)】保存。"
+                )
+                self.current_step = 2
+                tick = 0
+                while True:
+                    for idx, jname in enumerate(JOINT_NAMES):
+                        pos = int(2048 + math.sin(tick * 0.35 + idx) * 600)
+                        prev = self._cal_state["live_table"].get(jname)
+                        vmin = min(int(prev["min"]), pos) if prev else pos
+                        vmax = max(int(prev["max"]), pos) if prev else pos
+                        self._cal_state["live_table"][jname] = {
+                            "name": jname,
+                            "min": str(vmin),
+                            "pos": str(pos),
+                            "max": str(vmax),
+                        }
+                    tick += 1
+                    try:
+                        await asyncio.wait_for(cal_queue.get(), timeout=0.15)
+                        break
+                    except asyncio.TimeoutError:
+                        continue
+
+                self.current_step = 3
                 cal_dir = self.config.dry_run_dir / "calibration"
                 cal_dir.mkdir(parents=True, exist_ok=True)
                 cal_file = cal_dir / f"{target}_{resolved_id}.json"
                 cal_payload = {
                     "target": target,
                     "arm_id": resolved_id,
+                    "port": resolved_port,
                     "mode": "dry_run",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "joints": {
@@ -342,11 +526,16 @@ class WorkflowManager:
                     json.dumps(cal_payload, indent=2, ensure_ascii=False), encoding="utf-8"
                 )
                 self.simulator.reset()
+                self._cal_state["stage"] = "completed"
+                self._cal_state["waiting_for_input"] = False
+                self._cal_state["saved_path"] = str(cal_file)
+                self._cal_state["prompt"] = f"模拟标定完成 -> {cal_file.name}"
                 self.log(f"[dry_run] Calibration complete -> {cal_file.name}")
             except asyncio.CancelledError:
                 self.log("[dry_run] Calibration cancelled.")
                 raise
             finally:
+                self._dry_cal_queue = None
                 if self.active_workflow == "calibrate":
                     self.active_workflow = "idle"
                     self.state = "idle"
@@ -357,15 +546,46 @@ class WorkflowManager:
             "workflow": "calibrate",
             "mode": "dry_run",
             "target": target,
+            "port": resolved_port,
             "command": cmd,
         }
+
+    async def send_calibrate_input(self, value: str = "") -> dict[str, Any]:
+        self._sync_process_state()
+        if self.active_workflow != "calibrate":
+            raise WorkflowConflictError(
+                "No calibration workflow is currently running.",
+                code="CALIBRATE_NOT_ACTIVE",
+            )
+        cleaned = (value or "").strip()
+        if self.hardware.active_mode == "real":
+            if self._active_proc_id is None or not self.process_registry.write_stdin(
+                self._active_proc_id, cleaned
+            ):
+                raise WorkflowConflictError(
+                    "Calibration process is not accepting input.",
+                    code="CALIBRATE_NOT_ACCEPTING_INPUT",
+                )
+            self._cal_state["waiting_for_input"] = False
+            self.log(f"Calibration input sent: {'<ENTER>' if not cleaned else cleaned}")
+            return {"status": "sent", "value": cleaned}
+
+        if self._dry_cal_queue is not None:
+            await self._dry_cal_queue.put(cleaned)
+            self.log(f"[dry_run] Calibration input sent: {'<ENTER>' if not cleaned else cleaned}")
+            return {"status": "sent", "value": cleaned}
+        raise WorkflowConflictError("Dry-run calibration queue unavailable.", code="CALIBRATE_NOT_ACTIVE")
 
     async def stop_calibrate(self) -> dict[str, Any]:
         if self.active_workflow == "calibrate":
             self._stop_active_process()
             await self._cancel_background_task()
+            self._dry_cal_queue = None
             self.active_workflow = "idle"
             self.state = "idle"
+            self._cal_state["active"] = False
+            self._cal_state["waiting_for_input"] = False
+            self._cal_state["stage"] = "stopped"
             self.log("Calibration stopped.")
         return {"status": "stopped", "workflow": "calibrate"}
 
@@ -379,6 +599,7 @@ class WorkflowManager:
         follower_port: str | None = None,
         leader_port: str | None = None,
         display_data: bool = False,
+        use_cameras: bool = False,
     ) -> dict[str, Any]:
         self._sync_process_state()
         await self._ensure_idle()
@@ -388,6 +609,7 @@ class WorkflowManager:
             follower_port=follower_port,
             leader_port=leader_port,
             display_data=display_data,
+            use_cameras=use_cameras,
         )
 
         if self.hardware.active_mode == "real":
@@ -793,23 +1015,40 @@ class WorkflowManager:
         alias_map = {"0": "front", "1": "wrist"}
         logical_id = alias_map.get(cam_id, cam_id)
 
-        if self.hardware.active_mode == "real":
+        configured_raw: str | None = None
+        if logical_id == "front":
+            configured_raw = self.config.front_camera_id
+        elif logical_id == "wrist":
+            configured_raw = self.config.wrist_camera_id
+
+        if (
+            self.hardware.active_mode == "real"
+            and self.active_workflow in ("idle", "calibrate")
+            and (configured_raw is None or configured_raw.lower() != "none")
+        ):
             for cam in self.hardware.last_probe.get("cameras", []):
-                if str(cam.get("id")) in (cam_id, logical_id) and cam.get("available"):
+                cam_raw = str(cam.get("raw_id", cam.get("index_or_path", "")))
+                matched = (
+                    cam_raw == configured_raw
+                    if configured_raw is not None
+                    else str(cam.get("id")) in (cam_id, logical_id)
+                )
+                if matched and cam.get("available"):
                     try:
                         import cv2
 
                         backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2
-                        cap = cv2.VideoCapture(cam["index_or_path"], backend)
-                        try:
-                            if cap.isOpened():
-                                ok, frame = cap.read()
-                                if ok and frame is not None:
-                                    enc_ok, buf = cv2.imencode(".jpg", frame)
-                                    if enc_ok:
-                                        return bytes(buf)
-                        finally:
-                            cap.release()
+                        with CAMERA_IO_LOCK:
+                            cap = cv2.VideoCapture(cam["index_or_path"], backend)
+                            try:
+                                if cap.isOpened():
+                                    ok, frame = cap.read()
+                                    if ok and frame is not None:
+                                        enc_ok, buf = cv2.imencode(".jpg", frame)
+                                        if enc_ok:
+                                            return bytes(buf)
+                            finally:
+                                cap.release()
                     except Exception:
                         pass
 

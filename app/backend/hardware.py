@@ -8,10 +8,14 @@ import platform
 import re
 import shutil
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
 from app.backend.config import ModeType, StudioConfig
+
+# Process-wide lock to serialize OpenCV / DirectShow camera access across threads.
+CAMERA_IO_LOCK = threading.Lock()
 
 if platform.system() == "Windows":
     # Must be set before importing cv2 to prevent slow MSMF hardware transforms on Windows.
@@ -178,95 +182,98 @@ class HardwareManager:
             prev_level = None
 
         try:
-            if platform.system() == "Windows":
-                dshow_names: list[str] = []
-                try:
-                    import comtypes  # type: ignore[import-not-found]
-                    from pygrabber.dshow_graph import FilterGraph  # type: ignore[import-not-found]
-
-                    comtypes.CoInitialize()
+            with CAMERA_IO_LOCK:
+                if platform.system() == "Windows":
+                    dshow_names: list[str] = []
                     try:
-                        dshow_names = list(FilterGraph().get_input_devices())
-                    finally:
-                        comtypes.CoUninitialize()
-                except Exception:
-                    dshow_names = []
+                        import comtypes  # type: ignore[import-not-found]
+                        from pygrabber.dshow_graph import FilterGraph  # type: ignore[import-not-found]
 
-                max_idx = min(len(dshow_names), 4) if dshow_names else 4
-                for idx in range(max_idx):
-                    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                    try:
-                        if cap.isOpened():
-                            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
-                            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
-                            name = dshow_names[idx] if idx < len(dshow_names) else f"Camera {idx}"
-                            logical_id = (
-                                "front"
-                                if str(idx) == self.config.front_camera_id
-                                else (
-                                    "wrist"
-                                    if str(idx) == self.config.wrist_camera_id
-                                    else f"cam_{idx}"
+                        comtypes.CoInitialize()
+                        try:
+                            dshow_names = list(FilterGraph().get_input_devices())
+                        finally:
+                            comtypes.CoUninitialize()
+                    except Exception:
+                        dshow_names = []
+
+                    max_idx = min(len(dshow_names), 4) if dshow_names else 3
+                    for idx in range(max_idx):
+                        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                        try:
+                            if cap.isOpened():
+                                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+                                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+                                name = dshow_names[idx] if idx < len(dshow_names) else f"Camera {idx}"
+                                logical_id = (
+                                    "front"
+                                    if str(idx) == self.config.front_camera_id
+                                    else (
+                                        "wrist"
+                                        if str(idx) == self.config.wrist_camera_id
+                                        else f"cam_{idx}"
+                                    )
                                 )
-                            )
-                            cameras.append(
-                                {
-                                    "id": logical_id,
-                                    "index_or_path": idx,
-                                    "name": name,
-                                    "backend": "DSHOW",
-                                    "width": w,
-                                    "height": h,
-                                    "available": True,
-                                }
-                            )
-                    finally:
-                        cap.release()
-            else:
-                dev_paths = sorted(
-                    Path("/dev").glob("video*"),
-                    key=lambda p: (
-                        int(m.group(1))
-                        if (m := re.search(r"(\d+)$", p.name))
-                        else 999
-                    ),
-                )
-                for dev_path in dev_paths[:8]:
-                    idx_match = re.search(r"(\d+)$", dev_path.name)
-                    idx_str = idx_match.group(1) if idx_match else dev_path.name
-                    sys_name_file = Path(f"/sys/class/video4linux/{dev_path.name}/name")
-                    name = (
-                        sys_name_file.read_text(encoding="utf-8", errors="replace").strip()
-                        if sys_name_file.exists()
-                        else dev_path.name
+                                cameras.append(
+                                    {
+                                        "id": logical_id,
+                                        "raw_id": str(idx),
+                                        "index_or_path": idx,
+                                        "name": name,
+                                        "backend": "DSHOW",
+                                        "width": w,
+                                        "height": h,
+                                        "available": True,
+                                    }
+                                )
+                        finally:
+                            cap.release()
+                else:
+                    dev_paths = sorted(
+                        Path("/dev").glob("video*"),
+                        key=lambda p: (
+                            int(m.group(1))
+                            if (m := re.search(r"(\d+)$", p.name))
+                            else 999
+                        ),
                     )
-                    cap = cv2.VideoCapture(str(dev_path), cv2.CAP_V4L2)
-                    try:
-                        if cap.isOpened():
-                            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
-                            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
-                            logical_id = (
-                                "front"
-                                if idx_str == self.config.front_camera_id
-                                else (
-                                    "wrist"
-                                    if idx_str == self.config.wrist_camera_id
-                                    else dev_path.name
+                    for dev_path in dev_paths[:8]:
+                        idx_match = re.search(r"(\d+)$", dev_path.name)
+                        idx_str = idx_match.group(1) if idx_match else dev_path.name
+                        sys_name_file = Path(f"/sys/class/video4linux/{dev_path.name}/name")
+                        name = (
+                            sys_name_file.read_text(encoding="utf-8", errors="replace").strip()
+                            if sys_name_file.exists()
+                            else dev_path.name
+                        )
+                        cap = cv2.VideoCapture(str(dev_path), cv2.CAP_V4L2)
+                        try:
+                            if cap.isOpened():
+                                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+                                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+                                logical_id = (
+                                    "front"
+                                    if idx_str == self.config.front_camera_id
+                                    else (
+                                        "wrist"
+                                        if idx_str == self.config.wrist_camera_id
+                                        else dev_path.name
+                                    )
                                 )
-                            )
-                            cameras.append(
-                                {
-                                    "id": logical_id,
-                                    "index_or_path": str(dev_path),
-                                    "name": name,
-                                    "backend": "V4L2",
-                                    "width": w,
-                                    "height": h,
-                                    "available": True,
-                                }
-                            )
-                    finally:
-                        cap.release()
+                                cameras.append(
+                                    {
+                                        "id": logical_id,
+                                        "raw_id": str(dev_path),
+                                        "index_or_path": str(dev_path),
+                                        "name": name,
+                                        "backend": "V4L2",
+                                        "width": w,
+                                        "height": h,
+                                        "available": True,
+                                    }
+                                )
+                        finally:
+                            cap.release()
         except Exception:
             pass
         finally:
@@ -321,10 +328,101 @@ class HardwareManager:
             "cli_tools": cli_tools,
         }
 
+    def _relabel_cameras(self, cameras: list[dict[str, Any]]) -> None:
+        for cam in cameras:
+            raw = str(cam.get("raw_id", cam.get("index_or_path", "")))
+            if raw == self.config.front_camera_id:
+                cam["id"] = "front"
+            elif raw == self.config.wrist_camera_id:
+                cam["id"] = "wrist"
+            else:
+                cam["id"] = f"cam_{raw}" if raw.isdigit() else raw
+
+    def auto_match_devices(
+        self,
+        serial_ports: list[dict[str, Any]],
+        cameras: list[dict[str, Any]],
+        *,
+        force: bool = False,
+    ) -> bool:
+        """Auto-assign detected candidate serial ports and cameras when missing or forced."""
+        changed = False
+        cand_devices = [p["device"] for p in serial_ports if p.get("is_robot_candidate")]
+
+        if cand_devices:
+            if force or self.config.follower_port not in cand_devices:
+                pick = next(
+                    (d for d in cand_devices if force or d != self.config.leader_port),
+                    cand_devices[0],
+                )
+                if pick != self.config.follower_port:
+                    self.config.follower_port = pick
+                    changed = True
+
+            if (
+                force
+                or self.config.leader_port not in cand_devices
+                or self.config.leader_port == self.config.follower_port
+            ):
+                remaining = [d for d in cand_devices if d != self.config.follower_port]
+                if remaining and remaining[0] != self.config.leader_port:
+                    self.config.leader_port = remaining[0]
+                    changed = True
+
+        cam_raw_ids = [str(c.get("raw_id", c.get("index_or_path", ""))) for c in cameras]
+        if cam_raw_ids:
+            if force or (
+                self.config.front_camera_id not in ("", "none")
+                and self.config.front_camera_id not in cam_raw_ids
+            ):
+                pick = next(
+                    (c for c in cam_raw_ids if force or c != self.config.wrist_camera_id),
+                    cam_raw_ids[0],
+                )
+                if pick != self.config.front_camera_id:
+                    self.config.front_camera_id = pick
+                    changed = True
+
+            if force or (
+                self.config.wrist_camera_id not in ("", "none")
+                and (
+                    self.config.wrist_camera_id not in cam_raw_ids
+                    or self.config.wrist_camera_id == self.config.front_camera_id
+                )
+            ):
+                remaining_cams = [c for c in cam_raw_ids if c != self.config.front_camera_id]
+                if remaining_cams and remaining_cams[0] != self.config.wrist_camera_id:
+                    self.config.wrist_camera_id = remaining_cams[0]
+                    changed = True
+
+        self._relabel_cameras(cameras)
+        return changed
+
+    def get_calibration_status(self) -> dict[str, Any]:
+        follower_file = (
+            self.config.calibration_dir
+            / "robots"
+            / "so_follower"
+            / f"{self.config.follower_id}.json"
+        )
+        leader_file = (
+            self.config.calibration_dir
+            / "teleoperators"
+            / "so_leader"
+            / f"{self.config.leader_id}.json"
+        )
+        return {
+            "follower_calibrated": follower_file.is_file(),
+            "leader_calibrated": leader_file.is_file(),
+            "follower_file": str(follower_file),
+            "leader_file": str(leader_file),
+        }
+
     def probe(self) -> dict[str, Any]:
         """Run complete hardware + capability probe and update active mode if auto."""
         serial_ports = self.probe_serial_ports()
         cameras = self.probe_cameras()
+        auto_matched = self.auto_match_devices(serial_ports, cameras, force=False)
         os_capabilities = self.probe_capabilities()
         lerobot_available = bool(os_capabilities["packages"]["lerobot"])
 
@@ -376,13 +474,13 @@ class HardwareManager:
                 "未检测到可用物理摄像头，相机预览将使用 2D 运动学合成测试图（DRY-RUN）。"
             )
         if hardware_ready:
-            guidance.append("已检测到 SO-101 串口硬件且环境就绪，可运行真实硬件或切换 dry_run。")
+            guidance.append(
+                f"已检测到 SO-101 串口硬件（当前映射 从臂={self.config.follower_port} / 主臂={self.config.leader_port}），可在下方手动调整并保存。"
+            )
 
         if self.requested_mode == "dry_run":
             self.active_mode = "dry_run"
-        elif self.requested_mode == "auto":
-            self.active_mode = "real" if hardware_ready else "dry_run"
-        elif self.requested_mode == "real":
+        elif self.requested_mode in ("auto", "real"):
             self.active_mode = "real" if hardware_ready else "dry_run"
 
         result = {
@@ -395,18 +493,31 @@ class HardwareManager:
             "guidance": guidance,
             "active_mode": self.active_mode,
             "requested_mode": self.requested_mode,
+            "device_selection": {
+                "follower_port": self.config.follower_port,
+                "leader_port": self.config.leader_port,
+                "follower_id": self.config.follower_id,
+                "leader_id": self.config.leader_id,
+                "front_camera_id": self.config.front_camera_id,
+                "wrist_camera_id": self.config.wrist_camera_id,
+                "auto_matched": auto_matched,
+            },
+            "calibration_status": self.get_calibration_status(),
         }
         self.last_probe = result
         return result
 
     def set_mode(self, mode: ModeType) -> tuple[bool, dict[str, Any]]:
         """Switch operating mode cleanly; refuse real mode with 409 payload if hardware missing."""
-        probe_data = self.probe()
+        probe_data = self.last_probe if (mode == "dry_run" and self.last_probe) else self.probe()
         hardware_ready = bool(probe_data["hardware_ready"])
 
         if mode == "dry_run":
             self.requested_mode = "dry_run"
             self.active_mode = "dry_run"
+            if self.last_probe:
+                self.last_probe["requested_mode"] = "dry_run"
+                self.last_probe["active_mode"] = "dry_run"
             return True, {
                 "requested_mode": "dry_run",
                 "mode": "dry_run",
