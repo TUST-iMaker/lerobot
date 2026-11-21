@@ -1,18 +1,27 @@
+import { StickArmCanvas, renderStickTelemetryHtml, computeStickFK } from "/static/stick_sim.js";
+
 const JOINTS = [
-  { key: "shoulder_pan", label: "肩部水平 (shoulder_pan)", min: -180, max: 180, unit: "°", def: 0 },
-  { key: "shoulder_lift", label: "肩部俯仰 (shoulder_lift)", min: -180, max: 180, unit: "°", def: -25 },
-  { key: "elbow_flex", label: "肘部屈伸 (elbow_flex)", min: -180, max: 180, unit: "°", def: 45 },
-  { key: "wrist_flex", label: "腕部俯仰 (wrist_flex)", min: -180, max: 180, unit: "°", def: 30 },
-  { key: "wrist_roll", label: "腕部旋转 (wrist_roll)", min: -180, max: 180, unit: "°", def: 0 },
-  { key: "gripper", label: "夹爪开合 (gripper)", min: 0, max: 100, unit: "%", def: 20 },
+  { key: "shoulder_pan", label: "#1 底座旋转 (shoulder_pan)", min: -110, max: 110, unit: "°", def: 0 },
+  { key: "shoulder_lift", label: "#2 大臂俯仰 (shoulder_lift)", min: -100, max: 100, unit: "°", def: 0 },
+  { key: "elbow_flex", label: "#3 小臂肘弯 (elbow_flex)", min: -97, max: 97, unit: "°", def: 0 },
+  { key: "wrist_flex", label: "#4 手腕俯仰 (wrist_flex)", min: -95, max: 95, unit: "°", def: 0 },
+  { key: "wrist_roll", label: "#5 手腕滚转 (wrist_roll)", min: -157, max: 163, unit: "°", def: 0 },
+  { key: "gripper", label: "#6 末端夹爪 (gripper)", min: 0, max: 100, unit: "%", def: 20 },
 ];
 
 const state = {
   mode: "dry_run",
   activeWorkflow: "idle",
   lastCalStage: "idle",
+  linkedArms: false,
+  torqueEnabled: true,
+  estopLatched: false,
   leaderJoints: Object.fromEntries(JOINTS.map((j) => [j.key, j.def])),
   followerJoints: Object.fromEntries(JOINTS.map((j) => [j.key, j.def])),
+  waypoints: [],
+  vlaChunk: [],
+  vlaAnimTimer: null,
+  epReplayTimer: null,
   localLogs: [],
   ws: null,
   wsRetryMs: 1000,
@@ -20,6 +29,19 @@ const state = {
   camTimer: null,
   jointSendTimer: null,
   pendingJoints: {},
+  simSendTimers: { leader: null, follower: null },
+  simPending: { leader: {}, follower: {} },
+};
+
+const stickViews = {
+  cal: null,
+  teleopLeader: null,
+  teleopFollower: null,
+  simLeader: null,
+  simFollower: null,
+  teach: null,
+  collect: null,
+  vla: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -85,6 +107,162 @@ function setModeUI(mode) {
   }
 }
 
+function updateSafetyUI(safety) {
+  if (!safety) return;
+  state.torqueEnabled = Boolean(safety.torque_enabled);
+  state.estopLatched = Boolean(safety.estop_latched);
+
+  const tBadge = $("torque-badge");
+  if (tBadge) {
+    tBadge.textContent = state.torqueEnabled ? "⚡ 扭矩: 使能" : "💤 扭矩: 已释放";
+    tBadge.className = state.torqueEnabled ? "pill pill-ok" : "pill pill-warn";
+  }
+  const eBadge = $("estop-badge");
+  const btnReset = $("btn-global-reset");
+  if (eBadge) {
+    eBadge.textContent = state.estopLatched ? "🛑 急停已锁定 (ESTOP)" : "安全状态: 正常";
+    eBadge.className = state.estopLatched ? "pill pill-warn" : "pill pill-info";
+  }
+  if (btnReset) {
+    btnReset.hidden = !state.estopLatched;
+  }
+}
+
+function updateConnectionBadge(conn) {
+  const badge = $("teleop-connection-badge");
+  if (!badge) return;
+  if (state.mode === "real" && conn && conn.hardware_ready) {
+    badge.textContent = `✓ 主从臂连接成功 (从臂 ${conn.follower_port} ← 主臂 ${conn.leader_port})`;
+    badge.className = "conn-badge conn-ok";
+  } else {
+    badge.textContent = "模拟演练模式（主从联动就绪）";
+    badge.className = "conn-badge conn-sim";
+  }
+}
+
+function initStickCanvases() {
+  stickViews.cal = new StickArmCanvas($("canvas-cal-stick"), {
+    role: "follower",
+    title: "标定中位比对 (虚影=官方前伸中位)",
+    accent: "#06b6d4",
+    showHomingRef: true,
+  });
+  stickViews.teleopLeader = new StickArmCanvas($("canvas-teleop-leader"), {
+    role: "leader",
+    title: "主臂 Leader (操控端)",
+    accent: "#3b82f6",
+  });
+  stickViews.teleopFollower = new StickArmCanvas($("canvas-teleop-follower"), {
+    role: "follower",
+    title: "从臂 Follower (跟随端)",
+    accent: "#06b6d4",
+  });
+  stickViews.simLeader = new StickArmCanvas($("canvas-sim-leader"), {
+    role: "leader",
+    title: "主臂 Leader 6-DOF (独立控制)",
+    accent: "#3b82f6",
+  });
+  stickViews.simFollower = new StickArmCanvas($("canvas-sim-follower"), {
+    role: "follower",
+    title: "从臂 Follower 6-DOF (拖拽红圈=IK)",
+    accent: "#10b981",
+    enableIkDrag: true,
+    onIkDrag: async (req) => {
+      const res = await apiFetch("/api/sim/ik", {
+        method: "POST",
+        body: JSON.stringify(req),
+      });
+      if (res.ok && res.data) {
+        updateJointGauges(res.data.leader_joints, res.data.follower_joints, true);
+        if ($("ik-x")) $("ik-x").value = String(req.x_mm);
+        if ($("ik-y")) $("ik-y").value = String(req.y_mm);
+        if ($("ik-z")) $("ik-z").value = String(req.z_mm);
+      }
+    },
+  });
+  stickViews.teach = new StickArmCanvas($("canvas-teach-stick"), {
+    role: "follower",
+    title: "示教与表演轨迹 6-DOF 火柴棍",
+    accent: "#06b6d4",
+  });
+  stickViews.collect = new StickArmCanvas($("canvas-collect-stick"), {
+    role: "follower",
+    title: "数据采集 / Episode 回放 6-DOF 火柴棍",
+    accent: "#10b981",
+  });
+  stickViews.vla = new StickArmCanvas($("canvas-vla-stick"), {
+    role: "follower",
+    title: "VLA 5 步 Action Chunk 预测动画",
+    accent: "#a855f7",
+  });
+}
+
+function updateAllStickViews() {
+  const l = state.leaderJoints;
+  const f = state.followerJoints;
+  const calTarget = $("calibrate-target")?.value || "follower";
+  const calJoints = calTarget === "leader" ? l : f;
+
+  if (stickViews.cal) {
+    stickViews.cal.setState({ joints: calJoints, showHomingRef: true });
+    if ($("cal-stick-data")) {
+      $("cal-stick-data").innerHTML = renderStickTelemetryHtml(
+        calJoints,
+        `标定臂 (${calTarget}) 舵机角度与臂长`
+      );
+    }
+  }
+  if (stickViews.teleopLeader && !$("panel-teleop")?.hidden) {
+    stickViews.teleopLeader.setState({ joints: l });
+    if ($("teleop-leader-data")) {
+      $("teleop-leader-data").innerHTML = renderStickTelemetryHtml(l, "主臂 Leader 数据");
+    }
+  }
+  if (stickViews.teleopFollower && !$("panel-teleop")?.hidden) {
+    stickViews.teleopFollower.setState({ joints: f });
+    if ($("teleop-follower-data")) {
+      $("teleop-follower-data").innerHTML = renderStickTelemetryHtml(f, "从臂 Follower 数据");
+    }
+    const tcp = computeStickFK(f).tcp;
+    if ($("teleop-tcp-badge")) {
+      $("teleop-tcp-badge").textContent = `TCP: X=${tcp.x.toFixed(0)} Y=${tcp.y.toFixed(0)} Z=${tcp.z.toFixed(0)} mm | Pitch=${tcp.pitchDeg.toFixed(1)}°`;
+    }
+  }
+  if (stickViews.simLeader && !$("panel-sim")?.hidden) {
+    stickViews.simLeader.setState({ joints: l });
+    if ($("sim-leader-data")) {
+      $("sim-leader-data").innerHTML = renderStickTelemetryHtml(l, "主臂 Leader 完整数据");
+    }
+  }
+  if (stickViews.simFollower && !$("panel-sim")?.hidden) {
+    stickViews.simFollower.setState({ joints: f });
+    if ($("sim-follower-data")) {
+      $("sim-follower-data").innerHTML = renderStickTelemetryHtml(f, "从臂 Follower 完整数据");
+    }
+  }
+  if (stickViews.teach && !$("panel-teaching")?.hidden) {
+    stickViews.teach.setState({ joints: f, waypoints: state.waypoints });
+    if ($("teach-stick-data")) {
+      $("teach-stick-data").innerHTML = renderStickTelemetryHtml(f, "示教实时关节与臂长数据");
+    }
+  }
+  if (stickViews.collect && !$("panel-collect")?.hidden) {
+    stickViews.collect.setState({
+      joints: f,
+      recActive: state.activeWorkflow === "collect",
+    });
+    if ($("collect-stick-data")) {
+      $("collect-stick-data").innerHTML = renderStickTelemetryHtml(f, "采集状态 (observation.state) 数据");
+    }
+  }
+  if (stickViews.vla && !$("panel-vla")?.hidden) {
+    stickViews.vla.setState({ joints: f, vlaChunk: state.vlaChunk });
+    if ($("vla-stick-data")) {
+      $("vla-stick-data").innerHTML = renderStickTelemetryHtml(f, "VLA 预测关节与臂长数据");
+    }
+  }
+}
+
 function renderHardwareProbe(probe) {
   if (!probe) return;
   setModeUI(probe.active_mode || "dry_run");
@@ -124,7 +302,6 @@ function renderHardwareProbe(probe) {
     guidance.innerHTML = (probe.guidance || []).map((g) => `<li>${g}</li>`).join("");
   }
 
-  // Serial ports card
   const portsBox = $("serial-ports-list");
   if (portsBox) {
     const ports = probe.serial_ports || [];
@@ -138,7 +315,6 @@ function renderHardwareProbe(probe) {
       : '<div class="kv-item">未检测到串口设备</div>';
   }
 
-  // Cameras card
   const camsBox = $("cameras-list");
   if (camsBox) {
     camsBox.innerHTML = cams.length
@@ -151,7 +327,6 @@ function renderHardwareProbe(probe) {
       : '<div class="kv-item">未检测到物理相机（已启用合成 2D HUD）</div>';
   }
 
-  // Capabilities card
   const capsBox = $("capabilities-list");
   if (capsBox) {
     const cap = probe.os_capabilities || {};
@@ -165,6 +340,11 @@ function renderHardwareProbe(probe) {
 
   renderDeviceSelectors(probe);
   renderCalibrationFileBadges(probe.calibration_status);
+  updateConnectionBadge({
+    hardware_ready: probe.hardware_ready,
+    follower_port: probe.device_selection?.follower_port,
+    leader_port: probe.device_selection?.leader_port,
+  });
 }
 
 function populatePortSelect(selectEl, ports, currentValue) {
@@ -172,8 +352,7 @@ function populatePortSelect(selectEl, ports, currentValue) {
   const options = [];
   const seen = new Set();
   for (const p of ports || []) {
-    if (!p || !p.device) continue;
-    if (p.is_bluetooth) continue;
+    if (!p || !p.device || p.is_bluetooth) continue;
     seen.add(p.device);
     const label = `${p.device} — ${p.tag}${p.is_robot_candidate ? "" : " (非USB候选)"}`;
     options.push(`<option value="${p.device}">${label}</option>`);
@@ -264,9 +443,7 @@ function renderCalibrationState(cal) {
   }
 
   panel.hidden = false;
-  if (promptEl) {
-    promptEl.textContent = cal.prompt || `标定阶段: ${stage}`;
-  }
+  if (promptEl) promptEl.textContent = cal.prompt || `标定阶段: ${stage}`;
   if (btnEnter) {
     btnEnter.disabled = !cal.waiting_for_input;
     btnEnter.hidden = !cal.active;
@@ -296,16 +473,14 @@ function renderCalibrationState(cal) {
   }
 }
 
-function initJointSliders() {
-  const container = $("joints-container");
-  if (!container) return;
-  container.innerHTML = JOINTS.map((j) => {
+function buildSlidersHtml(prefix) {
+  return JOINTS.map((j) => {
     const pct = ((j.def - j.min) / (j.max - j.min)) * 100;
     return `
       <div class="joint-row">
         <div class="joint-head">
           <span>${j.label}</span>
-          <span class="joint-values" id="val-${j.key}">L:${j.def}${j.unit} / F:${j.def}${j.unit}</span>
+          <span class="joint-values" id="${prefix}-val-${j.key}">${j.def}${j.unit}</span>
         </div>
         <input
           class="joint-slider"
@@ -315,27 +490,54 @@ function initJointSliders() {
           step="1"
           value="${j.def}"
           data-joint="${j.key}"
-          id="slider-${j.key}"
+          id="${prefix}-slider-${j.key}"
         />
         <div class="gauge-bar-track">
-          <div class="gauge-bar-fill" id="bar-${j.key}" style="width:${pct}%"></div>
+          <div class="gauge-bar-fill" id="${prefix}-bar-${j.key}" style="width:${pct}%"></div>
         </div>
       </div>
     `;
   }).join("");
+}
 
-  container.querySelectorAll(".joint-slider").forEach((slider) => {
-    slider.addEventListener("input", (ev) => {
-      const target = ev.target;
-      const key = target.dataset.joint;
-      const val = Number(target.value);
-      state.leaderJoints[key] = val;
-      state.pendingJoints[key] = val;
-      if (!state.jointSendTimer) {
-        state.jointSendTimer = setTimeout(flushPendingJoints, 55);
-      }
+function initJointSliders() {
+  // 1. Teleop sliders
+  const teleopBox = $("joints-container");
+  if (teleopBox) {
+    teleopBox.innerHTML = buildSlidersHtml("teleop");
+    teleopBox.querySelectorAll(".joint-slider").forEach((slider) => {
+      slider.addEventListener("input", (ev) => {
+        const key = ev.target.dataset.joint;
+        const val = Number(ev.target.value);
+        state.leaderJoints[key] = val;
+        state.pendingJoints[key] = val;
+        updateAllStickViews();
+        if (!state.jointSendTimer) {
+          state.jointSendTimer = setTimeout(flushPendingJoints, 55);
+        }
+      });
     });
-  });
+  }
+
+  // 2. Independent Simulation page sliders (Leader & Follower separately)
+  for (const arm of ["leader", "follower"]) {
+    const box = $(`sim-${arm}-sliders`);
+    if (!box) continue;
+    box.innerHTML = buildSlidersHtml(`sim-${arm}`);
+    box.querySelectorAll(".joint-slider").forEach((slider) => {
+      slider.addEventListener("input", (ev) => {
+        const key = ev.target.dataset.joint;
+        const val = Number(ev.target.value);
+        if (arm === "leader") state.leaderJoints[key] = val;
+        else state.followerJoints[key] = val;
+        state.simPending[arm][key] = val;
+        updateAllStickViews();
+        if (!state.simSendTimers[arm]) {
+          state.simSendTimers[arm] = setTimeout(() => flushSimJoints(arm), 55);
+        }
+      });
+    });
+  }
 }
 
 async function flushPendingJoints() {
@@ -352,29 +554,59 @@ async function flushPendingJoints() {
   }
 }
 
+async function flushSimJoints(arm) {
+  state.simSendTimers[arm] = null;
+  const payload = { ...state.simPending[arm] };
+  state.simPending[arm] = {};
+  if (Object.keys(payload).length === 0) return;
+  const linked = Boolean($("chk-sim-linked")?.checked);
+  const res = await apiFetch("/api/sim/joints", {
+    method: "POST",
+    body: JSON.stringify({ arm, joints: payload, linked }),
+  });
+  if (res.ok && res.data) {
+    updateJointGauges(res.data.leader_joints, res.data.follower_joints, false);
+  }
+}
+
 function updateJointGauges(leader, follower, syncSliders = false) {
   if (!leader || !follower) return;
   state.leaderJoints = leader;
   state.followerJoints = follower;
+
   for (const j of JOINTS) {
     const lv = Number(leader[j.key] ?? j.def);
     const fv = Number(follower[j.key] ?? j.def);
-    const valEl = $(`val-${j.key}`);
-    if (valEl) {
-      valEl.textContent = `L:${lv.toFixed(1)}${j.unit} / F:${fv.toFixed(1)}${j.unit}`;
-    }
-    const barEl = $(`bar-${j.key}`);
-    if (barEl) {
+
+    // Teleop panel
+    const tVal = $(`teleop-val-${j.key}`);
+    if (tVal) tVal.textContent = `L:${lv.toFixed(1)}${j.unit} / F:${fv.toFixed(1)}${j.unit}`;
+    const tBar = $(`teleop-bar-${j.key}`);
+    if (tBar) {
       const pct = Math.max(0, Math.min(100, ((fv - j.min) / (j.max - j.min)) * 100));
-      barEl.style.width = `${pct.toFixed(1)}%`;
+      tBar.style.width = `${pct.toFixed(1)}%`;
     }
     if (syncSliders) {
-      const slider = $(`slider-${j.key}`);
-      if (slider && document.activeElement !== slider) {
-        slider.value = String(lv);
+      const sl = $(`teleop-slider-${j.key}`);
+      if (sl && document.activeElement !== sl) sl.value = String(lv);
+    }
+
+    // Independent Simulation sliders
+    for (const [arm, val] of [["leader", lv], ["follower", fv]]) {
+      const vEl = $(`sim-${arm}-val-${j.key}`);
+      if (vEl) vEl.textContent = `${val.toFixed(1)}${j.unit}`;
+      const bEl = $(`sim-${arm}-bar-${j.key}`);
+      if (bEl) {
+        const pct = Math.max(0, Math.min(100, ((val - j.min) / (j.max - j.min)) * 100));
+        bEl.style.width = `${pct.toFixed(1)}%`;
+      }
+      if (syncSliders) {
+        const sEl = $(`sim-${arm}-slider-${j.key}`);
+        if (sEl && document.activeElement !== sEl) sEl.value = String(val);
       }
     }
   }
+  updateAllStickViews();
 }
 
 function isTeleopPanelVisible() {
@@ -418,14 +650,32 @@ function applyWorkflowStatus(statusObj) {
   if (colProg) {
     colProg.textContent = `当前进度: ${statusObj.current_episode || 0} / ${statusObj.target_episodes || 0} 回合 (步数: ${statusObj.current_step || 0})`;
   }
-  if (Array.isArray(statusObj.logs)) {
-    renderLogs(statusObj.logs);
+  if (Array.isArray(statusObj.logs)) renderLogs(statusObj.logs);
+  if (statusObj.calibration) renderCalibrationState(statusObj.calibration);
+  if (wf !== "idle") scheduleCameraLoop();
+  updateAllStickViews();
+}
+
+function validateCollectSpecUI() {
+  const ds = ($("collect-dataset")?.value || "").trim();
+  const task = ($("collect-task")?.value || "").trim();
+  const fps = Number($("collect-fps")?.value || 30);
+  const badge = $("spec-check-badge");
+  if (!badge) return;
+
+  const issues = [];
+  if (!ds || ds.startsWith("eval_") || /[\s\u4e00-\u9fff/\\]/.test(ds)) {
+    issues.push("数据集名需为英文下划线且禁用 eval_");
   }
-  if (statusObj.calibration) {
-    renderCalibrationState(statusObj.calibration);
-  }
-  if (wf !== "idle") {
-    scheduleCameraLoop();
+  if (!task) issues.push("缺少英文任务指令");
+  if (fps !== 30) issues.push("建议保持 30 FPS");
+
+  if (issues.length === 0) {
+    badge.textContent = "规范校验: ✓ 符合团队标准";
+    badge.className = "pill pill-ok";
+  } else {
+    badge.textContent = `规范提示: ${issues.join("；")}`;
+    badge.className = "pill pill-warn";
   }
 }
 
@@ -434,6 +684,8 @@ async function refreshWaypoints() {
   const tbody = $("waypoints-tbody");
   if (!res.ok || !tbody) return;
   const list = res.data.waypoints || [];
+  state.waypoints = list;
+  updateAllStickViews();
   if (!list.length) {
     tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无示教轨迹点，请点击「记录示教点」。</td></tr>';
     return;
@@ -453,13 +705,56 @@ async function refreshWaypoints() {
     .join("");
 }
 
+async function replayEpisodeOnStick(dataset, episodeIndex) {
+  if (state.epReplayTimer) {
+    clearInterval(state.epReplayTimer);
+    state.epReplayTimer = null;
+  }
+  const res = await apiFetch(`/api/workflows/collect/episodes/${encodeURIComponent(dataset)}/${episodeIndex}`);
+  if (!res.ok || !Array.isArray(res.data?.frames) || res.data.frames.length === 0) {
+    appendLocalLog("该 Episode 暂无可回放帧数据。");
+    return;
+  }
+  const frames = res.data.frames;
+  let idx = 0;
+  appendLocalLog(`开始用火柴棍回放 ${dataset} #${episodeIndex} (${frames.length} 帧)...`);
+  state.epReplayTimer = setInterval(() => {
+    if (idx >= frames.length) {
+      clearInterval(state.epReplayTimer);
+      state.epReplayTimer = null;
+      if (stickViews.collect) stickViews.collect.setState({ overlayBadge: "" });
+      return;
+    }
+    const f = frames[idx];
+    const st = f["observation.state"] || [];
+    const jObj = {};
+    JOINTS.forEach((jm, i) => {
+      if (i < st.length) jObj[jm.key] = Number(st[i]);
+    });
+    state.followerJoints = { ...state.followerJoints, ...jObj };
+    if (stickViews.collect) {
+      stickViews.collect.setState({
+        joints: state.followerJoints,
+        overlayBadge: `▶ 回放 #${episodeIndex} (${idx + 1}/${frames.length})`,
+      });
+    }
+    if ($("collect-stick-data")) {
+      $("collect-stick-data").innerHTML = renderStickTelemetryHtml(
+        state.followerJoints,
+        `回放 ${dataset} #${episodeIndex} 帧 ${idx + 1}/${frames.length}`
+      );
+    }
+    idx += 1;
+  }, 60);
+}
+
 async function refreshEpisodes() {
   const res = await apiFetch("/api/workflows/collect/episodes");
   const tbody = $("episodes-tbody");
   if (!res.ok || !tbody) return;
   const eps = res.data.episodes || [];
   if (!eps.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无已保存的 Episode。</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无已保存的 Episode。</td></tr>';
     return;
   }
   tbody.innerHTML = eps
@@ -470,9 +765,16 @@ async function refreshEpisodes() {
         <td>${ep.task}</td>
         <td>${ep.num_frames} / ${ep.fps}Hz</td>
         <td class="joint-values">${ep.path}</td>
+        <td><button type="button" class="btn btn-xs btn-primary btn-ep-stick-replay" data-dataset="${ep.dataset}" data-ep="${ep.episode_index}">火柴棍回放</button></td>
       </tr>`
     )
     .join("");
+
+  tbody.querySelectorAll(".btn-ep-stick-replay").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      replayEpisodeOnStick(btn.dataset.dataset, Number(btn.dataset.ep));
+    });
+  });
 }
 
 async function refreshPlugins() {
@@ -578,9 +880,13 @@ function initTabs() {
       });
       if (target === "teleop") refreshCameraImagesOnce();
       if (target === "teaching") refreshWaypoints();
-      if (target === "collect") refreshEpisodes();
+      if (target === "collect") {
+        validateCollectSpecUI();
+        refreshEpisodes();
+      }
       if (target === "plugins") refreshPlugins();
       if (target === "vla") loadVLAConfigs();
+      updateAllStickViews();
     });
   });
 }
@@ -628,7 +934,13 @@ function connectWebSocket() {
           wfPill.textContent = `状态: ${wf}`;
           wfPill.className = wf === "idle" ? "pill pill-info" : "pill pill-ok";
         }
-        updateJointGauges(msg.leader_joints, msg.follower_joints, wf === "teaching_replay");
+        if (msg.safety) updateSafetyUI(msg.safety);
+        if (msg.connection_status) updateConnectionBadge(msg.connection_status);
+        const shouldSyncSliders =
+          wf === "teaching_replay" ||
+          wf === "demo_routine" ||
+          msg.safety?.sync_direction === "real_to_sim";
+        updateJointGauges(msg.leader_joints, msg.follower_joints, shouldSyncSliders);
         if (msg.workflow_status) {
           const colProg = $("collect-progress-text");
           if (colProg) {
@@ -653,16 +965,42 @@ function connectWebSocket() {
       state.wsRetryMs = Math.min(10000, state.wsRetryMs * 2);
       setTimeout(connectWebSocket, delay);
     };
-
-    ws.onerror = () => {
-      // Handled by onclose
-    };
+    ws.onerror = () => {};
   } catch {
     startPollingFallback();
   }
 }
 
 function bindActions() {
+  // Global safety bar
+  $("btn-global-estop")?.addEventListener("click", async () => {
+    const res = await apiFetch("/api/safety/estop", {
+      method: "POST",
+      body: JSON.stringify({ reason: "Topbar E-Stop Button" }),
+    });
+    if (res.ok) updateSafetyUI(res.data);
+  });
+
+  $("btn-global-reset")?.addEventListener("click", async () => {
+    const res = await apiFetch("/api/safety/reset", { method: "POST" });
+    if (res.ok) updateSafetyUI(res.data);
+  });
+
+  $("btn-toggle-torque")?.addEventListener("click", async () => {
+    const res = await apiFetch("/api/safety/torque", {
+      method: "POST",
+      body: JSON.stringify({ enabled: !state.torqueEnabled }),
+    });
+    if (res.ok) updateSafetyUI(res.data);
+  });
+
+  $("btn-quick-rest")?.addEventListener("click", async () => {
+    await apiFetch("/api/workflows/teaching/pose", {
+      method: "POST",
+      body: JSON.stringify({ pose: "rest", duration_s: 1.5 }),
+    });
+  });
+
   $("mode-select")?.addEventListener("change", async (ev) => {
     const mode = ev.target.value;
     const res = await apiFetch("/api/mode", {
@@ -717,7 +1055,7 @@ function bindActions() {
       renderHardwareProbe(res.data);
       refreshCameraImagesOnce();
       if ($("device-config-status")) {
-        $("device-config-status").textContent = "已应用并保存到 .env！现在可直接进行标定、遥操作或采集数据。";
+        $("device-config-status").textContent = "已应用并保存到 .env！";
       }
       appendLocalLog("已保存主从臂及摄像头配置到 .env。");
     } else if ($("device-config-status")) {
@@ -729,25 +1067,18 @@ function bindActions() {
     const fSel = $("select-follower-port");
     const lSel = $("select-leader-port");
     if (!fSel || !lSel) return;
-    const tmp = fSel.value;
-    fSel.value = lSel.value;
-    lSel.value = tmp;
-    if ($("device-config-status")) {
-      $("device-config-status").textContent = "已对调主从臂选项，请点击【应用并保存到 .env】生效。";
-    }
+    [fSel.value, lSel.value] = [lSel.value, fSel.value];
   });
 
   $("btn-swap-cameras")?.addEventListener("click", () => {
     const fCam = $("select-front-camera");
     const wCam = $("select-wrist-camera");
     if (!fCam || !wCam) return;
-    const tmp = fCam.value;
-    fCam.value = wCam.value;
-    wCam.value = tmp;
-    if ($("device-config-status")) {
-      $("device-config-status").textContent = "已对调前置/腕部相机选项，请点击【应用并保存到 .env】生效。";
-    }
+    [fCam.value, wCam.value] = [wCam.value, fCam.value];
   });
+
+  // Calibration controls
+  $("calibrate-target")?.addEventListener("change", () => updateAllStickViews());
 
   $("btn-start-calibrate")?.addEventListener("click", async () => {
     const target = $("calibrate-target")?.value || "follower";
@@ -760,9 +1091,6 @@ function bindActions() {
       body: JSON.stringify({ target, port }),
     });
     if (res.ok) {
-      if ($("calibrate-status")) {
-        $("calibrate-status").textContent = `正在执行 ${target} 标定 (${res.data.mode}, ${res.data.port || ""})...`;
-      }
       const st = await apiFetch("/api/workflows/status");
       if (st.ok) applyWorkflowStatus(st.data);
     }
@@ -797,6 +1125,23 @@ function bindActions() {
     if (st.ok) applyWorkflowStatus(st.data);
   });
 
+  $("btn-save-home-pose")?.addEventListener("click", async () => {
+    const r = await apiFetch("/api/workflows/teaching/save_pose", {
+      method: "POST",
+      body: JSON.stringify({ target: "home" }),
+    });
+    if (r.ok) appendLocalLog("已保存当前姿态至 software/upright_pose.json");
+  });
+
+  $("btn-save-rest-pose")?.addEventListener("click", async () => {
+    const r = await apiFetch("/api/workflows/teaching/save_pose", {
+      method: "POST",
+      body: JSON.stringify({ target: "rest" }),
+    });
+    if (r.ok) appendLocalLog("已保存当前姿态至 software/rest_pose.json");
+  });
+
+  // Teleop & WASD
   $("btn-start-teleop")?.addEventListener("click", async () => {
     const fps = Number($("teleop-fps")?.value || 60);
     const res = await apiFetch("/api/workflows/teleop/start", {
@@ -816,9 +1161,9 @@ function bindActions() {
 
   $("btn-reset-joints")?.addEventListener("click", async () => {
     const home = Object.fromEntries(JOINTS.map((j) => [j.key, j.def]));
-    const res = await apiFetch("/api/workflows/teleop/joints", {
+    const res = await apiFetch("/api/sim/joints", {
       method: "POST",
-      body: JSON.stringify({ joints: home }),
+      body: JSON.stringify({ arm: "both", joints: home }),
     });
     if (res.ok) {
       updateJointGauges(res.data.leader_joints, res.data.follower_joints, true);
@@ -826,6 +1171,95 @@ function bindActions() {
     }
   });
 
+  document.querySelectorAll(".btn-dpad").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const key = btn.dataset.key;
+      const res = await apiFetch("/api/workflows/control/key", {
+        method: "POST",
+        body: JSON.stringify({ key, step_mm: 10.0 }),
+      });
+      if (res.ok && res.data?.follower_joints) {
+        updateJointGauges(
+          res.data.leader_joints || state.leaderJoints,
+          res.data.follower_joints,
+          true
+        );
+      }
+    });
+  });
+
+  document.addEventListener("keydown", async (ev) => {
+    if (!$("chk-wasd-enable")?.checked) return;
+    if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName || "")) return;
+    const k = ev.key.toLowerCase();
+    if (!["w", "a", "s", "d", "r", "f", "j", "k", "u", "i", "c", "v", "m", " "].includes(k)) return;
+    ev.preventDefault();
+    const res = await apiFetch("/api/workflows/control/key", {
+      method: "POST",
+      body: JSON.stringify({ key: k, step_mm: 10.0 }),
+    });
+    if (res.ok && res.data?.follower_joints) {
+      updateJointGauges(
+        res.data.leader_joints || state.leaderJoints,
+        res.data.follower_joints,
+        true
+      );
+    }
+  });
+
+  // Dedicated Simulation page controls
+  $("btn-apply-sync-mode")?.addEventListener("click", async () => {
+    const direction = $("sim-sync-direction")?.value || "off";
+    const safety_confirmed = Boolean($("chk-sim-safety")?.checked);
+    const res = await apiFetch("/api/sim/sync_mode", {
+      method: "POST",
+      body: JSON.stringify({ direction, safety_confirmed }),
+    });
+    const el = $("sim-sync-status");
+    if (res.ok && el) {
+      el.textContent = `当前同步状态: ${res.data.direction} ${res.data.note || ""}`;
+    } else if (el) {
+      el.textContent = `同步切换失败: ${res.data?.detail || "请检查安全确认与硬件连接"}`;
+    }
+  });
+
+  $("chk-sim-ik-drag")?.addEventListener("change", (ev) => {
+    if (stickViews.simFollower) stickViews.simFollower.setIkEnabled(ev.target.checked);
+  });
+
+  $("btn-apply-ik")?.addEventListener("click", async () => {
+    const x_mm = Number($("ik-x")?.value || 196);
+    const y_mm = Number($("ik-y")?.value || 0);
+    const z_mm = Number($("ik-z")?.value || 245);
+    const gripper = Number($("ik-grip")?.value || 20);
+    const res = await apiFetch("/api/sim/ik", {
+      method: "POST",
+      body: JSON.stringify({ arm: "follower", x_mm, y_mm, z_mm, gripper }),
+    });
+    if (res.ok && res.data) {
+      updateJointGauges(res.data.leader_joints, res.data.follower_joints, true);
+    }
+  });
+
+  $("btn-sim-leader-home")?.addEventListener("click", async () => {
+    const home = Object.fromEntries(JOINTS.map((j) => [j.key, j.def]));
+    const res = await apiFetch("/api/sim/joints", {
+      method: "POST",
+      body: JSON.stringify({ arm: "leader", joints: home, linked: Boolean($("chk-sim-linked")?.checked) }),
+    });
+    if (res.ok) updateJointGauges(res.data.leader_joints, res.data.follower_joints, true);
+  });
+
+  $("btn-sim-follower-home")?.addEventListener("click", async () => {
+    const home = Object.fromEntries(JOINTS.map((j) => [j.key, j.def]));
+    const res = await apiFetch("/api/sim/joints", {
+      method: "POST",
+      body: JSON.stringify({ arm: "follower", joints: home, linked: Boolean($("chk-sim-linked")?.checked) }),
+    });
+    if (res.ok) updateJointGauges(res.data.leader_joints, res.data.follower_joints, true);
+  });
+
+  // Teaching, Presets & Demo Routines
   $("btn-teach-waypoint")?.addEventListener("click", async () => {
     const label = $("waypoint-label")?.value || "";
     const res = await apiFetch("/api/workflows/teaching/record_waypoint", {
@@ -842,7 +1276,6 @@ function bindActions() {
     });
     if (res.ok) {
       state.activeWorkflow = "teaching_replay";
-      scheduleCameraLoop();
     }
   });
 
@@ -851,9 +1284,32 @@ function bindActions() {
     await refreshWaypoints();
   });
 
+  document.querySelectorAll(".btn-preset").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      await apiFetch("/api/workflows/teaching/pose", {
+        method: "POST",
+        body: JSON.stringify({ pose: btn.dataset.pose, duration_s: 1.2 }),
+      });
+    });
+  });
+
+  document.querySelectorAll(".btn-routine").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      await apiFetch("/api/workflows/teaching/routine", {
+        method: "POST",
+        body: JSON.stringify({ routine: btn.dataset.routine }),
+      });
+    });
+  });
+
+  // Data Collection & Spec Validator
+  for (const id of ["collect-dataset", "collect-task", "collect-fps"]) {
+    $(id)?.addEventListener("input", validateCollectSpecUI);
+  }
+
   $("btn-start-collect")?.addEventListener("click", async () => {
-    const dataset_name = $("collect-dataset")?.value || "arm101_dryrun_demo";
-    const single_task = $("collect-task")?.value || "Pick and place cube";
+    const dataset_name = $("collect-dataset")?.value || "yyzmiao_pick_cube_demo";
+    const single_task = $("collect-task")?.value || "Pick up the red cube and place it into the tray";
     const num_episodes = Number($("collect-episodes")?.value || 2);
     const fps = Number($("collect-fps")?.value || 30);
     const res = await apiFetch("/api/workflows/collect/start", {
@@ -862,7 +1318,7 @@ function bindActions() {
     });
     if (res.ok) {
       state.activeWorkflow = "collect";
-      scheduleCameraLoop();
+      updateAllStickViews();
     }
   });
 
@@ -870,11 +1326,13 @@ function bindActions() {
     await apiFetch("/api/workflows/collect/stop", { method: "POST" });
     state.activeWorkflow = "idle";
     await refreshEpisodes();
+    updateAllStickViews();
   });
 
   $("btn-refresh-episodes")?.addEventListener("click", refreshEpisodes);
   $("btn-refresh-plugins")?.addEventListener("click", refreshPlugins);
 
+  // VLA Preview + Stick Animation
   $("btn-vla-preview")?.addEventListener("click", async () => {
     const endpoint = $("vla-endpoint")?.value || "ws://127.0.0.1:8000";
     const policy_name = $("vla-policy-name")?.value || "pi05_so101_custom";
@@ -883,8 +1341,31 @@ function bindActions() {
       method: "POST",
       body: JSON.stringify({ endpoint, policy_name, task_prompt }),
     });
-    if (res.ok && $("vla-preview-output")) {
-      $("vla-preview-output").textContent = JSON.stringify(res.data, null, 2);
+    if (res.ok && res.data) {
+      if ($("vla-preview-output")) {
+        $("vla-preview-output").textContent = JSON.stringify(res.data, null, 2);
+      }
+      const chunk = res.data.action_chunk || [];
+      state.vlaChunk = chunk;
+      if (state.vlaAnimTimer) clearInterval(state.vlaAnimTimer);
+      if (chunk.length > 0) {
+        let stepIdx = 0;
+        state.vlaAnimTimer = setInterval(() => {
+          if ($("panel-vla")?.hidden) return;
+          const j = chunk[stepIdx % chunk.length];
+          if (stickViews.vla) {
+            stickViews.vla.setState({
+              joints: j,
+              vlaChunk: chunk,
+              overlayBadge: `预测步 ${j.step}/${chunk.length}`,
+            });
+          }
+          if ($("vla-stick-data")) {
+            $("vla-stick-data").innerHTML = renderStickTelemetryHtml(j, `VLA 预测第 ${j.step} 步`);
+          }
+          stepIdx += 1;
+        }, 420);
+      }
     }
   });
 
@@ -896,8 +1377,10 @@ function bindActions() {
 
 async function bootstrap() {
   initTabs();
+  initStickCanvases();
   initJointSliders();
   bindActions();
+  validateCollectSpecUI();
 
   const [probeRes, statusRes] = await Promise.all([
     apiFetch("/api/hardware/probe"),
@@ -911,6 +1394,7 @@ async function bootstrap() {
   if (probeRes.ok) renderHardwareProbe(probeRes.data);
   if (statusRes.ok) applyWorkflowStatus(statusRes.data);
 
+  updateAllStickViews();
   refreshCameraImagesOnce();
   connectWebSocket();
 }

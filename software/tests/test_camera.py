@@ -139,7 +139,9 @@ class TestCameraModule(unittest.TestCase):
         self.assertIsInstance(devices, list)
         for dev in devices:
             self.assertIsInstance(dev, CameraDeviceInfo)
-            self.assertTrue(dev.device_path.startswith("/dev/video"))
+            self.assertTrue(
+                dev.device_path.startswith("/dev/video") or dev.device_path.isdigit()
+            )
 
         capture_only = list_capture_cameras()
         self.assertIsInstance(capture_only, list)

@@ -154,6 +154,66 @@ class VLAMockPredictRequest(BaseModel):
     task_prompt: str = "Pick up the cube and place it in the bin"
 
 
+class EstopRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = "Web Studio E-Stop"
+
+
+class TorqueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+
+
+class SimJointsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    arm: Literal["leader", "follower", "both"] = "follower"
+    joints: dict[str, Any] | list[Any]
+    linked: bool | None = None
+
+    @field_validator("joints")
+    @classmethod
+    def _validate_sim_joints(cls, value: dict[str, Any] | list[Any]) -> dict[str, float]:
+        return validate_joint_dict(value, require_non_empty=True)
+
+
+class SimIKRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    arm: Literal["leader", "follower", "both"] = "follower"
+    x_mm: float
+    y_mm: float
+    z_mm: float
+    pitch_deg: float | None = None
+    gripper: float | None = Field(default=None, ge=0.0, le=100.0)
+
+
+class SimSyncModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    direction: Literal["off", "real_to_sim", "sim_to_real"] = "off"
+    safety_confirmed: bool = False
+
+
+class ControlKeyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(min_length=1, max_length=8)
+    step_mm: float = Field(default=8.0, ge=0.5, le=40.0)
+
+
+class PresetPoseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    pose: Literal["home", "rest", "inspect", "pick_hover", "wave"]
+    duration_s: float = Field(default=1.2, ge=0.1, le=10.0)
+
+
+class DemoRoutineRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    routine: Literal["wave", "pick"]
+
+
+class SavePoseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target: Literal["home", "rest"]
+
+
 class StudioRuntime:
     """Container holding all runtime managers on app.state.runtime."""
 
@@ -419,6 +479,101 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     @fastapi_app.get("/api/workflows/collect/episodes")
     async def collect_episodes() -> dict[str, Any]:
         return _rt().workflows.list_episodes()
+
+    @fastapi_app.get("/api/workflows/collect/episodes/{dataset_name}/{episode_index}")
+    async def collect_episode_detail(dataset_name: str, episode_index: int) -> dict[str, Any]:
+        try:
+            return _rt().workflows.get_episode_frames(dataset_name, episode_index)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    # ------------------------------------------------------------------
+    # Safety Kernel, Independent Dual-Arm Sim, IK & aguiya Presets
+    # ------------------------------------------------------------------
+    @fastapi_app.post("/api/safety/estop")
+    async def safety_estop(req: EstopRequest | None = None) -> dict[str, Any]:
+        body = req or EstopRequest()
+        return await _rt().workflows.trigger_estop(reason=body.reason)
+
+    @fastapi_app.post("/api/safety/reset")
+    async def safety_reset() -> dict[str, Any]:
+        return await _rt().workflows.reset_estop()
+
+    @fastapi_app.post("/api/safety/torque")
+    async def safety_torque(req: TorqueRequest) -> dict[str, Any]:
+        try:
+            return await _rt().workflows.set_torque(req.enabled)
+        except WorkflowConflictError as exc:
+            raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
+
+    @fastapi_app.post("/api/sim/joints")
+    async def sim_joints(req: SimJointsRequest) -> dict[str, Any]:
+        try:
+            return _rt().workflows.set_sim_joints(
+                arm=req.arm, raw_joints=req.joints, linked=req.linked
+            )
+        except WorkflowConflictError as exc:
+            raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
+
+    @fastapi_app.post("/api/sim/ik")
+    async def sim_ik(req: SimIKRequest) -> dict[str, Any]:
+        try:
+            return _rt().workflows.apply_ik_target(
+                arm=req.arm,
+                x_mm=req.x_mm,
+                y_mm=req.y_mm,
+                z_mm=req.z_mm,
+                pitch_deg=req.pitch_deg,
+                gripper=req.gripper,
+            )
+        except WorkflowConflictError as exc:
+            raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+    @fastapi_app.post("/api/sim/sync_mode")
+    async def sim_sync_mode(req: SimSyncModeRequest) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                _rt().workflows.set_sync_mode,
+                direction=req.direction,
+                safety_confirmed=req.safety_confirmed,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    @fastapi_app.post("/api/workflows/control/key")
+    async def workflow_control_key(req: ControlKeyRequest) -> dict[str, Any]:
+        try:
+            return _rt().workflows.send_control_key(req.key, step_mm=req.step_mm)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+    @fastapi_app.post("/api/workflows/teaching/pose")
+    async def teaching_pose(req: PresetPoseRequest) -> dict[str, Any]:
+        try:
+            return await _rt().workflows.run_preset_pose(req.pose, duration_s=req.duration_s)
+        except WorkflowConflictError as exc:
+            raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+    @fastapi_app.post("/api/workflows/teaching/routine")
+    async def teaching_routine(req: DemoRoutineRequest) -> dict[str, Any]:
+        try:
+            return await _rt().workflows.run_demo_routine(req.routine)
+        except WorkflowConflictError as exc:
+            raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
+
+    @fastapi_app.post("/api/workflows/teaching/save_pose")
+    async def teaching_save_pose(req: SavePoseRequest) -> dict[str, Any]:
+        return _rt().workflows.save_custom_pose(req.target)
 
     # ------------------------------------------------------------------
     # Cameras

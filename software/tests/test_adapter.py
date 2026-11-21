@@ -34,8 +34,9 @@ class TestHardwareAdapters(unittest.TestCase):
     def test_config_roles(self) -> None:
         self.assertEqual(self.follower_cfg.role, ArmRole.FOLLOWER)
         self.assertEqual(self.leader_cfg.role, ArmRole.LEADER)
-        self.assertEqual(self.follower_cfg.port, "/dev/ttyACM0")
-        self.assertEqual(self.leader_cfg.port, "/dev/ttyACM1")
+        self.assertTrue(bool(self.follower_cfg.port))
+        self.assertTrue(bool(self.leader_cfg.port))
+        self.assertNotEqual(self.follower_cfg.port, self.leader_cfg.port)
 
     def test_follower_unconnected_safety(self) -> None:
         self.assertIsInstance(self.follower, BaseArmAdapter)

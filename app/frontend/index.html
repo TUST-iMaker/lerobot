@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>TUST-iMaker Arm101 Studio</title>
+  <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -17,8 +18,8 @@
           <circle cx="19" cy="7" r="2" fill="currentColor" />
         </svg>
         <div>
-          <h1>TUST-iMaker Arm101 Studio</h1>
-          <p class="subtitle">SO-ARM101 双臂串联控制台 · 双系统标准工作区</p>
+          <h1>TUST-iMaker Arm101 Studio (V3 融合版)</h1>
+          <p class="subtitle">SO-ARM101 统一安全内核 · 全场景 6 轴火柴棍仿真 · 双系统标准工作区</p>
         </div>
       </div>
 
@@ -37,6 +38,16 @@
       </div>
     </header>
 
+    <!-- Global Safety Bar (Fused aguiya cockpit controls) -->
+    <section class="safety-bar" aria-label="Global Safety Controls">
+      <span id="torque-badge" class="pill pill-ok">⚡ 扭矩: 使能</span>
+      <span id="estop-badge" class="pill pill-info">安全状态: 正常</span>
+      <button type="button" class="btn btn-xs btn-secondary" data-testid="btn-toggle-torque" id="btn-toggle-torque">切换扭矩 / 卸力</button>
+      <button type="button" class="btn btn-xs btn-secondary" data-testid="btn-quick-rest" id="btn-quick-rest">🛌 一键回蜷缩休眠 (S曲线)</button>
+      <button type="button" class="btn btn-xs btn-danger" data-testid="btn-global-estop" id="btn-global-estop">🛑 紧急停止 (E-STOP)</button>
+      <button type="button" class="btn btn-xs btn-primary" data-testid="btn-global-reset" id="btn-global-reset" hidden>🔄 解除急停复位</button>
+    </section>
+
     <!-- Persistent Hardware Status Banner -->
     <section data-testid="hardware-status-banner" id="hardware-status-banner" class="hw-banner hw-dry">
       <div class="hw-banner-main">
@@ -50,9 +61,10 @@
     <!-- Navigation Tabs -->
     <nav class="tab-nav" role="tablist" aria-label="Studio Modules">
       <button type="button" role="tab" aria-selected="true" class="tab-btn active" data-tab="dashboard" data-testid="tab-dashboard">总览与标定</button>
-      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="teleop" data-testid="tab-teleop">遥操作</button>
-      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="teaching" data-testid="tab-teaching">示教与回放</button>
-      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="collect" data-testid="tab-collect">数据采集</button>
+      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="teleop" data-testid="tab-teleop">遥操作与驾驶舱</button>
+      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="sim" data-testid="tab-sim">6轴双向仿真</button>
+      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="teaching" data-testid="tab-teaching">示教与表演</button>
+      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="collect" data-testid="tab-collect">数据采集与规范</button>
       <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="plugins" data-testid="tab-plugins">开源插件中心</button>
       <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="vla" data-testid="tab-vla">VLA 与云端配置</button>
     </nav>
@@ -63,8 +75,8 @@
       <section id="panel-dashboard" class="tab-panel" role="tabpanel">
         <div class="panel-toolbar">
           <div>
-            <h2>硬件拓扑与零点标定</h2>
-            <p class="muted">自动过滤蓝牙虚拟串口（如 COM8/COM9），识别 CH340/STM32 USB 串口与摄像头。</p>
+            <h2>硬件拓扑、设备选择与零点标定</h2>
+            <p class="muted">自动过滤蓝牙虚拟串口（如 COM8/COM9），识别 CH340/CH343/STM32 USB 串口与双摄像头。</p>
           </div>
           <div class="btn-group">
             <button type="button" class="btn btn-primary" data-testid="btn-probe-hardware" id="btn-probe-hardware">重新探测硬件</button>
@@ -90,7 +102,7 @@
           <div class="panel-toolbar">
             <div>
               <h3>主从臂与摄像头配置（自动检测 / 手动选择）</h3>
-              <p class="muted">启动探测时会自动匹配已连接的 USB 串口与摄像头；若主从臂或前后相机接反，可直接下拉改选或点击对调，并保存到 `.env`。</p>
+              <p class="muted">启动探测时自动匹配串口与摄像头；若主从臂或前后相机接反，可直接下拉改选或点击对调，并保存到 `.env`（同时同步给 `software/`）。</p>
             </div>
             <div class="btn-group">
               <button type="button" class="btn btn-secondary" data-testid="btn-auto-detect-devices" id="btn-auto-detect-devices">自动识别填充</button>
@@ -124,8 +136,8 @@
         <div class="card mt-16">
           <div class="panel-toolbar">
             <div>
-              <h3>单臂零点标定 (lerobot-calibrate)</h3>
-              <p class="muted">安全提示：每次仅标定单条机械臂（Follower 或 Leader）。可直接在下方网页引导中完成「确认中位」与「录制限位」，无需切回黑框终端敲回车。</p>
+              <h3>单臂零点标定 (lerobot-calibrate) &amp; 官方前伸中位重合演示</h3>
+              <p class="muted">参考虚影为官方 SO-101 中位（大臂竖直向上、小臂与夹爪水平前伸）；把机械臂摆成一致姿势，出现绿色「中位重合成功 ✓」即可确认。</p>
             </div>
             <div class="btn-group">
               <select id="calibrate-target" aria-label="Calibration Target">
@@ -134,10 +146,17 @@
               </select>
               <button type="button" class="btn btn-accent" data-testid="btn-start-calibrate" id="btn-start-calibrate">开始标定</button>
               <button type="button" class="btn btn-danger" data-testid="btn-stop-calibrate" id="btn-stop-calibrate">停止标定</button>
+              <button type="button" class="btn btn-secondary" id="btn-save-home-pose">存为中位 (upright)</button>
+              <button type="button" class="btn btn-secondary" id="btn-save-rest-pose">存为蜷缩位 (rest)</button>
             </div>
           </div>
           <div id="calibration-file-badges" class="chip-row mt-12"></div>
           <div id="calibrate-status" class="muted mt-12">当前未执行标定任务。dry_run 模式将生成 `data/dry_run/calibration/*.json` 演练文件。</div>
+
+          <div class="stick-split mt-12">
+            <canvas id="canvas-cal-stick" data-testid="canvas-cal-stick" class="stick-canvas" width="520" height="320"></canvas>
+            <div id="cal-stick-data" class="stick-data-panel"></div>
+          </div>
 
           <div id="calibration-interactive-panel" class="cal-box mt-12" hidden>
             <div class="panel-toolbar">
@@ -164,12 +183,15 @@
         </div>
       </section>
 
-      <!-- 2. Teleoperation -->
+      <!-- 2. Teleoperation & WASD Cockpit -->
       <section id="panel-teleop" class="tab-panel" role="tabpanel" hidden>
         <div class="panel-toolbar">
           <div>
-            <h2>SO-101 主从臂遥操作与 6-DOF 监控</h2>
-            <p class="muted">在 dry_run 模式下可通过下方虚拟主臂滑块实时驱动 6 自由度从臂运动学模型与合成相机画面。</p>
+            <h2>SO-101 主从遥操作 &amp; WASD 笛卡尔锁高驾驶舱</h2>
+            <div class="chip-row mt-12">
+              <span id="teleop-connection-badge" data-testid="teleop-connection-badge" class="conn-badge conn-sim">模拟演练模式（主从联动就绪）</span>
+              <span id="teleop-tcp-badge" class="pill pill-info">TCP: X=0 Y=0 Z=0 mm</span>
+            </div>
           </div>
           <div class="btn-group">
             <label class="inline-field">
@@ -178,14 +200,44 @@
             </label>
             <button type="button" class="btn btn-accent" data-testid="btn-start-teleop" id="btn-start-teleop">启动遥操作</button>
             <button type="button" class="btn btn-danger" data-testid="btn-stop-teleop" id="btn-stop-teleop">停止遥操作</button>
-            <button type="button" class="btn btn-secondary" id="btn-reset-joints">归位</button>
+            <button type="button" class="btn btn-secondary" id="btn-reset-joints">归位中位</button>
           </div>
         </div>
 
         <div class="grid-2">
           <div class="card">
-            <h3>6-DOF 关节状态 (Leader 主臂 vs Follower 从臂)</h3>
-            <div id="joints-container" class="joints-list"></div>
+            <h3>主臂 (Leader) 6-DOF 火柴棍</h3>
+            <canvas id="canvas-teleop-leader" data-testid="canvas-teleop-leader" class="stick-canvas" width="480" height="280"></canvas>
+            <div id="teleop-leader-data" class="stick-data-panel mt-12"></div>
+          </div>
+          <div class="card">
+            <h3>从臂 (Follower) 6-DOF 火柴棍</h3>
+            <canvas id="canvas-teleop-follower" data-testid="canvas-teleop-follower" class="stick-canvas" width="480" height="280"></canvas>
+            <div id="teleop-follower-data" class="stick-data-panel mt-12"></div>
+          </div>
+        </div>
+
+        <div class="grid-2 mt-16">
+          <div class="card">
+            <h3>6-DOF 关节滑块 &amp; WASD 锁高方向盘 (aguiya 内核)</h3>
+            <div class="btn-group mt-12">
+              <label class="inline-field">
+                <input id="chk-wasd-enable" type="checkbox" />
+                <span>启用键盘 WASD 驾驶 (W/S锁高平推, A/D旋转, R/F升降, C/V夹爪, 空格急停)</span>
+              </label>
+            </div>
+            <div class="dpad-grid mt-12">
+              <button type="button" class="btn btn-xs btn-secondary btn-dpad" data-key="r">升高 [R]</button>
+              <button type="button" class="btn btn-xs btn-primary btn-dpad" data-key="w">前推 [W]</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-dpad" data-key="f">降低 [F]</button>
+              <button type="button" class="btn btn-xs btn-primary btn-dpad" data-key="a">左旋 [A]</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-dpad" data-key="m">中位 [M]</button>
+              <button type="button" class="btn btn-xs btn-primary btn-dpad" data-key="d">右旋 [D]</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-dpad" data-key="c">张爪 [C]</button>
+              <button type="button" class="btn btn-xs btn-primary btn-dpad" data-key="s">后拉 [S]</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-dpad" data-key="v">闭爪 [V]</button>
+            </div>
+            <div id="joints-container" class="joints-list mt-12"></div>
           </div>
 
           <div class="card">
@@ -204,12 +256,78 @@
         </div>
       </section>
 
-      <!-- 3. Teaching & Replay -->
+      <!-- 3. Dedicated Dual-Arm 6-DOF Simulation & Bidirectional Sync Page -->
+      <section id="panel-sim" class="tab-panel" role="tabpanel" hidden>
+        <div class="panel-toolbar">
+          <div>
+            <h2>独立 6 轴火柴棍仿真 &amp; 现实↔动画双向同步中心</h2>
+            <p class="muted">左右并排独立展示主臂与从臂，可分别用滑块操控，也可直接拖动从臂末端红圈进行 6 轴逆运动学（IK）控臂与夹爪开合。</p>
+          </div>
+          <div class="btn-group">
+            <select id="sim-sync-direction" data-testid="sim-sync-direction" aria-label="Sync Direction">
+              <option value="off">纯仿真（不连串口）</option>
+              <option value="real_to_sim">现实动 → 动画动（只读真机，不上力矩）</option>
+              <option value="sim_to_real">动画动 → 现实动（安全限幅驱动从臂）</option>
+            </select>
+            <label class="inline-field">
+              <input id="chk-sim-safety" type="checkbox" />
+              <span>确认桌面安全（解锁真机驱动）</span>
+            </label>
+            <button type="button" class="btn btn-primary" data-testid="btn-apply-sync-mode" id="btn-apply-sync-mode">应用同步模式</button>
+            <label class="inline-field">
+              <input id="chk-sim-linked" type="checkbox" />
+              <span>主从同步联动</span>
+            </label>
+          </div>
+        </div>
+        <div id="sim-sync-status" class="muted">当前同步状态: off（独立双臂仿真，支持独立调节主/从臂与末端拖拽 IK）。</div>
+
+        <div class="grid-2 mt-12">
+          <!-- Left: Leader Arm -->
+          <div class="card">
+            <div class="panel-toolbar">
+              <h3>左：主臂 (Leader Arm) — 6 轴状态与独立控制</h3>
+              <button type="button" class="btn btn-xs btn-secondary" id="btn-sim-leader-home">归中位</button>
+            </div>
+            <canvas id="canvas-sim-leader" data-testid="canvas-sim-leader" class="stick-canvas mt-12" width="520" height="320"></canvas>
+            <div id="sim-leader-data" class="stick-data-panel mt-12"></div>
+            <div id="sim-leader-sliders" class="joints-list mt-12"></div>
+          </div>
+
+          <!-- Right: Follower Arm with IK Drag -->
+          <div class="card">
+            <div class="panel-toolbar">
+              <h3>右：从臂 (Follower Arm) — 拖拽末端夹爪 IK 控臂</h3>
+              <div class="btn-group">
+                <label class="inline-field">
+                  <input id="chk-sim-ik-drag" type="checkbox" checked />
+                  <span>允许拖拽夹爪 IK</span>
+                </label>
+                <button type="button" class="btn btn-xs btn-secondary" id="btn-sim-follower-home">归中位</button>
+              </div>
+            </div>
+            <canvas id="canvas-sim-follower" data-testid="canvas-sim-follower" class="stick-canvas mt-12" width="520" height="320"></canvas>
+            <div class="form-grid mt-12">
+              <label><span>目标 X (mm)</span><input id="ik-x" type="number" value="196" step="5" /></label>
+              <label><span>目标 Y (mm)</span><input id="ik-y" type="number" value="0" step="5" /></label>
+              <label><span>目标 Z (mm)</span><input id="ik-z" type="number" value="245" step="5" /></label>
+              <label><span>夹爪开合 (%)</span><input id="ik-grip" type="number" value="20" min="0" max="100" step="5" /></label>
+            </div>
+            <div class="btn-group mt-12">
+              <button type="button" class="btn btn-accent" data-testid="btn-apply-ik" id="btn-apply-ik">执行 6 轴逆运动学 (IK) 移动</button>
+            </div>
+            <div id="sim-follower-data" class="stick-data-panel mt-12"></div>
+            <div id="sim-follower-sliders" class="joints-list mt-12"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. Teaching, Presets & Demo Routines -->
       <section id="panel-teaching" class="tab-panel" role="tabpanel" hidden>
         <div class="panel-toolbar">
           <div>
-            <h2>演示示教与轨迹点回放</h2>
-            <p class="muted">记录当前 6-DOF 关节关键帧至 `data/dry_run/waypoints.json`，支持平滑插值回放与轨迹清空。</p>
+            <h2>演示示教、预设表演动线与轨迹回放</h2>
+            <p class="muted">融合关键帧航点回放 + `aguiya` 预设姿态（Home/Rest/Inspect/Hover）与一键表演（挥手 Wave / 抓取 Pick）。</p>
           </div>
           <div class="btn-group">
             <input id="waypoint-label" type="text" placeholder="航点备注 (如 grasp_ready)" />
@@ -220,6 +338,24 @@
         </div>
 
         <div class="card">
+          <div class="panel-toolbar">
+            <h3>快捷预设姿态与现场表演动线 (自动 S 曲线平滑插值)</h3>
+            <div class="btn-group">
+              <button type="button" class="btn btn-primary btn-routine" data-routine="wave">👋 挥手致意 (Wave)</button>
+              <button type="button" class="btn btn-accent btn-routine" data-routine="pick">🦾 模拟抓取 (Pick)</button>
+              <button type="button" class="btn btn-secondary btn-preset" data-pose="home">🎯 回直立中位 (Home)</button>
+              <button type="button" class="btn btn-secondary btn-preset" data-pose="rest">🛌 回蜷缩休眠 (Rest)</button>
+              <button type="button" class="btn btn-secondary btn-preset" data-pose="inspect">👀 俯视观察位</button>
+              <button type="button" class="btn btn-secondary btn-preset" data-pose="pick_hover">🤏 抓取悬停位</button>
+            </div>
+          </div>
+          <div class="stick-split mt-12">
+            <canvas id="canvas-teach-stick" data-testid="canvas-teach-stick" class="stick-canvas" width="520" height="300"></canvas>
+            <div id="teach-stick-data" class="stick-data-panel"></div>
+          </div>
+        </div>
+
+        <div class="card mt-16">
           <div class="table-wrap">
             <table>
               <thead>
@@ -239,12 +375,12 @@
         </div>
       </section>
 
-      <!-- 4. Data Collection -->
+      <!-- 5. Data Collection & Team Spec -->
       <section id="panel-collect" class="tab-panel" role="tabpanel" hidden>
         <div class="panel-toolbar">
           <div>
-            <h2>数据集采集 (lerobot-record / dry_run)</h2>
-            <p class="muted">real 模式自动注入 `--dataset.push_to_hub=false`；dry_run 模式落盘至 `data/dry_run/datasets/`。</p>
+            <h2>数据集采集 (lerobot-record / dry_run) 与团队多人协作数据规范</h2>
+            <p class="muted">采集数据本身即为 6 轴状态/动作序列，下方可直接用火柴棍实时演示采集过程并回放任意已落盘 Episode。</p>
           </div>
           <div class="btn-group">
             <button type="button" class="btn btn-accent" data-testid="btn-start-collect" id="btn-start-collect">开始采集</button>
@@ -252,31 +388,50 @@
           </div>
         </div>
 
-        <div class="card">
+        <!-- Team Multi-Person Data Specification Card -->
+        <div class="spec-box" data-testid="data-spec-card" id="data-spec-card">
+          <div class="panel-toolbar">
+            <strong>📋 TUST-iMaker 多人协作数据采集规范（详见 docs/02_arm101_workflow/05_data_spec.md）</strong>
+            <span id="spec-check-badge" class="pill pill-ok">规范校验: 通过</span>
+          </div>
+          <ul class="spec-list">
+            <li><strong>数据集命名</strong>：建议 <code>&lt;成员&gt;_&lt;动词&gt;_&lt;物体&gt;_&lt;日期&gt;</code>（如 <code>yyzmiao_pick_cube_20261121</code>），严禁 <code>eval_</code> 前缀、中文或空格。</li>
+            <li><strong>必采 6-DOF 特征</strong>：<code>observation.state</code>（从臂）+ <code>action</code>（主臂），统一 <code>use_degrees=true</code>，固定顺序 <code>shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper</code>。</li>
+            <li><strong>必采相机键名</strong>：标准双视角固定为 <code>observation.images.front</code> + <code>observation.images.wrist</code>（<code>640×480 @ 30fps</code>）；单相机也必须命名为 <code>front</code>（禁用不统一键名）。</li>
+            <li><strong>指令与质检</strong>：固定 <code>fps=30</code>；同一任务使用完全一致的英文 <code>single_task</code>；建议每任务 ≥ 50 条有效回合，上传前确保 <code>meta/stats.json</code> 含 <code>q01/q99</code>（兼容 <code>pi0.5</code>）。</li>
+          </ul>
+        </div>
+
+        <div class="card mt-16">
           <div class="form-grid">
             <label>
-              <span>数据集名称 (禁用 eval_ 前缀)</span>
-              <input id="collect-dataset" type="text" value="arm101_dryrun_demo" />
+              <span>数据集名称 (推荐 成员_动词_物体_日期)</span>
+              <input id="collect-dataset" type="text" value="yyzmiao_pick_cube_demo" />
             </label>
             <label>
-              <span>任务指令 (single_task)</span>
-              <input id="collect-task" type="text" value="Pick and place cube" />
+              <span>英文任务指令 (single_task)</span>
+              <input id="collect-task" type="text" value="Pick up the red cube and place it into the tray" />
             </label>
             <label>
               <span>采集回合数 (episodes)</span>
               <input id="collect-episodes" type="number" min="1" max="100" value="2" />
             </label>
             <label>
-              <span>帧率 (FPS)</span>
+              <span>帧率 (团队规范: 30 FPS)</span>
               <input id="collect-fps" type="number" min="1" max="120" value="30" />
             </label>
           </div>
           <div id="collect-progress-text" class="mt-12 muted">当前进度: 0 / 0 回合</div>
+
+          <div class="stick-split mt-12">
+            <canvas id="canvas-collect-stick" data-testid="canvas-collect-stick" class="stick-canvas" width="520" height="300"></canvas>
+            <div id="collect-stick-data" class="stick-data-panel"></div>
+          </div>
         </div>
 
         <div class="card mt-16">
           <div class="panel-toolbar">
-            <h3>已落盘 Episode 列表</h3>
+            <h3>已落盘 Episode 列表（点击「火柴棍回放」检视原始 6 轴数据）</h3>
             <button type="button" class="btn btn-secondary" id="btn-refresh-episodes">刷新列表</button>
           </div>
           <div class="table-wrap">
@@ -288,17 +443,18 @@
                   <th>任务指令</th>
                   <th>帧数 / FPS</th>
                   <th>存储路径</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody id="episodes-tbody">
-                <tr><td colspan="5" class="muted">暂无已保存的 Episode。</td></tr>
+                <tr><td colspan="6" class="muted">暂无已保存的 Episode。</td></tr>
               </tbody>
             </table>
           </div>
         </div>
       </section>
 
-      <!-- 5. Open-Source Plugin Hub -->
+      <!-- 6. Open-Source Plugin Hub -->
       <section id="panel-plugins" class="tab-panel" role="tabpanel" hidden>
         <div class="panel-toolbar">
           <div>
@@ -310,12 +466,12 @@
         <div data-testid="plugin-list" id="plugin-list" class="plugin-grid"></div>
       </section>
 
-      <!-- 6. VLA & Cloud Configs -->
+      <!-- 7. VLA & Cloud Configs -->
       <section id="panel-vla" class="tab-panel" role="tabpanel" hidden>
         <div class="panel-toolbar">
           <div>
-            <h2>VLA 训练配置与远程策略预览</h2>
-            <p class="muted">读取工作区 `configs/train/*.yaml` 与 `pi0.7` / `pi0.5` / `openpi` 训练指南。</p>
+            <h2>VLA 训练配置与远程策略 6 轴预测预览</h2>
+            <p class="muted">读取工作区 `configs/train/*.yaml` 与 `pi0.7` / `pi0.5` / `openpi` 训练指南，并用火柴棍动画直观预览 5 步动作块。</p>
           </div>
         </div>
 
@@ -323,7 +479,7 @@
         <div id="vla-configs-grid" class="grid-2 mt-16"></div>
 
         <div class="card mt-16">
-          <h3>远程 VLA / OpenPI 策略预览 (Mock / Remote Endpoint)</h3>
+          <h3>远程 VLA / OpenPI 策略预测预览 (5 步 6-DOF Action Chunk 火柴棍动画)</h3>
           <div class="form-grid mt-12">
             <label>
               <span>策略服务端点 (OpenPI / LeRobot Policy Server)</span>
@@ -339,7 +495,11 @@
             </label>
           </div>
           <div class="btn-group mt-12">
-            <button type="button" class="btn btn-primary" id="btn-vla-preview">生成 5 步 6-DOF 预测预览</button>
+            <button type="button" class="btn btn-primary" data-testid="btn-vla-preview" id="btn-vla-preview">生成 5 步 6-DOF 预测预览</button>
+          </div>
+          <div class="stick-split mt-12">
+            <canvas id="canvas-vla-stick" data-testid="canvas-vla-stick" class="stick-canvas" width="520" height="300"></canvas>
+            <div id="vla-stick-data" class="stick-data-panel"></div>
           </div>
           <pre id="vla-preview-output" class="code-box mt-12">点击上方按钮查看基于当前关节状态的 Action Chunk 预测结构。</pre>
         </div>

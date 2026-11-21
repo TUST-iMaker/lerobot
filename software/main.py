@@ -236,7 +236,20 @@ def cmd_demo(args: argparse.Namespace) -> int:
 
 
 def cmd_web(args: argparse.Namespace) -> int:
-    """启动轻量极速原型 Web 控制中心."""
+    """启动统一 Arm101 Studio Web 控制中心（加 --legacy 可回退原单文件 web_ui.py）."""
+    if getattr(args, "legacy", False):
+        from web_ui import run_web_server
+        return run_web_server(port=args.port, mock=args.mock, follower_port=args.follower_port)
+
+    workspace_root = Path(__file__).resolve().parent.parent
+    studio_entry = workspace_root / "app" / "run_studio.py"
+    if studio_entry.is_file():
+        import subprocess
+        cmd = [sys.executable, str(studio_entry), "--port", str(args.port)]
+        if args.mock:
+            cmd.append("--dry-run")
+        return subprocess.call(cmd, cwd=str(workspace_root))
+
     from web_ui import run_web_server
     return run_web_server(port=args.port, mock=args.mock, follower_port=args.follower_port)
 
@@ -252,9 +265,10 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True, help="子命令列表")
 
     # 0. web 子命令
-    p_web = subparsers.add_parser("web", help="启动轻量极速原型 Web 控制中心 (视频流/Demo/数据看板)")
-    p_web.add_argument("--port", type=int, default=8080, help="Web 监听端口 (默认 8080)")
+    p_web = subparsers.add_parser("web", help="启动统一 Arm101 Studio Web 控制中心 (加 --legacy 启动旧版 web_ui)")
+    p_web.add_argument("--port", type=int, default=8760, help="Web 监听端口 (默认 8760)")
     p_web.add_argument("--mock", action="store_true", help="启用虚拟仿真模式 (无须插硬件)")
+    p_web.add_argument("--legacy", action="store_true", help="使用旧版单文件 software/web_ui.py")
     p_web.add_argument("--follower-port", default=cfg.follower.port, help=f"真机从臂端口 (默认 {cfg.follower.port})")
     p_web.set_defaults(func=cmd_web)
 

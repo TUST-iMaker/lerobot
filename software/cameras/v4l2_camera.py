@@ -9,7 +9,10 @@
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows fallback
+    fcntl = None  # type: ignore[assignment]
 import logging
 import mmap
 import os

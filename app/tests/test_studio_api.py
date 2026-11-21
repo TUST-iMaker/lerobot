@@ -549,6 +549,20 @@ def test_playwright_ui_smoke_and_zero_console_errors(
             page.wait_for_timeout(250)
             page.get_by_test_id("btn-stop-teleop").click()
 
+            # Dual-arm 6-DOF stick-figure simulation tab & IK
+            page.get_by_test_id("tab-sim").click()
+            page.get_by_test_id("btn-apply-ik").wait_for(state="visible", timeout=5000)
+            page.get_by_test_id("btn-apply-ik").click()
+            page.wait_for_timeout(200)
+            sim_canvas_ok = page.evaluate(
+                """() => {
+                    const l = document.getElementById('canvas-sim-leader');
+                    const f = document.getElementById('canvas-sim-follower');
+                    return Boolean(l && f && l.width > 0 && f.width > 0);
+                }"""
+            )
+            assert sim_canvas_ok is True
+
             # Teaching waypoints
             page.get_by_test_id("tab-teaching").click()
             page.get_by_test_id("btn-teach-waypoint").click()
@@ -556,8 +570,9 @@ def test_playwright_ui_smoke_and_zero_console_errors(
             page.get_by_test_id("btn-replay-waypoints").click()
             page.wait_for_timeout(450)
 
-            # Data collection
+            # Data collection + Team Data Spec card
             page.get_by_test_id("tab-collect").click()
+            page.get_by_test_id("data-spec-card").wait_for(state="visible", timeout=5000)
             page.get_by_test_id("btn-start-collect").click()
             page.wait_for_timeout(350)
             page.get_by_test_id("btn-stop-collect").click()
@@ -569,6 +584,8 @@ def test_playwright_ui_smoke_and_zero_console_errors(
 
             page.get_by_test_id("tab-vla").click()
             assert "pi0.7" in page.locator("#pi07-notice-card").inner_text()
+            page.get_by_test_id("btn-vla-preview").click()
+            page.wait_for_timeout(250)
 
             assert console_errors == [], f"Unexpected console errors: {console_errors}"
             assert page_errors == [], f"Unexpected page errors: {page_errors}"
@@ -700,3 +717,98 @@ def test_interactive_calibration_flow_and_stdin_shim(
         builtins.input = orig_input
         lu.enter_pressed = orig_lu_enter
         mb.enter_pressed = orig_mb_enter
+
+
+def test_v3_safety_dual_arm_ik_sync_and_routines(
+    live_server: tuple[str, StudioConfig],
+) -> None:
+    """Verify V3 Fusion APIs: E-Stop, independent dual-arm control, IK, sync gate, WASD, presets, episode frames."""
+    base_url, _ = live_server
+    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        assert client.post("/api/mode", json={"mode": "dry_run"}).status_code == 200
+
+        # 1. Independent Leader vs Follower control
+        r_lead = client.post(
+            "/api/sim/joints",
+            json={"arm": "leader", "joints": {"shoulder_pan": 35.0, "gripper": 80.0}},
+        )
+        assert r_lead.status_code == 200
+        d_lead = r_lead.json()
+        assert d_lead["leader_joints"]["shoulder_pan"] == 35.0
+        assert d_lead["follower_joints"]["shoulder_pan"] != 35.0
+
+        r_fol = client.post(
+            "/api/sim/joints",
+            json={"arm": "follower", "joints": {"shoulder_pan": -25.0, "elbow_flex": 20.0}},
+        )
+        assert r_fol.status_code == 200
+        d_fol = r_fol.json()
+        assert d_fol["follower_joints"]["shoulder_pan"] == -25.0
+        assert d_fol["leader_joints"]["shoulder_pan"] == 35.0
+
+        # 2. IK solver (valid workspace target + unreachable 422)
+        ik_ok = client.post(
+            "/api/sim/ik",
+            json={"arm": "follower", "x_mm": 180.0, "y_mm": 20.0, "z_mm": 210.0, "pitch_deg": 0.0},
+        )
+        assert ik_ok.status_code == 200
+        ik_body = ik_ok.json()
+        assert "follower_fk" in ik_body
+        assert len(ik_body["follower_fk"]["nodes_mm"]) == 5
+
+        ik_bad = client.post(
+            "/api/sim/ik",
+            json={"arm": "follower", "x_mm": 999.0, "y_mm": 0.0, "z_mm": 999.0},
+        )
+        assert ik_bad.status_code == 422
+
+        # 3. Bidirectional sync mode safety gate
+        assert (
+            client.post("/api/sim/sync_mode", json={"direction": "sim_to_real", "safety_confirmed": False})
+            .status_code
+            == 422
+        )
+        assert (
+            client.post("/api/sim/sync_mode", json={"direction": "sim_to_real", "safety_confirmed": True})
+            .status_code
+            == 200
+        )
+        assert client.post("/api/sim/sync_mode", json={"direction": "off"}).status_code == 200
+
+        # 4. E-Stop latch, reset & torque toggle
+        es = client.post("/api/safety/estop")
+        assert es.status_code == 200
+        assert es.json()["estop_latched"] is True
+
+        # Reset E-Stop
+        rs = client.post("/api/safety/reset")
+        assert rs.status_code == 200
+        assert rs.json()["estop_latched"] is False
+
+        tq = client.post("/api/safety/torque", json={"enabled": False})
+        assert tq.status_code == 200
+        assert tq.json()["torque_enabled"] is False
+        assert client.post("/api/safety/torque", json={"enabled": True}).status_code == 200
+
+        # 5. WASD height-locked Cartesian step + presets + routine
+        assert client.post("/api/workflows/control/key", json={"key": "w", "step_mm": 12.0}).status_code == 200
+        assert client.post("/api/workflows/teaching/pose", json={"pose": "inspect"}).status_code == 200
+        assert client.post("/api/workflows/teaching/pose", json={"pose": "home"}).status_code == 200
+        assert client.post("/api/workflows/teaching/routine", json={"routine": "wave"}).status_code == 200
+        time.sleep(0.25)
+
+        # 6. Collect episode & fetch frames for stick-figure replay
+        col = client.post(
+            "/api/workflows/collect/start",
+            json={"dataset_name": "v3_replay_test", "single_task": "Pick cube", "num_episodes": 1},
+        )
+        assert col.status_code == 200
+        time.sleep(0.3)
+        assert client.post("/api/workflows/collect/stop").status_code == 200
+        ep_res = client.get("/api/workflows/collect/episodes/v3_replay_test/0")
+        assert ep_res.status_code == 200
+        ep_data = ep_res.json()
+        assert len(ep_data["frames"]) >= 1
+        assert len(ep_data["frames"][0]["observation.state"]) == 6
+        assert len(ep_data["frames"][0]["action"]) == 6
+

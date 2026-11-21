@@ -5,7 +5,7 @@
 - **非重复上游仓库管理**：通过 `configs/repos.yaml` 与 `scripts/common/bootstrap_repos.py` 统一将所需开源仓库克隆到 `repos/`，杜绝多份重复克隆与散落依赖；
 - **Windows + Ubuntu 双系统协同**：共享工作区代码、配置、教程与数据骨架，各自维护系统隔离的 `uv` 虚拟环境（Windows 端负责硬件与本地 UI，Ubuntu 端负责本地 CUDA 训练与 `openpi`）；
 - **全流程中文教程体系（`docs/`）**：覆盖双系统配置、arm101 标定/遥操作/示教/数据采集、VLA 云端算力训练与 `pi0.7` / `pi0.5` / `pi0` / `openpi` 方案及开源前端工具调研；
-- **本地串联软件（`app/` — Arm101 Studio）**：整合硬件探测、遥操作、示教轨迹点、数据采集与开源插件入口，并在无硬件连接时自动降级到 `dry_run` 模拟模式。
+- **本地串联软件（`app/` — Arm101 Studio）与统一控制内核（`software/`）**：融合 `software/core/` 的 SO-101 运动学/安全控制器/预设姿态与 `app/` 的全场景 6 轴火柴棍仿真、独立主从臂双向仿真 + 末端夹爪拖动 IK、交互式标定、遥操作、示教、多人数据规范采集与开源插件入口；无硬件时自动降级为 `dry_run` 模拟模式，并支持 `python software/main.py web` 一键拉起统一界面（加 `--legacy` 可回退旧版）。
 
 ---
 
@@ -38,11 +38,15 @@ lerobot/                                   # 根 Git 仓库 (TUST-iMaker/lerobot
 │   ├── repos.yaml                         # 唯一权威的上游开源仓库注册表
 │   ├── robots/                            # 机械臂配置模板（arm101_win.example.yaml 等）
 │   └── train/                             # ACT / SmolVLA / Pi0 / Pi0.5(OpenPI) 训练配置
-├── app/                                   # [本地串联软件] Arm101 Studio（FastAPI + 零构建 Web 前端）
+├── app/                                   # [本地串联软件] Arm101 Studio（FastAPI + 6轴火柴棍仿真/IK + 零构建 Web 前端）
 │   ├── run_studio.py                      # 快捷启动入口（支持 --dry-run / --port）
-│   ├── backend/                           # FastAPI + WebSocket 后端与硬件/模拟/插件管理器
-│   ├── frontend/                          # 原生 HTML5/CSS3/ESM 控制面板
+│   ├── backend/                           # FastAPI + WebSocket 后端、安全/运动学仿真桥接与插件管理器
+│   ├── frontend/                          # 原生 HTML5/CSS3/ESM 控制面板（含全场景 6 轴火柴棍仿真）
 │   └── tests/                             # Studio 接口与前端行为测试
+├── software/                              # [底层控制内核与 CLI] SO-101 运动学、SafetyController、预设姿态与跨平台 CLI
+│   ├── main.py                            # 统一 CLI 入口（`web` 默认拉起 Arm101 Studio，`--legacy` 启动旧版）
+│   ├── core/                              # SO101Kinematics、SafetyController、ActionAPI 与 rest/upright 姿态
+│   └── tests/                             # 底层运动学、安全与跨平台相机/配置单元测试
 ├── repos/                                 # (gitignored) 上游开源仓库集中存放目录
 │   ├── lerobot/                           # huggingface/lerobot
 │   ├── leLab/                             # huggingface/leLab

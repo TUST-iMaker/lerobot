@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import platform
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -167,6 +169,7 @@ def load_config(config_path: Path | str | None = None) -> SystemConfig:
         ),
         safety=SafetyConfig(
             rest_pose_file=str(safety_raw.get("rest_pose_file", SafetyConfig.rest_pose_file)),
+            home_pose_file=str(safety_raw.get("home_pose_file", SafetyConfig.home_pose_file)),
             auto_rest_on_exit=bool(safety_raw.get("auto_rest_on_exit", SafetyConfig.auto_rest_on_exit)),
             rest_duration_s=float(safety_raw.get("rest_duration_s", SafetyConfig.rest_duration_s)),
             max_speed_deg_per_s=float(safety_raw.get("max_speed_deg_per_s", SafetyConfig.max_speed_deg_per_s)),
@@ -180,6 +183,41 @@ def load_config(config_path: Path | str | None = None) -> SystemConfig:
             default_replay_episode=int(operation_raw.get("default_replay_episode", OperationConfig.default_replay_episode)),
         ),
     )
+
+    # 当使用默认工作区配置时，同步根目录 .env 的跨平台串口与相机映射（实现与 Arm101 Studio 一处配置全局生效）
+    if config_path is None:
+        workspace_env = _software_root.parent / ".env"
+        env_map: dict[str, str] = {}
+        if workspace_env.is_file():
+            try:
+                for raw_line in workspace_env.read_text(encoding="utf-8").splitlines():
+                    line = raw_line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env_map[k.strip()] = v.strip().strip('"').strip("'")
+            except Exception:
+                env_map = {}
+
+        def _env_val(key: str) -> str:
+            return (os.environ.get(key) or env_map.get(key) or "").strip()
+
+        is_win = platform.system() == "Windows"
+        f_port = _env_val("ARM101_FOLLOWER_PORT_WIN" if is_win else "ARM101_FOLLOWER_PORT_UBUNTU")
+        l_port = _env_val("ARM101_LEADER_PORT_WIN" if is_win else "ARM101_LEADER_PORT_UBUNTU")
+        f_id = _env_val("ARM101_FOLLOWER_ID")
+        l_id = _env_val("ARM101_LEADER_ID")
+        front_cam = _env_val("ARM101_FRONT_CAMERA_ID")
+        if f_port:
+            cfg.follower.port = f_port
+        if l_port:
+            cfg.leader.port = l_port
+        if f_id:
+            cfg.follower.id = f_id
+        if l_id:
+            cfg.leader.id = l_id
+        if front_cam and front_cam.lower() != "none":
+            cfg.camera.port = int(front_cam) if front_cam.isdigit() else front_cam
+
     return cfg
 
 
