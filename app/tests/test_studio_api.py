@@ -129,6 +129,7 @@ def _isolated_config(tmp_path: Path) -> StudioConfig:
     dry = tmp_path / "data" / "dry_run"
     return base.model_copy(
         update={
+            "env_file": tmp_path / ".env",
             "data_dir": tmp_path / "data",
             "datasets_dir": tmp_path / "data" / "datasets",
             "calibration_dir": tmp_path / "data" / "calibration",
@@ -204,7 +205,7 @@ def test_health_mode_probe_and_offline_assets(live_server: tuple[str, StudioConf
         assert health.status_code == 200
         hdata = health.json()
         assert hdata["status"] == "ok"
-        assert hdata["mode"] == "dry_run"
+        assert hdata["mode"] in ("real", "dry_run")
         assert "workspace_root" in hdata
 
         probe = client.get("/api/hardware/probe")
@@ -256,6 +257,7 @@ def test_calibrate_teleop_teaching_collect_and_cameras(
 ) -> None:
     base_url, cfg = live_server
     with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        assert client.post("/api/mode", json={"mode": "dry_run"}).status_code == 200
         # Calibrate lifecycle + command isolation check (never both robot & teleop)
         cal_start = client.post("/api/workflows/calibrate/start", json={"target": "follower"})
         assert cal_start.status_code == 200
@@ -373,6 +375,7 @@ def test_real_data_dry_run_directory_artifact_and_cleanup() -> None:
         from fastapi.testclient import TestClient
 
         with TestClient(app) as client:
+            assert client.post("/api/mode", json={"mode": "dry_run"}).status_code == 200
             res = client.post(
                 "/api/workflows/collect/start",
                 json={"dataset_name": test_ds, "single_task": "Cleanup check", "num_episodes": 1},
@@ -470,7 +473,7 @@ async def test_ws_telemetry_streams_6dof_and_logs(live_server: tuple[str, Studio
     async with websockets.connect(ws_url, open_timeout=5.0) as ws:
         raw = await ws.recv()
         msg = json.loads(raw)
-        assert msg["mode"] == "dry_run"
+        assert msg["mode"] in ("real", "dry_run")
         assert "active_workflow" in msg
         assert "workflow_status" in msg
         assert "log_tail" in msg
@@ -509,12 +512,28 @@ def test_playwright_ui_smoke_and_zero_console_errors(
             page.get_by_test_id("mode-badge").wait_for(state="visible", timeout=5000)
             page.get_by_test_id("hardware-status-banner").wait_for(state="visible", timeout=5000)
             page.get_by_test_id("log-console").wait_for(state="visible", timeout=5000)
-            assert "DRY-RUN" in page.get_by_test_id("mode-badge").inner_text()
+            page.locator("#mode-select").select_option("dry_run")
+            page.wait_for_function(
+                "() => document.querySelector('[data-testid=\"mode-badge\"]')?.innerText?.includes('DRY-RUN')",
+                timeout=5000,
+            )
 
-            # Dashboard probe
+            # Dashboard probe, manual device config, and interactive calibration
             page.get_by_test_id("tab-dashboard").click()
             page.get_by_test_id("btn-probe-hardware").click()
             page.wait_for_timeout(200)
+            page.get_by_test_id("btn-swap-arms").click()
+            page.get_by_test_id("btn-swap-cameras").click()
+            page.get_by_test_id("btn-save-device-config").click()
+            page.wait_for_timeout(200)
+
+            # Interactive calibration in UI
+            page.get_by_test_id("btn-start-calibrate").click()
+            page.get_by_test_id("btn-calibrate-enter").wait_for(state="visible", timeout=5000)
+            page.get_by_test_id("btn-calibrate-enter").click()
+            page.wait_for_timeout(250)
+            page.get_by_test_id("btn-calibrate-enter").click()
+            page.wait_for_timeout(250)
 
             # Teleop & Camera JPEG verification
             page.get_by_test_id("tab-teleop").click()
@@ -555,3 +574,129 @@ def test_playwright_ui_smoke_and_zero_console_errors(
             assert page_errors == [], f"Unexpected page errors: {page_errors}"
         finally:
             browser.close()
+
+
+def test_hardware_auto_match_and_manual_config_persistence(
+    live_server: tuple[str, StudioConfig],
+) -> None:
+    """Verify auto_match_devices + POST /api/hardware/config validation & .env persistence."""
+    from app.backend.hardware import HardwareManager
+
+    base_url, cfg = live_server
+    stale_cfg = cfg.model_copy(
+        update={
+            "follower_port": "COM3",
+            "leader_port": "COM4",
+            "front_camera_id": "9",
+            "wrist_camera_id": "8",
+        }
+    )
+    hw = HardwareManager(stale_cfg)
+    fake_ports = [
+        {"device": "COM8", "is_robot_candidate": False},
+        {"device": "COM11", "is_robot_candidate": True},
+        {"device": "COM12", "is_robot_candidate": True},
+    ]
+    fake_cams = [
+        {"id": "cam_0", "raw_id": "0", "index_or_path": 0},
+        {"id": "cam_1", "raw_id": "1", "index_or_path": 1},
+    ]
+    changed = hw.auto_match_devices(fake_ports, fake_cams, force=False)
+    assert changed is True
+    assert stale_cfg.follower_port == "COM11"
+    assert stale_cfg.leader_port == "COM12"
+    assert fake_cams[0]["id"] == "front"
+    assert fake_cams[1]["id"] == "wrist"
+
+    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        # Reject duplicate arm port or duplicate camera
+        dup_arm = client.post(
+            "/api/hardware/config",
+            json={"follower_port": "COM11", "leader_port": "COM11", "persist_env": False},
+        )
+        assert dup_arm.status_code == 422
+
+        dup_cam = client.post(
+            "/api/hardware/config",
+            json={"front_camera_id": "0", "wrist_camera_id": "0", "persist_env": False},
+        )
+        assert dup_cam.status_code == 422
+
+        # Save valid manual selection to isolated .env
+        ok = client.post(
+            "/api/hardware/config",
+            json={
+                "follower_port": "COM12",
+                "leader_port": "COM11",
+                "front_camera_id": "1",
+                "wrist_camera_id": "0",
+                "persist_env": True,
+            },
+        )
+        assert ok.status_code == 200
+        body = ok.json()
+        assert body["device_selection"]["follower_port"] == "COM12"
+        assert body["device_selection"]["leader_port"] == "COM11"
+        assert body["device_selection"]["front_camera_id"] == "1"
+        assert body["device_selection"]["wrist_camera_id"] == "0"
+        assert cfg.env_file.exists()
+        env_text = cfg.env_file.read_text(encoding="utf-8")
+        assert "COM12" in env_text and "COM11" in env_text
+
+
+def test_interactive_calibration_flow_and_stdin_shim(
+    live_server: tuple[str, StudioConfig],
+) -> None:
+    """Verify two-step interactive calibration via API and piped stdin shims."""
+    import builtins
+    import queue
+    from app.backend.calibrate_runner import install_piped_stdin_shims
+
+    base_url, cfg = live_server
+    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        assert client.post("/api/mode", json={"mode": "dry_run"}).status_code == 200
+        # Idle input -> 409
+        assert client.post("/api/workflows/calibrate/input", json={"value": ""}).status_code == 409
+
+        start = client.post("/api/workflows/calibrate/start", json={"target": "follower"})
+        assert start.status_code == 200
+        time.sleep(0.15)
+        st1 = client.get("/api/workflows/status").json()
+        assert st1["calibrate_active"] is True
+        assert st1["calibration"]["stage"] == "waiting_middle"
+        assert st1["calibration"]["waiting_for_input"] is True
+
+        # Step 1: confirm middle
+        assert client.post("/api/workflows/calibrate/input", json={"value": ""}).status_code == 200
+        time.sleep(0.25)
+        st2 = client.get("/api/workflows/status").json()
+        assert st2["calibration"]["stage"] == "recording_range"
+        assert len(st2["calibration"]["live_table"]) == 6
+
+        # Step 2: finish range recording
+        assert client.post("/api/workflows/calibrate/input", json={"value": ""}).status_code == 200
+        time.sleep(0.2)
+        st3 = client.get("/api/workflows/status").json()
+        assert st3["active_workflow"] == "idle"
+        assert st3["calibration"]["stage"] == "completed"
+        assert (cfg.dry_run_dir / "calibration" / f"follower_{cfg.follower_id}.json").is_file()
+
+    # Unit test piped stdin shim (restore builtins.input afterward)
+    orig_input = builtins.input
+    try:
+        import lerobot.motors.motors_bus as mb
+        import lerobot.utils.utils as lu
+
+        orig_lu_enter = lu.enter_pressed
+        orig_mb_enter = mb.enter_pressed
+        q: queue.Queue[str | None] = queue.Queue()
+        install_piped_stdin_shims(q)
+        q.put("c\n")
+        assert builtins.input("Test prompt") == "c"
+        assert mb.enter_pressed() is False
+        q.put("\n")
+        assert mb.enter_pressed() is True
+    finally:
+        builtins.input = orig_input
+        lu.enter_pressed = orig_lu_enter
+        mb.enter_pressed = orig_mb_enter

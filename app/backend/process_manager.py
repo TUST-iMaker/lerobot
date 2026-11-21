@@ -48,6 +48,7 @@ class ProcessRegistry:
         cwd: Path | None = None,
         env_overrides: dict[str, str] | None = None,
         on_line: Callable[[str], None] | None = None,
+        stdin_pipe: bool = False,
     ) -> ManagedProcess:
         """Spawn a subprocess in its own OS process group."""
         with self._lock:
@@ -64,7 +65,7 @@ class ProcessRegistry:
             popen_kwargs: dict[str, object] = {
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.STDOUT,
-                "stdin": subprocess.DEVNULL,
+                "stdin": subprocess.PIPE if stdin_pipe else subprocess.DEVNULL,
                 "text": True,
                 "encoding": "utf-8",
                 "errors": "replace",
@@ -154,6 +155,20 @@ class ProcessRegistry:
     def get(self, process_id: str) -> ManagedProcess | None:
         with self._lock:
             return self._processes.get(process_id)
+
+    def write_stdin(self, process_id: str, text: str = "") -> bool:
+        """Write a line to a running interactive subprocess stdin."""
+        with self._lock:
+            managed = self._processes.get(process_id)
+            if managed is None or managed.proc.poll() is not None or managed.proc.stdin is None:
+                return False
+            payload = text if text.endswith("\n") else f"{text}\n"
+            try:
+                managed.proc.stdin.write(payload)
+                managed.proc.stdin.flush()
+                return True
+            except Exception:
+                return False
 
     def terminate(self, process_id: str, timeout_s: float = 2.0) -> bool:
         """Terminate a process and all its descendants cleanly."""

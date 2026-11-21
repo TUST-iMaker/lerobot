@@ -89,19 +89,78 @@
         <div class="card mt-16">
           <div class="panel-toolbar">
             <div>
+              <h3>主从臂与摄像头配置（自动检测 / 手动选择）</h3>
+              <p class="muted">启动探测时会自动匹配已连接的 USB 串口与摄像头；若主从臂或前后相机接反，可直接下拉改选或点击对调，并保存到 `.env`。</p>
+            </div>
+            <div class="btn-group">
+              <button type="button" class="btn btn-secondary" data-testid="btn-auto-detect-devices" id="btn-auto-detect-devices">自动识别填充</button>
+              <button type="button" class="btn btn-secondary" data-testid="btn-swap-arms" id="btn-swap-arms">对调主从臂</button>
+              <button type="button" class="btn btn-secondary" data-testid="btn-swap-cameras" id="btn-swap-cameras">对调相机</button>
+              <button type="button" class="btn btn-primary" data-testid="btn-save-device-config" id="btn-save-device-config">应用并保存到 .env</button>
+            </div>
+          </div>
+
+          <div class="form-grid mt-12">
+            <label>
+              <span>从臂串口 (so101_follower)</span>
+              <select id="select-follower-port" data-testid="select-follower-port" aria-label="Follower Port"></select>
+            </label>
+            <label>
+              <span>主臂串口 (so101_leader)</span>
+              <select id="select-leader-port" data-testid="select-leader-port" aria-label="Leader Port"></select>
+            </label>
+            <label>
+              <span>前置相机 (front)</span>
+              <select id="select-front-camera" data-testid="select-front-camera" aria-label="Front Camera"></select>
+            </label>
+            <label>
+              <span>腕部相机 (wrist)</span>
+              <select id="select-wrist-camera" data-testid="select-wrist-camera" aria-label="Wrist Camera"></select>
+            </label>
+          </div>
+          <div id="device-config-status" class="mt-12 muted">当前未修改设备映射。</div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="panel-toolbar">
+            <div>
               <h3>单臂零点标定 (lerobot-calibrate)</h3>
-              <p class="muted">安全提示：官方 `lerobot-calibrate` 每次仅标定单条机械臂（Follower 或 Leader），不可混用参数。</p>
+              <p class="muted">安全提示：每次仅标定单条机械臂（Follower 或 Leader）。可直接在下方网页引导中完成「确认中位」与「录制限位」，无需切回黑框终端敲回车。</p>
             </div>
             <div class="btn-group">
               <select id="calibrate-target" aria-label="Calibration Target">
                 <option value="follower">so101_follower (从臂)</option>
                 <option value="leader">so101_leader (主臂)</option>
               </select>
-              <button type="button" class="btn btn-accent" id="btn-start-calibrate">开始标定</button>
-              <button type="button" class="btn btn-danger" id="btn-stop-calibrate">停止标定</button>
+              <button type="button" class="btn btn-accent" data-testid="btn-start-calibrate" id="btn-start-calibrate">开始标定</button>
+              <button type="button" class="btn btn-danger" data-testid="btn-stop-calibrate" id="btn-stop-calibrate">停止标定</button>
             </div>
           </div>
-          <div id="calibrate-status" class="muted">当前未执行标定任务。dry_run 模式将生成 `data/dry_run/calibration/*.json` 演练文件。</div>
+          <div id="calibration-file-badges" class="chip-row mt-12"></div>
+          <div id="calibrate-status" class="muted mt-12">当前未执行标定任务。dry_run 模式将生成 `data/dry_run/calibration/*.json` 演练文件。</div>
+
+          <div id="calibration-interactive-panel" class="cal-box mt-12" hidden>
+            <div class="panel-toolbar">
+              <strong id="calibrate-stage-prompt">等待标定步骤提示...</strong>
+              <div class="btn-group">
+                <button type="button" class="btn btn-primary" data-testid="btn-calibrate-enter" id="btn-calibrate-enter">确认 / 下一步 (Enter)</button>
+                <button type="button" class="btn btn-secondary" data-testid="btn-calibrate-recal" id="btn-calibrate-recal" hidden>重新标定 (输入 c)</button>
+              </div>
+            </div>
+            <div id="calibrate-live-table-wrap" class="table-wrap mt-12" hidden>
+              <table>
+                <thead>
+                  <tr>
+                    <th>关节电机</th>
+                    <th>最小值 (MIN)</th>
+                    <th>当前位置 (POS)</th>
+                    <th>最大值 (MAX)</th>
+                  </tr>
+                </thead>
+                <tbody id="calibrate-live-tbody"></tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </section>
 

@@ -10,6 +10,7 @@ const JOINTS = [
 const state = {
   mode: "dry_run",
   activeWorkflow: "idle",
+  lastCalStage: "idle",
   leaderJoints: Object.fromEntries(JOINTS.map((j) => [j.key, j.def])),
   followerJoints: Object.fromEntries(JOINTS.map((j) => [j.key, j.def])),
   localLogs: [],
@@ -161,6 +162,138 @@ function renderHardwareProbe(probe) {
       `<div class="kv-item">包状态: lerobot=${Boolean(pkgs.lerobot)}, datasets=${Boolean(pkgs.datasets)}, rerun=${Boolean(pkgs.rerun)}</div>`,
     ].join("");
   }
+
+  renderDeviceSelectors(probe);
+  renderCalibrationFileBadges(probe.calibration_status);
+}
+
+function populatePortSelect(selectEl, ports, currentValue) {
+  if (!selectEl) return;
+  const options = [];
+  const seen = new Set();
+  for (const p of ports || []) {
+    if (!p || !p.device) continue;
+    if (p.is_bluetooth) continue;
+    seen.add(p.device);
+    const label = `${p.device} — ${p.tag}${p.is_robot_candidate ? "" : " (非USB候选)"}`;
+    options.push(`<option value="${p.device}">${label}</option>`);
+  }
+  if (currentValue && !seen.has(currentValue)) {
+    options.unshift(`<option value="${currentValue}">${currentValue} (当前配置 / 未连接)</option>`);
+  }
+  if (!options.length) {
+    options.push('<option value="">未检测到可用串口</option>');
+  }
+  selectEl.innerHTML = options.join("");
+  if (currentValue) selectEl.value = currentValue;
+}
+
+function populateCameraSelect(selectEl, cameras, currentValue) {
+  if (!selectEl) return;
+  const options = ['<option value="none">不使用摄像头 (none)</option>'];
+  const seen = new Set(["none"]);
+  for (const c of cameras || []) {
+    const raw = String(c.raw_id ?? c.index_or_path ?? "");
+    if (!raw || seen.has(raw)) continue;
+    seen.add(raw);
+    options.push(`<option value="${raw}">[${raw}] ${c.name} (${c.width}x${c.height} ${c.backend})</option>`);
+  }
+  if (currentValue && !seen.has(currentValue)) {
+    options.push(`<option value="${currentValue}">[${currentValue}] 当前配置 (未连接)</option>`);
+  }
+  selectEl.innerHTML = options.join("");
+  selectEl.value = currentValue || "none";
+}
+
+function renderDeviceSelectors(probe) {
+  const sel = probe.device_selection || {};
+  const ports = probe.serial_ports || [];
+  const cams = probe.cameras || [];
+  populatePortSelect($("select-follower-port"), ports, sel.follower_port || "");
+  populatePortSelect($("select-leader-port"), ports, sel.leader_port || "");
+  populateCameraSelect($("select-front-camera"), cams, sel.front_camera_id || "none");
+  populateCameraSelect($("select-wrist-camera"), cams, sel.wrist_camera_id || "none");
+
+  const statusEl = $("device-config-status");
+  if (statusEl) {
+    const autoNote = sel.auto_matched ? "（已自动匹配当前探测到的设备）" : "";
+    statusEl.textContent = `当前配置: 从臂=${sel.follower_port || "-"} | 主臂=${sel.leader_port || "-"} | 前置相机=${sel.front_camera_id || "none"} | 腕部相机=${sel.wrist_camera_id || "none"} ${autoNote}`;
+  }
+}
+
+function renderCalibrationFileBadges(calStatus) {
+  const box = $("calibration-file-badges");
+  if (!box || !calStatus) return;
+  const fChip = calStatus.follower_calibrated
+    ? '<span class="chip chip-ok">从臂标定文件: 已就绪</span>'
+    : '<span class="chip chip-warn">从臂标定文件: 未标定</span>';
+  const lChip = calStatus.leader_calibrated
+    ? '<span class="chip chip-ok">主臂标定文件: 已就绪</span>'
+    : '<span class="chip chip-warn">主臂标定文件: 未标定</span>';
+  box.innerHTML = fChip + lChip;
+}
+
+function renderCalibrationState(cal) {
+  if (!cal) return;
+  const panel = $("calibration-interactive-panel");
+  const statusEl = $("calibrate-status");
+  const promptEl = $("calibrate-stage-prompt");
+  const btnEnter = $("btn-calibrate-enter");
+  const btnRecal = $("btn-calibrate-recal");
+  const tableWrap = $("calibrate-live-table-wrap");
+  const tbody = $("calibrate-live-tbody");
+
+  const stage = cal.stage || "idle";
+  const prevStage = state.lastCalStage;
+  state.lastCalStage = stage;
+
+  if (stage === "completed" && prevStage !== "completed") {
+    apiFetch("/api/hardware/probe").then((r) => {
+      if (r.ok) renderHardwareProbe(r.data);
+    });
+  }
+
+  if (statusEl && (cal.active || stage !== "idle")) {
+    statusEl.textContent = `标定目标: ${cal.target} (${cal.port || "-"}) | 模式: ${cal.mode} | 阶段: ${stage}`;
+  }
+
+  if (!panel) return;
+  if (!cal.active && (stage === "idle" || stage === "stopped")) {
+    panel.hidden = true;
+    return;
+  }
+
+  panel.hidden = false;
+  if (promptEl) {
+    promptEl.textContent = cal.prompt || `标定阶段: ${stage}`;
+  }
+  if (btnEnter) {
+    btnEnter.disabled = !cal.waiting_for_input;
+    btnEnter.hidden = !cal.active;
+  }
+  if (btnRecal) {
+    btnRecal.hidden = !(cal.active && cal.allow_recalibrate);
+    btnRecal.disabled = !cal.waiting_for_input;
+  }
+
+  const rows = cal.live_table || [];
+  if (tableWrap && tbody) {
+    if (rows.length > 0) {
+      tableWrap.hidden = false;
+      tbody.innerHTML = rows
+        .map(
+          (r) => `<tr>
+            <td class="joint-values">${r.name}</td>
+            <td class="joint-values">${r.min}</td>
+            <td class="joint-values"><strong>${r.pos}</strong></td>
+            <td class="joint-values">${r.max}</td>
+          </tr>`
+        )
+        .join("");
+    } else {
+      tableWrap.hidden = true;
+    }
+  }
 }
 
 function initJointSliders() {
@@ -244,6 +377,11 @@ function updateJointGauges(leader, follower, syncSliders = false) {
   }
 }
 
+function isTeleopPanelVisible() {
+  const panel = $("panel-teleop");
+  return Boolean(panel && !panel.hidden);
+}
+
 function refreshCameraImagesOnce() {
   const ts = Date.now();
   const front = $("camera-preview-front");
@@ -254,14 +392,16 @@ function refreshCameraImagesOnce() {
 
 function scheduleCameraLoop() {
   if (state.camTimer) return;
+  if (!isTeleopPanelVisible()) return;
+  const intervalMs = state.mode === "real" ? 1200 : 450;
   const tick = () => {
     state.camTimer = null;
-    if (state.activeWorkflow !== "idle") {
+    if (state.activeWorkflow === "teleop" && isTeleopPanelVisible()) {
       refreshCameraImagesOnce();
-      state.camTimer = setTimeout(tick, 450);
+      state.camTimer = setTimeout(tick, intervalMs);
     }
   };
-  state.camTimer = setTimeout(tick, 450);
+  state.camTimer = setTimeout(tick, intervalMs);
 }
 
 function applyWorkflowStatus(statusObj) {
@@ -280,6 +420,9 @@ function applyWorkflowStatus(statusObj) {
   }
   if (Array.isArray(statusObj.logs)) {
     renderLogs(statusObj.logs);
+  }
+  if (statusObj.calibration) {
+    renderCalibrationState(statusObj.calibration);
   }
   if (wf !== "idle") {
     scheduleCameraLoop();
@@ -433,6 +576,7 @@ function initTabs() {
       panels.forEach((p) => {
         p.hidden = p.id !== `panel-${target}`;
       });
+      if (target === "teleop") refreshCameraImagesOnce();
       if (target === "teaching") refreshWaypoints();
       if (target === "collect") refreshEpisodes();
       if (target === "plugins") refreshPlugins();
@@ -492,6 +636,7 @@ function connectWebSocket() {
           }
         }
         if (Array.isArray(msg.log_tail)) renderLogs(msg.log_tail);
+        if (msg.calibration) renderCalibrationState(msg.calibration);
         if (wf !== "idle") scheduleCameraLoop();
       } catch {
         // Ignore malformed frame
@@ -536,24 +681,120 @@ function bindActions() {
     const res = await apiFetch("/api/hardware/probe");
     if (res.ok) {
       renderHardwareProbe(res.data);
+      refreshCameraImagesOnce();
       appendLocalLog("已完成硬件重新探测。");
+    }
+  });
+
+  $("btn-auto-detect-devices")?.addEventListener("click", async () => {
+    const res = await apiFetch("/api/hardware/config", {
+      method: "POST",
+      body: JSON.stringify({ auto_detect: true, persist_env: true }),
+    });
+    if (res.ok) {
+      renderHardwareProbe(res.data);
+      refreshCameraImagesOnce();
+      appendLocalLog("已自动识别并保存主从臂串口与摄像头配置。");
+    }
+  });
+
+  $("btn-save-device-config")?.addEventListener("click", async () => {
+    const follower_port = $("select-follower-port")?.value || "";
+    const leader_port = $("select-leader-port")?.value || "";
+    const front_camera_id = $("select-front-camera")?.value || "none";
+    const wrist_camera_id = $("select-wrist-camera")?.value || "none";
+    const res = await apiFetch("/api/hardware/config", {
+      method: "POST",
+      body: JSON.stringify({
+        follower_port,
+        leader_port,
+        front_camera_id,
+        wrist_camera_id,
+        persist_env: true,
+      }),
+    });
+    if (res.ok) {
+      renderHardwareProbe(res.data);
+      refreshCameraImagesOnce();
+      if ($("device-config-status")) {
+        $("device-config-status").textContent = "已应用并保存到 .env！现在可直接进行标定、遥操作或采集数据。";
+      }
+      appendLocalLog("已保存主从臂及摄像头配置到 .env。");
+    } else if ($("device-config-status")) {
+      $("device-config-status").textContent = `保存失败: ${res.data?.detail || "参数冲突"}`;
+    }
+  });
+
+  $("btn-swap-arms")?.addEventListener("click", () => {
+    const fSel = $("select-follower-port");
+    const lSel = $("select-leader-port");
+    if (!fSel || !lSel) return;
+    const tmp = fSel.value;
+    fSel.value = lSel.value;
+    lSel.value = tmp;
+    if ($("device-config-status")) {
+      $("device-config-status").textContent = "已对调主从臂选项，请点击【应用并保存到 .env】生效。";
+    }
+  });
+
+  $("btn-swap-cameras")?.addEventListener("click", () => {
+    const fCam = $("select-front-camera");
+    const wCam = $("select-wrist-camera");
+    if (!fCam || !wCam) return;
+    const tmp = fCam.value;
+    fCam.value = wCam.value;
+    wCam.value = tmp;
+    if ($("device-config-status")) {
+      $("device-config-status").textContent = "已对调前置/腕部相机选项，请点击【应用并保存到 .env】生效。";
     }
   });
 
   $("btn-start-calibrate")?.addEventListener("click", async () => {
     const target = $("calibrate-target")?.value || "follower";
+    const port =
+      target === "follower"
+        ? $("select-follower-port")?.value || null
+        : $("select-leader-port")?.value || null;
     const res = await apiFetch("/api/workflows/calibrate/start", {
       method: "POST",
-      body: JSON.stringify({ target }),
+      body: JSON.stringify({ target, port }),
     });
-    if (res.ok && $("calibrate-status")) {
-      $("calibrate-status").textContent = `正在执行 ${target} 标定 (${res.data.mode})...`;
+    if (res.ok) {
+      if ($("calibrate-status")) {
+        $("calibrate-status").textContent = `正在执行 ${target} 标定 (${res.data.mode}, ${res.data.port || ""})...`;
+      }
+      const st = await apiFetch("/api/workflows/status");
+      if (st.ok) applyWorkflowStatus(st.data);
+    }
+  });
+
+  $("btn-calibrate-enter")?.addEventListener("click", async () => {
+    const res = await apiFetch("/api/workflows/calibrate/input", {
+      method: "POST",
+      body: JSON.stringify({ value: "" }),
+    });
+    if (res.ok) {
+      const st = await apiFetch("/api/workflows/status");
+      if (st.ok) applyWorkflowStatus(st.data);
+    }
+  });
+
+  $("btn-calibrate-recal")?.addEventListener("click", async () => {
+    const res = await apiFetch("/api/workflows/calibrate/input", {
+      method: "POST",
+      body: JSON.stringify({ value: "c" }),
+    });
+    if (res.ok) {
+      const st = await apiFetch("/api/workflows/status");
+      if (st.ok) applyWorkflowStatus(st.data);
     }
   });
 
   $("btn-stop-calibrate")?.addEventListener("click", async () => {
     await apiFetch("/api/workflows/calibrate/stop", { method: "POST" });
     if ($("calibrate-status")) $("calibrate-status").textContent = "标定已停止。";
+    const st = await apiFetch("/api/workflows/status");
+    if (st.ok) applyWorkflowStatus(st.data);
   });
 
   $("btn-start-teleop")?.addEventListener("click", async () => {
