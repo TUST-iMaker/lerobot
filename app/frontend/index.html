@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TUST-iMaker Arm101 Studio</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="studio-shell">
+    <!-- Top Header -->
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 20h16M7 20v-4l5-6 4 3 3-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          <circle cx="12" cy="10" r="2" fill="currentColor" />
+          <circle cx="19" cy="7" r="2" fill="currentColor" />
+        </svg>
+        <div>
+          <h1>TUST-iMaker Arm101 Studio</h1>
+          <p class="subtitle">SO-ARM101 双臂串联控制台 · 双系统标准工作区</p>
+        </div>
+      </div>
+
+      <div class="header-controls">
+        <span id="ws-pill" class="pill pill-muted">WS 连接中...</span>
+        <span id="workflow-pill" class="pill pill-info">状态: idle</span>
+        <span data-testid="mode-badge" id="mode-badge" class="mode-badge mode-dry">DRY-RUN 模拟模式</span>
+        <label class="mode-select-wrap" for="mode-select">
+          <span>模式</span>
+          <select id="mode-select" aria-label="Operating Mode">
+            <option value="auto">auto (自动探测)</option>
+            <option value="dry_run">dry_run (模拟演练)</option>
+            <option value="real">real (真实硬件)</option>
+          </select>
+        </label>
+      </div>
+    </header>
+
+    <!-- Persistent Hardware Status Banner -->
+    <section data-testid="hardware-status-banner" id="hardware-status-banner" class="hw-banner hw-dry">
+      <div class="hw-banner-main">
+        <strong id="hw-banner-title">正在初始化硬件探测...</strong>
+        <span id="hw-banner-meta" class="hw-meta"></span>
+      </div>
+      <div id="hw-missing-chips" class="chip-row"></div>
+      <ul id="hw-guidance-list" class="guidance-list"></ul>
+    </section>
+
+    <!-- Navigation Tabs -->
+    <nav class="tab-nav" role="tablist" aria-label="Studio Modules">
+      <button type="button" role="tab" aria-selected="true" class="tab-btn active" data-tab="dashboard" data-testid="tab-dashboard">总览与标定</button>
+      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="teleop" data-testid="tab-teleop">遥操作</button>
+      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="teaching" data-testid="tab-teaching">示教与回放</button>
+      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="collect" data-testid="tab-collect">数据采集</button>
+      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="plugins" data-testid="tab-plugins">开源插件中心</button>
+      <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="vla" data-testid="tab-vla">VLA 与云端配置</button>
+    </nav>
+
+    <!-- Main Content Panels -->
+    <main class="main-content">
+      <!-- 1. Dashboard & Calibration -->
+      <section id="panel-dashboard" class="tab-panel" role="tabpanel">
+        <div class="panel-toolbar">
+          <div>
+            <h2>硬件拓扑与零点标定</h2>
+            <p class="muted">自动过滤蓝牙虚拟串口（如 COM8/COM9），识别 CH340/STM32 USB 串口与摄像头。</p>
+          </div>
+          <div class="btn-group">
+            <button type="button" class="btn btn-primary" data-testid="btn-probe-hardware" id="btn-probe-hardware">重新探测硬件</button>
+          </div>
+        </div>
+
+        <div class="grid-3">
+          <div class="card">
+            <h3>串口设备 (SO-101)</h3>
+            <div id="serial-ports-list" class="kv-list muted">等待探测...</div>
+          </div>
+          <div class="card">
+            <h3>视觉相机 (OpenCV)</h3>
+            <div id="cameras-list" class="kv-list muted">等待探测...</div>
+          </div>
+          <div class="card">
+            <h3>系统与运行能力</h3>
+            <div id="capabilities-list" class="kv-list muted">等待探测...</div>
+          </div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="panel-toolbar">
+            <div>
+              <h3>单臂零点标定 (lerobot-calibrate)</h3>
+              <p class="muted">安全提示：官方 `lerobot-calibrate` 每次仅标定单条机械臂（Follower 或 Leader），不可混用参数。</p>
+            </div>
+            <div class="btn-group">
+              <select id="calibrate-target" aria-label="Calibration Target">
+                <option value="follower">so101_follower (从臂)</option>
+                <option value="leader">so101_leader (主臂)</option>
+              </select>
+              <button type="button" class="btn btn-accent" id="btn-start-calibrate">开始标定</button>
+              <button type="button" class="btn btn-danger" id="btn-stop-calibrate">停止标定</button>
+            </div>
+          </div>
+          <div id="calibrate-status" class="muted">当前未执行标定任务。dry_run 模式将生成 `data/dry_run/calibration/*.json` 演练文件。</div>
+        </div>
+      </section>
+
+      <!-- 2. Teleoperation -->
+      <section id="panel-teleop" class="tab-panel" role="tabpanel" hidden>
+        <div class="panel-toolbar">
+          <div>
+            <h2>SO-101 主从臂遥操作与 6-DOF 监控</h2>
+            <p class="muted">在 dry_run 模式下可通过下方虚拟主臂滑块实时驱动 6 自由度从臂运动学模型与合成相机画面。</p>
+          </div>
+          <div class="btn-group">
+            <label class="inline-field">
+              <span>FPS</span>
+              <input id="teleop-fps" type="number" min="1" max="120" value="60" />
+            </label>
+            <button type="button" class="btn btn-accent" data-testid="btn-start-teleop" id="btn-start-teleop">启动遥操作</button>
+            <button type="button" class="btn btn-danger" data-testid="btn-stop-teleop" id="btn-stop-teleop">停止遥操作</button>
+            <button type="button" class="btn btn-secondary" id="btn-reset-joints">归位</button>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3>6-DOF 关节状态 (Leader 主臂 vs Follower 从臂)</h3>
+            <div id="joints-container" class="joints-list"></div>
+          </div>
+
+          <div class="card">
+            <h3>双视角相机实时画面</h3>
+            <div class="camera-grid">
+              <figure class="cam-box">
+                <figcaption>前置相机 (front)</figcaption>
+                <img data-testid="camera-preview-front" id="camera-preview-front" src="/api/cameras/front/frame" alt="Front Camera Preview" />
+              </figure>
+              <figure class="cam-box">
+                <figcaption>腕部相机 (wrist)</figcaption>
+                <img data-testid="camera-preview-wrist" id="camera-preview-wrist" src="/api/cameras/wrist/frame" alt="Wrist Camera Preview" />
+              </figure>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. Teaching & Replay -->
+      <section id="panel-teaching" class="tab-panel" role="tabpanel" hidden>
+        <div class="panel-toolbar">
+          <div>
+            <h2>演示示教与轨迹点回放</h2>
+            <p class="muted">记录当前 6-DOF 关节关键帧至 `data/dry_run/waypoints.json`，支持平滑插值回放与轨迹清空。</p>
+          </div>
+          <div class="btn-group">
+            <input id="waypoint-label" type="text" placeholder="航点备注 (如 grasp_ready)" />
+            <button type="button" class="btn btn-primary" data-testid="btn-teach-waypoint" id="btn-teach-waypoint">记录示教点</button>
+            <button type="button" class="btn btn-accent" data-testid="btn-replay-waypoints" id="btn-replay-waypoints">回放轨迹</button>
+            <button type="button" class="btn btn-danger" id="btn-clear-waypoints">清空轨迹</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>备注</th>
+                  <th>记录时间</th>
+                  <th>6-DOF 关节快照 (deg / %)</th>
+                  <th>模式</th>
+                </tr>
+              </thead>
+              <tbody id="waypoints-tbody">
+                <tr><td colspan="5" class="muted">暂无示教轨迹点，请点击「记录示教点」。</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. Data Collection -->
+      <section id="panel-collect" class="tab-panel" role="tabpanel" hidden>
+        <div class="panel-toolbar">
+          <div>
+            <h2>数据集采集 (lerobot-record / dry_run)</h2>
+            <p class="muted">real 模式自动注入 `--dataset.push_to_hub=false`；dry_run 模式落盘至 `data/dry_run/datasets/`。</p>
+          </div>
+          <div class="btn-group">
+            <button type="button" class="btn btn-accent" data-testid="btn-start-collect" id="btn-start-collect">开始采集</button>
+            <button type="button" class="btn btn-danger" data-testid="btn-stop-collect" id="btn-stop-collect">停止采集</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="form-grid">
+            <label>
+              <span>数据集名称 (禁用 eval_ 前缀)</span>
+              <input id="collect-dataset" type="text" value="arm101_dryrun_demo" />
+            </label>
+            <label>
+              <span>任务指令 (single_task)</span>
+              <input id="collect-task" type="text" value="Pick and place cube" />
+            </label>
+            <label>
+              <span>采集回合数 (episodes)</span>
+              <input id="collect-episodes" type="number" min="1" max="100" value="2" />
+            </label>
+            <label>
+              <span>帧率 (FPS)</span>
+              <input id="collect-fps" type="number" min="1" max="120" value="30" />
+            </label>
+          </div>
+          <div id="collect-progress-text" class="mt-12 muted">当前进度: 0 / 0 回合</div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="panel-toolbar">
+            <h3>已落盘 Episode 列表</h3>
+            <button type="button" class="btn btn-secondary" id="btn-refresh-episodes">刷新列表</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>数据集</th>
+                  <th>Episode</th>
+                  <th>任务指令</th>
+                  <th>帧数 / FPS</th>
+                  <th>存储路径</th>
+                </tr>
+              </thead>
+              <tbody id="episodes-tbody">
+                <tr><td colspan="5" class="muted">暂无已保存的 Episode。</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 5. Open-Source Plugin Hub -->
+      <section id="panel-plugins" class="tab-panel" role="tabpanel" hidden>
+        <div class="panel-toolbar">
+          <div>
+            <h2>开源工具插件中心 (ToolAdapter)</h2>
+            <p class="muted">统一管理 `lerobot-dataset-viz`、`feetech-motorlab`、`leLab`、`lerobot-studio` 与远程 VLA 服务，按当前系统环境动态检测依赖。</p>
+          </div>
+          <button type="button" class="btn btn-secondary" id="btn-refresh-plugins">刷新插件状态</button>
+        </div>
+        <div data-testid="plugin-list" id="plugin-list" class="plugin-grid"></div>
+      </section>
+
+      <!-- 6. VLA & Cloud Configs -->
+      <section id="panel-vla" class="tab-panel" role="tabpanel" hidden>
+        <div class="panel-toolbar">
+          <div>
+            <h2>VLA 训练配置与远程策略预览</h2>
+            <p class="muted">读取工作区 `configs/train/*.yaml` 与 `pi0.7` / `pi0.5` / `openpi` 训练指南。</p>
+          </div>
+        </div>
+
+        <div id="pi07-notice-card" class="card notice-amber"></div>
+        <div id="vla-configs-grid" class="grid-2 mt-16"></div>
+
+        <div class="card mt-16">
+          <h3>远程 VLA / OpenPI 策略预览 (Mock / Remote Endpoint)</h3>
+          <div class="form-grid mt-12">
+            <label>
+              <span>策略服务端点 (OpenPI / LeRobot Policy Server)</span>
+              <input id="vla-endpoint" type="text" value="ws://127.0.0.1:8000" />
+            </label>
+            <label>
+              <span>策略配置名称</span>
+              <input id="vla-policy-name" type="text" value="pi05_so101_custom" />
+            </label>
+            <label>
+              <span>语言指令 (Prompt)</span>
+              <input id="vla-prompt" type="text" value="Pick up the cube and place it in the bin" />
+            </label>
+          </div>
+          <div class="btn-group mt-12">
+            <button type="button" class="btn btn-primary" id="btn-vla-preview">生成 5 步 6-DOF 预测预览</button>
+          </div>
+          <pre id="vla-preview-output" class="code-box mt-12">点击上方按钮查看基于当前关节状态的 Action Chunk 预测结构。</pre>
+        </div>
+      </section>
+    </main>
+
+    <!-- Persistent Bottom Log Console -->
+    <footer class="log-dock">
+      <div class="log-dock-header">
+        <span>实时运行日志 (Console / Telemetry)</span>
+        <button type="button" class="btn btn-xs btn-secondary" id="btn-clear-log-view">清屏</button>
+      </div>
+      <pre data-testid="log-console" id="log-console" class="log-console"></pre>
+    </footer>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
