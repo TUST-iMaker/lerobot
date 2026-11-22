@@ -25,11 +25,16 @@ import logging
 import math
 import select
 import sys
-import termios
 import time
-import tty
 from pathlib import Path
 from typing import Any
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 
 # Ensure software root is on sys.path
 _here = Path(__file__).resolve().parent
@@ -38,7 +43,9 @@ if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
 from core.action_api import ActionAPI
+from core.config_loader import get_config
 from core.data_types import (
+    SO101_GRIPPER_JOINT_NAME,
     SO101_JOINT_NAMES,
     ActionType,
     ControlSource,
@@ -69,18 +76,33 @@ KEY_MAPPING: dict[str, tuple[str, float]] = {
 
 
 class NonBlockingTerminal:
-    """Linux 终端非阻塞单字符读取上下文管理器."""
+    """跨平台终端非阻塞单字符读取上下文管理器 (Linux termios / Windows msvcrt)."""
 
     def __enter__(self) -> NonBlockingTerminal:
-        self.old_settings = termios.tcgetattr(sys.stdin)
-        tty.setcbreak(sys.stdin.fileno())
+        self.old_settings = None
+        if termios is not None and tty is not None and sys.stdin.isatty():
+            self.old_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+        if termios is not None and self.old_settings is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
 
     def read_key(self, timeout_s: float = 0.05) -> str | None:
         """非阻塞等待单个按键输入."""
+        if sys.platform == "win32":
+            import msvcrt
+
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                if msvcrt.kbhit():
+                    char = msvcrt.getwch()
+                    return "ESC" if char == "\x1b" else char
+                time.sleep(0.01)
+            return None
+        if not sys.stdin.isatty():
+            return None
         rlist, _, _ = select.select([sys.stdin], [], [], timeout_s)
         if rlist:
             char = sys.stdin.read(1)
@@ -109,24 +131,28 @@ def print_banner(step_deg: float) -> None:
 
 
 def format_joint_state_line(state: JointState) -> str:
-    """格式化关节当前读数单行显示 (显示为角度，直观易读)."""
+    """格式化关节当前读数单行显示 (臂关节显示角度°, gripper 显示 RANGE_0_100 %)."""
     parts = []
     for name in SO101_JOINT_NAMES:
-        val = state.positions.get(name, 0.0)
-        deg = rad_to_deg(val) if state.unit == JointUnit.RADIAN else val
-        parts.append(f"{name[:4]}:{deg:>6.1f}°")
+        val = float(state.positions.get(name, 0.0))
+        if name == SO101_GRIPPER_JOINT_NAME:
+            parts.append(f"grip:{val:>5.1f}%")
+        else:
+            deg = rad_to_deg(val) if state.unit == JointUnit.RADIAN else val
+            parts.append(f"{name[:4]}:{deg:>6.1f}°")
     return " | ".join(parts)
 
 
 def run_keyboard_teleop(args: argparse.Namespace) -> int:
     """键盘遥操作主循环."""
-    arm_cfg = ArmConfig.default_follower(port=args.port)
+    target_port = getattr(args, "port", None) or get_config().follower.port
+    arm_cfg = ArmConfig.default_follower(port=target_port)
     sys_cfg = RobotSystemConfig(follower=arm_cfg)
     api = ActionAPI(config=sys_cfg)
 
-    print(f"[*] 正在通过 ActionAPI 连接机械臂 (端口: {args.port})...")
+    print(f"[*] 正在通过 ActionAPI 连接机械臂 (端口: {target_port})...")
     if not api.connect(connect_leader=False):
-        print("[!] 连接失败，请检查端口与权限 (如 sudo chmod 666 /dev/ttyACM0)")
+        print(f"[!] 连接失败，请检查串口 ({target_port}) 连接与访问权限")
         return 1
 
     # 申请键盘控制权
@@ -210,17 +236,21 @@ def run_keyboard_teleop(args: argparse.Namespace) -> int:
                     print("-" * 50)
                     continue
 
-                # 7. 关节增量控制
+                # 7. 关节增量控制 (臂关节使用弧度增量, gripper 直接使用百分比增量)
                 elif key in KEY_MAPPING:
                     joint_name, direction = KEY_MAPPING[key]
-                    delta_rad = direction * deg_to_rad(current_step_deg)
+                    if joint_name == SO101_GRIPPER_JOINT_NAME:
+                        delta_val = direction * current_step_deg
+                    else:
+                        delta_val = direction * deg_to_rad(current_step_deg)
 
                     action = RobotAction(
                         action_type=ActionType.JOINT_DELTA,
                         source=ControlSource.KEYBOARD,
                         timestamp=time.monotonic(),
-                        target_joint_deltas={joint_name: delta_rad},
+                        target_joint_deltas={joint_name: delta_val},
                         unit=JointUnit.RADIAN,
+                        gripper_unit=JointUnit.RANGE_0_100,
                     )
 
                     ok, msg = api.submit_action(action)
@@ -244,7 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--port", default="/dev/ttyACM0", help="Follower 串口 (默认 /dev/ttyACM0)")
+    parser.add_argument("--port", default=None, help="Follower 串口 (默认从全局配置解析)")
     parser.add_argument("--step-deg", type=float, default=2.0, help="单次按键增量步长 (度, 默认 2.0°)")
     parser.add_argument(
         "--keep-torque",

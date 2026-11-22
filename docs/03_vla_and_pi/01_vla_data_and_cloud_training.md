@@ -260,13 +260,14 @@ scp -P <SSH_PORT> -r \
     --output_dir=logs/eval_smolvla
   ```
 - **分离式客户端-服务端推理（`lerobot-policy-server`）**：
-  当本地 Windows 轻薄本连接着 `arm101` 真机，但没有大显存 GPU 时，可以在局域网 Ubuntu 主机或云端 GPU 上启动 `lerobot-policy-server`，让本地机械臂通过网络请求动作块：
+  当本地 Windows 轻薄本连接着 `arm101` 真机，但没有大显存 GPU 时，可以在局域网 Ubuntu 主机或云端 GPU 上启动基于 Zenoh `ServerConfig` 的 `lerobot-policy-server`，让本地机械臂通过网络请求动作块：
   ```bash
-  # 在 GPU 服务端启动策略推理服务
+  # 在 GPU 服务端启动策略推理服务（对齐 v0.7.1 Zenoh ServerConfig）
   lerobot-policy-server \
-    --host=0.0.0.0 \
-    --port=8080 \
-    --policy.path=models/checkpoints/smolvla_so101_best
+    --deployment=server \
+    --model.repo_or_path=models/checkpoints/smolvla_so101_best \
+    --model.device=cuda \
+    --zenoh.connect_endpoints="[]"
   ```
 
 ### 5.3 真机闭环推理与人机协同部署（`lerobot-rollout`）

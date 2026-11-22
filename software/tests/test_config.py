@@ -1,13 +1,17 @@
 """测试全局配置加载与解析 (test_config.py)."""
 
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from core.config_loader import (
     DEFAULT_CONFIG_PATH,
     FollowerConfig,
     LeaderConfig,
     get_config,
     load_config,
+    resolve_calibration_dir,
+    resolve_lerobot_home,
 )
 
 
@@ -52,6 +56,16 @@ class TestConfigLoader(unittest.TestCase):
         home_pose = get_preset_pose("home")
         self.assertIn("wrist_flex", home_pose)
         self.assertIn("wrist_roll", home_pose)
+
+    def test_leader_default_type_and_calibration_resolution(self) -> None:
+        self.assertEqual(LeaderConfig().type, "so101_leader")
+        with patch.dict(os.environ, {"HF_LEROBOT_HOME": "/tmp/custom_lerobot"}, clear=False):
+            os.environ.pop("HF_LEROBOT_CALIBRATION", None)
+            self.assertEqual(resolve_lerobot_home().name, "custom_lerobot")
+            f_dir = resolve_calibration_dir("follower")
+            l_dir = resolve_calibration_dir("leader")
+            self.assertTrue(str(f_dir).endswith(str(Path("robots") / "so_follower")))
+            self.assertTrue(str(l_dir).endswith(str(Path("teleoperators") / "so_leader")))
 
 
 if __name__ == "__main__":

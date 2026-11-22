@@ -13,6 +13,8 @@ from typing import Any
 
 from core.action_api import ActionAPI
 from core.data_types import (
+    SO101_ARM_JOINT_NAMES,
+    SO101_GRIPPER_JOINT_NAME,
     SO101_JOINT_NAMES,
     ActionType,
     ControlSource,
@@ -43,11 +45,19 @@ class DemoRoutineRunner:
             logger.error("无法读取机械臂当前关节状态")
             return False
 
-        start_positions = {j: cur_state.positions.get(j, 0.0) for j in SO101_JOINT_NAMES}
+        cur_state_rad = cur_state.to_radians() if cur_state.unit != JointUnit.RADIAN else cur_state
+        start_positions = {j: cur_state_rad.positions.get(j, 0.0) for j in SO101_JOINT_NAMES}
 
-        # 计算最大关节角跨度，自适应动态延长耗时，避免舵机严重滞后
-        max_diff = max(abs(start_positions[j] - target_positions.get(j, start_positions[j])) for j in SO101_JOINT_NAMES)
-        actual_duration = max(duration_s, max_diff / 0.8)
+        # 分别按弧度 (臂关节) 与百分比 (gripper) 计算自适应时长，防止混合单位产生百秒级延迟
+        max_arm_diff = max(
+            abs(start_positions[j] - target_positions.get(j, start_positions[j]))
+            for j in SO101_ARM_JOINT_NAMES
+        )
+        gripper_diff = abs(
+            start_positions.get(SO101_GRIPPER_JOINT_NAME, 0.0)
+            - target_positions.get(SO101_GRIPPER_JOINT_NAME, start_positions.get(SO101_GRIPPER_JOINT_NAME, 0.0))
+        )
+        actual_duration = max(duration_s, max_arm_diff / 0.8, gripper_diff / 50.0)
 
         total_steps = max(10, int(actual_duration * rate_hz))
         dt = 1.0 / rate_hz
@@ -69,6 +79,7 @@ class DemoRoutineRunner:
                 timestamp=time.monotonic(),
                 target_joint_positions=interp_pos,
                 unit=JointUnit.RADIAN,
+                gripper_unit=JointUnit.RANGE_0_100,
             )
             ok, msg = self.api.submit_action(action)
             if not ok:
@@ -84,6 +95,7 @@ class DemoRoutineRunner:
                 timestamp=time.monotonic(),
                 target_joint_positions=target_positions,
                 unit=JointUnit.RADIAN,
+                gripper_unit=JointUnit.RANGE_0_100,
             )
             self.api.submit_action(hold_action)
             time.sleep(dt)
@@ -138,9 +150,9 @@ class DemoRoutineRunner:
         self.run_pose("pick_hover", duration_s=1.5)
         time.sleep(0.5)
 
-        # 闭合夹爪
+        # 闭合夹爪 (RANGE_0_100: 10% 夹紧)
         gripped_pose = get_preset_pose("pick_hover", unit=JointUnit.RADIAN)
-        gripped_pose["gripper"] = 0.20
+        gripped_pose["gripper"] = 10.0
         self.interpolate_and_send(gripped_pose, duration_s=0.8)
         time.sleep(0.5)
 
@@ -151,10 +163,10 @@ class DemoRoutineRunner:
         self.interpolate_and_send(lift_pose, duration_s=1.2)
         time.sleep(0.5)
 
-        # 下放并松开
+        # 下放并松开 (RANGE_0_100: 85% 张开)
         self.interpolate_and_send(gripped_pose, duration_s=1.2)
         open_pose = dict(gripped_pose)
-        open_pose["gripper"] = -0.85
+        open_pose["gripper"] = 85.0
         self.interpolate_and_send(open_pose, duration_s=0.8)
 
         # 平稳收回安全蜷缩休眠位

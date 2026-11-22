@@ -12,6 +12,8 @@ DRY_RUN=0
 WITH_OPENPI=0
 WITH_CORE_SCRIPTS=0
 WITH_TRAINING=0
+WITH_PI=0
+WITH_SMOLVLA=0
 SKIP_LEROBOT_INSTALL=0
 SETUP_UDEV=0
 
@@ -29,6 +31,8 @@ Options:
   --with-openpi           Also provision Python 3.11 OpenPI venv from repos/openpi
   --with-core-scripts     Install repos/lerobot[feetech,core_scripts] instead of [feetech]
   --with-training         Include repos/lerobot[training] extra (datasets/accelerate) for training
+  --with-pi               Include repos/lerobot[pi] extra for Pi0 / Pi0-FAST / Pi0.5 policies
+  --with-smolvla          Include repos/lerobot[smolvla] extra for SmolVLA policy
   --skip-lerobot-install  Skip editable install of repos/lerobot
   --setup-udev            Write /etc/udev/rules.d/99-lerobot-arms.rules and reload udev
   -h, --help              Show this help message
@@ -42,6 +46,8 @@ while [[ $# -gt 0 ]]; do
     --with-openpi) WITH_OPENPI=1; shift ;;
     --with-core-scripts) WITH_CORE_SCRIPTS=1; shift ;;
     --with-training) WITH_TRAINING=1; shift ;;
+    --with-pi) WITH_PI=1; shift ;;
+    --with-smolvla) WITH_SMOLVLA=1; shift ;;
     --skip-lerobot-install) SKIP_LEROBOT_INSTALL=1; shift ;;
     --setup-udev) SETUP_UDEV=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -201,6 +207,12 @@ if [[ "$SKIP_LEROBOT_INSTALL" -eq 0 ]]; then
   fi
   if [[ "$WITH_TRAINING" -eq 1 ]]; then
     EXTRAS="${EXTRAS},training"
+  fi
+  if [[ "$WITH_PI" -eq 1 ]]; then
+    EXTRAS="${EXTRAS},pi"
+  fi
+  if [[ "$WITH_SMOLVLA" -eq 1 ]]; then
+    EXTRAS="${EXTRAS},smolvla"
   fi
   run_cmd "Install editable repos/lerobot[$EXTRAS]" "$UV_BIN" pip install --python "$VENV_PYTHON" -e "${LEROBOT_REPO}[${EXTRAS}]"
 else

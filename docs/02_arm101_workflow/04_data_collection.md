@@ -63,7 +63,7 @@ lerobot-record `
 
 ### 2.3 重要勘误：`--dataset.video_backend=pyav` 属于哪个命令？
 查阅 `repos/lerobot` v0.7.1 源码（`configs/dataset.py` vs `configs/default.py`）需特别区分：
-- **`lerobot-record` 使用的是 `DatasetRecordConfig`**：它**没有** `--dataset.video_backend` 参数！录制侧影响视频编码的性能参数是 `--dataset.streaming_encoding=true`（边录边编码，显著缩短收尾等待时间）、`--dataset.vcodec` 与 `--dataset.encoder_threads`。若强行给 `lerobot-record` 传 `--dataset.video_backend=pyav` 会报未知字段错误。
+- **`lerobot-record` 使用的是 `DatasetRecordConfig`**：它**没有** `--dataset.video_backend` 参数！录制侧影响视频编码的性能参数是 `--dataset.streaming_encoding=true`（边录边编码，显著缩短收尾等待时间）、`--dataset.rgb_encoder.vcodec` 与 `--dataset.encoder_threads`。若强行给 `lerobot-record` 传 `--dataset.video_backend=pyav` 会报未知字段错误。
 - **`lerobot-train`（以及所有读取 `LeRobotDataset` 的评估/数据加载脚本）使用的是 `DatasetConfig`**：它**才拥有 `--dataset.video_backend=pyav`**（默认在 `torchcodec` 不可用或 RTX 50 系列 Blackwell 遇到预览版 `torchvision`/`torchcodec` 兼容性问题时，可在**训练命令**里加上 `--dataset.video_backend=pyav`）。
 
 ### 2.4 采集后上传 Hugging Face Hub（如先用了 `push_to_hub=false`）

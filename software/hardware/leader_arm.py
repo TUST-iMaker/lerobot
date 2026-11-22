@@ -14,11 +14,13 @@ import time
 from typing import Any
 
 from core.data_types import (
+    SO101_GRIPPER_JOINT_NAME,
     ActionType,
     ControlSource,
     JointState,
     JointUnit,
     RobotAction,
+    deg_to_rad,
 )
 from hardware.base import BaseArmAdapter
 from hardware.config import ArmConfig
@@ -41,15 +43,30 @@ class SO101LeaderArm(BaseArmAdapter):
 
         self.load_calibration()
 
+        cal_dir = self.config.calibration_dir or self.config.calibration_fpath.parent
+
         try:
             from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
             driver_cfg = SO101LeaderConfig(
                 port=self.config.port,
                 id=self.config.robot_id,
+                calibration_dir=cal_dir,
                 use_degrees=self.config.use_degrees,
             )
             leader = SO101Leader(driver_cfg)
-            leader.connect()
+            leader.connect(calibrate=False)
+            try:
+                hw_cal = bool(leader.is_calibrated)
+            except Exception as cal_exc:
+                hw_cal = False
+                logger.warning("[%s] 检查主臂硬件校准状态异常: %s", self.config.robot_id, cal_exc)
+            self._hw_calibrated = hw_cal
+            if not hw_cal:
+                logger.warning(
+                    "[%s] 主臂舵机 EEPROM 与校准文件 %s 不一致或未校准!",
+                    self.config.robot_id,
+                    getattr(leader, "calibration_fpath", self.config.calibration_fpath),
+                )
             # 确保主臂扭矩处于禁用状态
             try:
                 leader.bus.disable_torque()
@@ -63,12 +80,23 @@ class SO101LeaderArm(BaseArmAdapter):
             driver_cfg = SO101FollowerConfig(
                 port=self.config.port,
                 id=self.config.robot_id,
+                calibration_dir=cal_dir,
                 disable_torque_on_disconnect=True,
                 use_degrees=self.config.use_degrees,
             )
             leader = SO101Follower(driver_cfg)
             leader.bus.connect()
+            try:
+                hw_cal = bool(leader.is_calibrated)
+            except Exception:
+                hw_cal = False
+            self._hw_calibrated = hw_cal
             leader.bus.disable_torque()
+            try:
+                leader.configure()
+            finally:
+                # SOFollower.configure() 退出 with torque_disabled() 时会恢复使能，主臂必须再次泄力
+                leader.bus.disable_torque()
             self._leader = leader
 
         self._connected = True
@@ -124,14 +152,15 @@ class SO101LeaderArm(BaseArmAdapter):
         driver_unit = JointUnit.DEGREE if self.config.use_degrees else JointUnit.NORMALIZED
         converted_pos, final_unit = self._convert_driver_to_internal_unit(raw_positions, driver_unit)
 
-        # 应用主从遥操作偏置补偿 (如主从五号舵机安装/标定 90° 偏差校正)
+        # 应用主从遥操作偏置补偿 (如主从五号舵机安装/标定 90° 偏差校正, 跳过 gripper)
         if hasattr(self.config, "joint_offsets_deg") and self.config.joint_offsets_deg:
             for j, offset_deg in self.config.joint_offsets_deg.items():
+                if j == SO101_GRIPPER_JOINT_NAME:
+                    continue
                 if j in converted_pos:
                     if final_unit == JointUnit.DEGREE:
                         converted_pos[j] += offset_deg
                     elif final_unit == JointUnit.RADIAN:
-                        from core.data_types import deg_to_rad
                         converted_pos[j] += deg_to_rad(offset_deg)
 
         state = JointState(
@@ -139,6 +168,7 @@ class SO101LeaderArm(BaseArmAdapter):
             positions=converted_pos,
             unit=final_unit,
             torques_enabled={k: False for k in converted_pos},
+            gripper_unit=JointUnit.RANGE_0_100,
         )
         return state
 
@@ -151,5 +181,6 @@ class SO101LeaderArm(BaseArmAdapter):
             timestamp=state.timestamp,
             target_joint_positions=dict(state.positions),
             unit=state.unit,
+            gripper_unit=state.gripper_unit,
         )
 

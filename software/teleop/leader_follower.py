@@ -14,11 +14,16 @@ import argparse
 import logging
 import select
 import sys
-import termios
 import time
-import tty
 from pathlib import Path
 from typing import Any
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 
 # Ensure software root is on sys.path
 _here = Path(__file__).resolve().parent
@@ -27,6 +32,7 @@ if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
 from core.action_api import ActionAPI
+from core.config_loader import get_config
 from core.data_types import ControlSource, JointUnit, rad_to_deg
 from hardware.config import ArmConfig, RobotSystemConfig
 
@@ -35,22 +41,28 @@ logger = logging.getLogger("teleop")
 
 
 class NonBlockingTerminal:
-    """Linux 终端非阻塞单字符读取上下文管理器."""
+    """跨平台终端非阻塞单字符读取上下文管理器 (Linux termios / Windows msvcrt)."""
 
     def __enter__(self) -> NonBlockingTerminal:
-        if sys.stdin.isatty():
+        self.old_settings = None
+        if termios is not None and tty is not None and sys.stdin.isatty():
             self.old_settings = termios.tcgetattr(sys.stdin)
             tty.setcbreak(sys.stdin.fileno())
-        else:
-            self.old_settings = None
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if self.old_settings is not None:
+        if termios is not None and self.old_settings is not None:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
 
     def read_key(self) -> str | None:
         """非阻塞即刻检查单个按键输入 (零延迟)."""
+        if sys.platform == "win32":
+            import msvcrt
+
+            if msvcrt.kbhit():
+                char = msvcrt.getwch()
+                return "ESC" if char == "\x1b" else char
+            return None
         if not sys.stdin.isatty():
             return None
         rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
@@ -64,11 +76,15 @@ class NonBlockingTerminal:
 
 def run_leader_follower(args: argparse.Namespace) -> int:
     """主从遥操作与多模态示教录制主循环."""
+    cfg = get_config()
+    follower_port = getattr(args, "follower_port", None) or cfg.follower.port
+    leader_port = getattr(args, "leader_port", None) or cfg.leader.port
+
     if getattr(args, "mock", False):
-        sys_cfg = RobotSystemConfig.mock_system()
+        sys_cfg = RobotSystemConfig.mock_system(with_leader=True)
     else:
-        follower_cfg = ArmConfig.default_follower(port=args.follower_port)
-        leader_cfg = ArmConfig.default_leader(port=args.leader_port)
+        follower_cfg = ArmConfig.default_follower(port=follower_port)
+        leader_cfg = ArmConfig.default_leader(port=leader_port)
         sys_cfg = RobotSystemConfig(
             follower=follower_cfg,
             leader=leader_cfg,
@@ -94,8 +110,8 @@ def run_leader_follower(args: argparse.Namespace) -> int:
     print("=" * 65)
     print("      SO-ARM101 主从双臂实时遥操作与示教录制系统 (30Hz 闭环)")
     print("=" * 65)
-    print(f" 从臂端口: {args.follower_port} (执行从臂, 闭环使能扭矩)")
-    print(f" 主臂端口: {args.leader_port} (示教主臂, 零力矩拖动)")
+    print(f" 从臂端口: {follower_port} (执行从臂, 闭环使能扭矩)")
+    print(f" 主臂端口: {leader_port} (示教主臂, 零力矩拖动)")
     print(f" 控制频率: {args.hz:.1f} Hz (周期 ~{1000/args.hz:.1f} ms)")
     if record_mode:
         print(" 录制模式: 已开启示教录制！")
@@ -324,8 +340,6 @@ def run_leader_follower(args: argparse.Namespace) -> int:
 
     return 0
 
-    return 0
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -333,9 +347,10 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--follower-port", default="/dev/ttyACM0", help="从臂串口 (默认 /dev/ttyACM0)")
-    parser.add_argument("--leader-port", default="/dev/ttyACM1", help="主臂串口 (默认 /dev/ttyACM1)")
+    parser.add_argument("--follower-port", default=None, help="从臂串口 (默认从全局配置解析)")
+    parser.add_argument("--leader-port", default=None, help="主臂串口 (默认从全局配置解析)")
     parser.add_argument("--hz", type=float, default=30.0, help="遥操作同步频率 (默认 30 Hz)")
+    parser.add_argument("--mock", action="store_true", help="纯软件仿真模式 (无需物理串口)")
     parser.add_argument(
         "--record",
         action="store_true",
@@ -362,7 +377,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--camera-id",
         default="auto",
-        help="摄像头设备编号或路径 (默认 auto，优先自动探测 /dev/video2)",
+        help="摄像头设备编号或路径 (默认 auto，自动探测可用摄像头)",
     )
     parser.add_argument(
         "--keep-torque",

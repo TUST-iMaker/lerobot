@@ -141,6 +141,7 @@ class RobotSystemAdapter:
             timestamp=leader_state.timestamp,
             target_joint_positions=dict(leader_state.positions),
             unit=leader_state.unit,
+            gripper_unit=leader_state.gripper_unit,
         )
         ok = self.follower.send_action(action)
         return leader_state, action, ok

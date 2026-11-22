@@ -8,61 +8,129 @@
  */
 
 export const LINK_MM = {
-  base_height: 110,
-  upper_arm: 135,
-  forearm: 125,
-  gripper_tcp: 71,
+  base_height: 116.6,
+  upper_arm: 116.0,
+  forearm: 135.0,
+  gripper_tcp: 160.5,
 };
 
 export const JOINT_META = [
-  { id: 1, key: "shoulder_pan", label: "底座旋转", unit: "°", linkMm: "L1=110", min: -110, max: 110 },
-  { id: 2, key: "shoulder_lift", label: "大臂俯仰", unit: "°", linkMm: "L2=135", min: -100, max: 100 },
-  { id: 3, key: "elbow_flex", label: "小臂肘弯", unit: "°", linkMm: "L3=125", min: -97, max: 97 },
-  { id: 4, key: "wrist_flex", label: "手腕俯仰", unit: "°", linkMm: "L4=71", min: -95, max: 95 },
+  { id: 1, key: "shoulder_pan", label: "底座旋转", unit: "°", linkMm: "L1=116.6", min: -110, max: 110 },
+  { id: 2, key: "shoulder_lift", label: "大臂俯仰", unit: "°", linkMm: "L2=116.0", min: -100, max: 100 },
+  { id: 3, key: "elbow_flex", label: "小臂肘弯", unit: "°", linkMm: "L3=135.0", min: -97, max: 97 },
+  { id: 4, key: "wrist_flex", label: "手腕俯仰", unit: "°", linkMm: "L4=160.5", min: -95, max: 95 },
   { id: 5, key: "wrist_roll", label: "手腕滚转", unit: "°", linkMm: "Roll", min: -157, max: 163 },
   { id: 6, key: "gripper", label: "末端夹爪", unit: "%", linkMm: "Claw", min: 0, max: 100 },
 ];
 
-export function estimateEncoder(key, val) {
-  const n = Number(val ?? 0);
-  if (key === "gripper") {
-    return Math.max(0, Math.min(4095, Math.round(2048 + (n - 50) * 20)));
+// Exact URDF chain parameters from repos/SO-ARM100/Simulation/SO101/so101_new_calib.urdf
+const URDF_CHAIN = [
+  { name: "shoulder_pan", rev: true, xyz: [0.0388353, -8.97657e-9, 0.0624], rpy: [3.14159, 4.18253e-17, -3.14159] },
+  { name: "shoulder_lift", rev: true, xyz: [-0.0303992, -0.0182778, -0.0542], rpy: [-1.5708, -1.5708, 0.0] },
+  { name: "elbow_flex", rev: true, xyz: [-0.11257, -0.028, 1.73763e-16], rpy: [-3.63608e-16, 8.74301e-16, 1.5708] },
+  { name: "wrist_flex", rev: true, xyz: [-0.1349, 0.0052, 3.62355e-17], rpy: [4.02456e-15, 8.67362e-16, -1.5708] },
+  { name: "wrist_roll", rev: true, xyz: [5.55112e-17, -0.0611, 0.0181], rpy: [1.5708, 0.0486795, 3.14159] },
+  { name: "gripper_frame_joint", rev: false, xyz: [-0.0079, -0.000218121, -0.0981274], rpy: [0.0, 3.14159, 0.0] },
+];
+
+function _rpyMat(roll, pitch, yaw) {
+  const cr = Math.cos(roll), sr = Math.sin(roll);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  return [
+    [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+    [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+    [-sp, cp * sr, cp * cr],
+  ];
+}
+
+function _rotZMat(angle) {
+  const c = Math.cos(angle), s = Math.sin(angle);
+  return [
+    [c, -s, 0],
+    [s, c, 0],
+    [0, 0, 1],
+  ];
+}
+
+function _mulMat3(A, B) {
+  const C = [
+    [0, 0, 0],
+    [0, 0, 0],
+    [0, 0, 0],
+  ];
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      C[i][j] = A[i][0] * B[0][j] + A[i][1] * B[1][j] + A[i][2] * B[2][j];
+    }
   }
-  return Math.max(0, Math.min(4095, Math.round(2048 + n * (4096 / 360))));
+  return C;
+}
+
+function _mulMatVec3(R, v) {
+  return [
+    R[0][0] * v[0] + R[0][1] * v[1] + R[0][2] * v[2],
+    R[1][0] * v[0] + R[1][1] * v[1] + R[1][2] * v[2],
+    R[2][0] * v[0] + R[2][1] * v[1] + R[2][2] * v[2],
+  ];
+}
+
+export function estimateEncoder(key, val, opts = {}) {
+  const n = Number(val ?? 0);
+  const rMin = opts.rangeMin ?? 0;
+  const rMax = opts.rangeMax ?? 4095;
+  const driveMode = opts.driveMode ?? 0;
+  const span = Math.max(1, rMax - rMin);
+  if (key === "gripper") {
+    const pct = Math.max(0, Math.min(100, n));
+    const norm = driveMode ? 100 - pct : pct;
+    return Math.max(rMin, Math.min(rMax, Math.round(rMin + (norm / 100) * span)));
+  }
+  const mid = opts.rangeMin !== undefined && opts.rangeMax !== undefined ? (rMin + rMax) / 2 : 2047;
+  const sign = driveMode ? -1 : 1;
+  return Math.max(rMin, Math.min(rMax, Math.round(mid + sign * n * (4095 / 360))));
 }
 
 export function computeStickFK(joints) {
-  const pan = ((Number(joints?.shoulder_pan ?? 0)) * Math.PI) / 180;
-  const lift = ((Number(joints?.shoulder_lift ?? 0)) * Math.PI) / 180;
-  const elbow = ((Number(joints?.elbow_flex ?? 0)) * Math.PI) / 180;
-  const wristP = ((Number(joints?.wrist_flex ?? 0)) * Math.PI) / 180;
   const wristR = Number(joints?.wrist_roll ?? 0);
   const grip = Number(joints?.gripper ?? 20);
 
-  const { base_height: L1, upper_arm: L2, forearm: L3, gripper_tcp: L4 } = LINK_MM;
-  const phi2 = lift;
-  const phi3 = phi2 + Math.PI / 2 + elbow;
-  const phi4 = phi3 + wristP;
+  let R = [
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1],
+  ];
+  let p = [0, 0, 0];
+  const nodePosMm = { base: [0, 0, 0] };
 
-  const r1 = 0;
-  const z1 = L1;
-  const r2 = L2 * Math.sin(phi2);
-  const z2 = L1 + L2 * Math.cos(phi2);
-  const r3 = r2 + L3 * Math.sin(phi3);
-  const z3 = z2 + L3 * Math.cos(phi3);
-  const r4 = r3 + L4 * Math.sin(phi4);
-  const z4 = z3 + L4 * Math.cos(phi4);
-
-  const cp = Math.cos(pan);
-  const sp = Math.sin(pan);
+  for (const spec of URDF_CHAIN) {
+    const dp = _mulMatVec3(R, spec.xyz);
+    p = [p[0] + dp[0], p[1] + dp[1], p[2] + dp[2]];
+    R = _mulMat3(R, _rpyMat(spec.rpy[0], spec.rpy[1], spec.rpy[2]));
+    nodePosMm[spec.name] = [p[0] * 1000, p[1] * 1000, p[2] * 1000];
+    if (spec.rev) {
+      const deg = Number(joints?.[spec.name] ?? 0);
+      const rad = (deg * Math.PI) / 180;
+      R = _mulMat3(R, _rotZMat(rad));
+    }
+  }
 
   const pts = {
     base: [0, 0, 0],
-    shoulder: [r1 * cp, r1 * sp, z1],
-    elbow: [r2 * cp, r2 * sp, z2],
-    wrist: [r3 * cp, r3 * sp, z3],
-    tcp: [r4 * cp, r4 * sp, z4],
+    shoulder: nodePosMm.shoulder_lift || [0, 0, 116.6],
+    elbow: nodePosMm.elbow_flex || [0, 0, 229.2],
+    wrist: nodePosMm.wrist_flex || [171.3, 0, 229.2],
+    tcp: nodePosMm.gripper_frame_joint,
   };
+
+  const tcpX = pts.tcp[0];
+  const tcpY = pts.tcp[1];
+  const tcpZ = pts.tcp[2];
+  const r4 = Math.hypot(tcpX, tcpY);
+  const fVec = [R[0][2], R[1][2], R[2][2]];
+  const pitchRad = Math.atan2(-fVec[2], Math.hypot(fVec[0], fVec[1]));
+  const panWorld = Math.atan2(tcpY, tcpX);
+  const phi4 = pitchRad + Math.PI / 2;
 
   const bodyErr = Math.max(
     Math.abs(Number(joints?.shoulder_pan ?? 0)),
@@ -75,13 +143,13 @@ export function computeStickFK(joints) {
   return {
     pts,
     phi4,
-    pan,
+    pan: panWorld,
     tcp: {
-      x: pts.tcp[0],
-      y: pts.tcp[1],
-      z: pts.tcp[2],
+      x: tcpX,
+      y: tcpY,
+      z: tcpZ,
       r: r4,
-      pitchDeg: ((phi4 - Math.PI / 2) * 180) / Math.PI,
+      pitchDeg: (pitchRad * 180) / Math.PI,
       rollDeg: wristR,
       gripperPct: grip,
     },

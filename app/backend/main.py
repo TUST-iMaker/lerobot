@@ -468,6 +468,7 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
                 episode_time_s=body.episode_time_s,
                 reset_time_s=body.reset_time_s,
                 fps=body.fps,
+                push_to_hub=body.push_to_hub,
             )
         except WorkflowConflictError as exc:
             raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})

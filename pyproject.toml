@@ -41,10 +41,10 @@ win = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["app*"]
+include = ["app*", "software*"]
 
 [tool.pytest.ini_options]
-testpaths = ["app/tests", "tests"]
+testpaths = ["app/tests", "tests", "software/tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 

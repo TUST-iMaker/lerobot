@@ -132,6 +132,32 @@ class TestActionAPI(unittest.TestCase):
         self.assertTrue(ok)
         self.mock_hw.disable_torque.assert_called()
 
+    def test_submit_action_full_open_gripper_100_not_clamped(self) -> None:
+        self.api.claim_control(ControlSource.KEYBOARD)
+        self.sample_state = JointState(
+            timestamp=10.0,
+            positions={**{j: 0.0 for j in SO101_JOINT_NAMES}, "gripper": 90.0},
+            unit=JointUnit.RADIAN,
+        )
+        self.mock_hw.read_follower_state.return_value = self.sample_state
+        act = RobotAction(
+            action_type=ActionType.JOINT_POSITION,
+            source=ControlSource.KEYBOARD,
+            timestamp=11.0,
+            target_joint_positions={"gripper": 100.0},
+            unit=JointUnit.RADIAN,
+            gripper_unit=JointUnit.RANGE_0_100,
+        )
+        ok, _ = self.api.submit_action(act)
+        self.assertTrue(ok)
+        sent_action = self.mock_hw.send_action.call_args[0][0]
+        self.assertAlmostEqual(sent_action.target_joint_positions["gripper"], 100.0, places=4)
+
+    def test_calibration_dir_forwarded_when_constructing_default_api(self) -> None:
+        from pathlib import Path
+        api = ActionAPI(calibration_dir=Path("data/calibration"))
+        self.assertEqual(api.hardware.config.follower.calibration_dir.name, "so_follower")
+
 
 if __name__ == "__main__":
     unittest.main()

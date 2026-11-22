@@ -16,11 +16,15 @@ from typing import Any
 
 from core.data_types import (
     MIDDLE_ORDER,
+    SO101_ARM_JOINT_NAMES,
+    SO101_GRIPPER_JOINT_NAME,
     SO101_JOINT_NAMES,
     ActionType,
     JointState,
     JointUnit,
     RobotAction,
+    clamp_gripper_pct,
+    convert_joint_positions,
     deg_to_rad,
     rad_to_deg,
 )
@@ -126,13 +130,15 @@ class MockArmAdapter(BaseArmAdapter):
         dt = max(1e-4, min(0.2, now - self._last_step_time))
         self._last_step_time = now
 
-        max_step = self.max_joint_speed_rad_s * dt
+        max_arm_step = self.max_joint_speed_rad_s * dt
+        max_gripper_step = (self.max_joint_speed_rad_s * (100.0 / math.pi)) * dt
 
         for j in SO101_JOINT_NAMES:
             # 仅在使能扭矩时响应目标位置更新
             if not self._torques.get(j, False):
                 continue
 
+            max_step = max_gripper_step if j == SO101_GRIPPER_JOINT_NAME else max_arm_step
             target = self._target_positions[j]
             current = self._current_positions[j]
             diff = target - current
@@ -157,10 +163,15 @@ class MockArmAdapter(BaseArmAdapter):
         # 推进物理插值运动
         self._step_dynamics()
 
-        # 构造观测数据 (根据 config.internal_unit 进行单位转换)
+        # 构造观测数据 (根据 config.internal_unit 转换 5 个臂关节，保持 gripper RANGE_0_100)
         positions = dict(self._current_positions)
         if self.config.internal_unit == JointUnit.DEGREE:
-            positions = {k: rad_to_deg(v) for k, v in positions.items()}
+            positions = convert_joint_positions(
+                positions,
+                JointUnit.RADIAN,
+                JointUnit.DEGREE,
+                gripper_unit=JointUnit.RANGE_0_100,
+            )
 
         self._record_read_latency(0.45)  # 模拟 ~0.45ms 极低读取延迟
 
@@ -169,6 +180,7 @@ class MockArmAdapter(BaseArmAdapter):
             positions=positions,
             unit=self.config.internal_unit,
             torques_enabled=dict(self._torques),
+            gripper_unit=JointUnit.RANGE_0_100,
         )
         return state
 
@@ -186,22 +198,28 @@ class MockArmAdapter(BaseArmAdapter):
             logger.error("[%s] 拒绝执行非法动作: %s", self.config.robot_id, err)
             return False
 
-        # 单位统一转换为弧度制
+        # 臂关节统一转换为弧度制，gripper 保持 RANGE_0_100 [0.0, 100.0]
         if action.action_type == ActionType.JOINT_POSITION:
             if not action.target_joint_positions:
                 return False
             for j, val in action.target_joint_positions.items():
                 if j in self._target_positions:
-                    target_rad = deg_to_rad(val) if action.unit == JointUnit.DEGREE else float(val)
-                    self._target_positions[j] = target_rad
+                    if j == SO101_GRIPPER_JOINT_NAME:
+                        self._target_positions[j] = clamp_gripper_pct(val)
+                    else:
+                        target_rad = deg_to_rad(val) if action.unit == JointUnit.DEGREE else float(val)
+                        self._target_positions[j] = target_rad
 
         elif action.action_type == ActionType.JOINT_DELTA:
             if not action.target_joint_deltas:
                 return False
             for j, delta in action.target_joint_deltas.items():
                 if j in self._target_positions:
-                    delta_rad = deg_to_rad(delta) if action.unit == JointUnit.DEGREE else float(delta)
-                    self._target_positions[j] = self._current_positions[j] + delta_rad
+                    if j == SO101_GRIPPER_JOINT_NAME:
+                        self._target_positions[j] = clamp_gripper_pct(self._current_positions[j] + float(delta))
+                    else:
+                        delta_rad = deg_to_rad(delta) if action.unit == JointUnit.DEGREE else float(delta)
+                        self._target_positions[j] = self._current_positions[j] + delta_rad
 
         else:
             logger.error("[%s] 不支持的动作类型: %s", self.config.robot_id, action.action_type)
@@ -221,19 +239,25 @@ class MockArmAdapter(BaseArmAdapter):
         step_deg: float = 3.0,
         tolerance_deg: float = 1.0,
         timeout_s: float = 10.0,
+        gripper_target: float | None = None,
     ) -> bool:
-        """按安全次序平稳回到工作工作区中位."""
+        """按安全次序平稳回到工作区中位 (5 臂关节归 0.0, gripper 默认保持当前开合度)."""
         if not self._connected:
             raise RuntimeError(f"[{self.config.robot_id}] 仿真机械臂未连接")
 
         logger.info("[%s] 正在按 MIDDLE_ORDER 顺序分步回中位...", self.config.robot_id)
         for joint in MIDDLE_ORDER:
+            if joint == SO101_GRIPPER_JOINT_NAME:
+                if gripper_target is not None:
+                    g_val = clamp_gripper_pct(gripper_target)
+                    self._target_positions[joint] = g_val
+                    self._current_positions[joint] = g_val
+                continue
             target_val = DEFAULT_MOCK_WORKING_POSE.get(joint, 0.0)
             self._target_positions[joint] = target_val
-            # 立即平稳插值
             self._current_positions[joint] = target_val
 
-        logger.info("[%s] 所有关节已回到仿真中位", self.config.robot_id)
+        logger.info("[%s] 所有臂关节已回到仿真中位", self.config.robot_id)
         return True
 
     def read_torque_states(self) -> dict[str, bool]:
@@ -250,19 +274,29 @@ class MockArmAdapter(BaseArmAdapter):
         }
 
     def read_positions(self, use_degrees: bool = False) -> dict[str, float]:
-        """获取各关节当前位置数值."""
+        """获取各关节当前位置数值 (arm 转 deg/rad, gripper 保持 RANGE_0_100)."""
         self._step_dynamics()
         if use_degrees:
-            return {k: rad_to_deg(v) for k, v in self._current_positions.items()}
+            return convert_joint_positions(
+                self._current_positions,
+                JointUnit.RADIAN,
+                JointUnit.DEGREE,
+                gripper_unit=JointUnit.RANGE_0_100,
+            )
         return dict(self._current_positions)
 
     def set_joint_positions(self, positions: dict[str, float], unit: JointUnit = JointUnit.RADIAN) -> None:
         """强制瞬时重设关节位置 (仅供仿真器/测试用例初始化)."""
         for j, val in positions.items():
             if j in self._current_positions:
-                rad_val = deg_to_rad(val) if unit == JointUnit.DEGREE else float(val)
-                self._current_positions[j] = rad_val
-                self._target_positions[j] = rad_val
+                if j == SO101_GRIPPER_JOINT_NAME:
+                    g_val = clamp_gripper_pct(val)
+                    self._current_positions[j] = g_val
+                    self._target_positions[j] = g_val
+                else:
+                    rad_val = deg_to_rad(val) if unit == JointUnit.DEGREE else float(val)
+                    self._current_positions[j] = rad_val
+                    self._target_positions[j] = rad_val
 
     def set_torque(self, joint: str, enable: bool) -> None:
         """设置单个关节扭矩使能."""

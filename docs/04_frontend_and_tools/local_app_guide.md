@@ -59,9 +59,9 @@ envs\win\lerobot\Scripts\python.exe -m app.backend.main
 ### 3.2 遥操作与 6-DOF 监控（`遥操作` 标签页）
 
 1. 设置目标帧率（默认 `60` FPS），点击 **启动遥操作**。
-2. 查看左侧 **6-DOF 关节状态**：严格对齐 SO-101 官方 6 个舵机通道：
-   - `shoulder_pan`、`shoulder_lift`、`elbow_flex`、`wrist_flex`、`wrist_roll`（单位：度 `[-180, 180]°`）
-   - `gripper`（夹爪开合百分比 `[0, 100]%`）
+2. 查看左侧 **6-DOF 关节状态**：严格对齐 SO-101 官方 `so101_new_calib.urdf` 6 个舵机通道与物理软限位：
+   - `shoulder_pan`（`[-110, 110]°`）、`shoulder_lift`（`[-100, 100]°`）、`elbow_flex`（`[-97, 97]°`）、`wrist_flex`（`[-95, 95]°`）、`wrist_roll`（`[-157, 163]°`）
+   - `gripper`（夹爪开合百分比 `RANGE_0_100` `[0, 100]%`）
 3. 在 `dry_run` 模式下拖动任一滑块，右侧 **前置相机 (`front`)** 与 **腕部相机 (`wrist`)** 的 2D 运动学投影 HUD 画面会同步响应机械臂姿态变化。
 
 ### 3.3 演示示教与轨迹回放（`示教与回放` 标签页）

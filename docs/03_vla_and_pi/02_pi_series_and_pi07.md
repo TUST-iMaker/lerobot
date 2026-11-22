@@ -91,12 +91,12 @@ lerobot-train \
   --policy.push_to_hub=false \
   --policy.dtype=bfloat16 \
   --policy.gradient_checkpointing=true \
-  -- policy.device=cuda \
+  --policy.device=cuda \
   --batch_size=16 \
   --steps=10000 \
   --output_dir=models/checkpoints/pi0_fast_so101
 ```
-*(注：上式中 `--policy.device=cuda` 无空格，书写时请确保紧贴 `--policy.device=cuda`。)*
+*(注：上式中 `--policy.device=cuda` 请确保紧贴无空格。)*
 
 ```bash
 # 标准紧凑写法：

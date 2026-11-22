@@ -13,10 +13,15 @@
 from __future__ import annotations
 
 import logging
+import os
+import platform
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+if platform.system() == "Windows" and "OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS" not in os.environ:
+    os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
 
 try:
     import cv2
@@ -66,20 +71,37 @@ class TeleopCameraManager:
 
     @classmethod
     def auto_detect_camera_index(cls) -> int:
-        """自动探测最优先的机械臂摄像头 (优先 /dev/video2, 其次 /dev/video0)."""
+        """自动探测最优先的机械臂摄像头 (跨 Windows DirectShow 与 Linux /dev/video*)."""
+        if cv2 is None:
+            return 0
+        is_win = platform.system() == "Windows"
         for candidate in (2, 0, 1, 3):
-            dev_p = f"/dev/video{candidate}"
-            if Path(dev_p).exists():
+            if not is_win:
+                dev_p = f"/dev/video{candidate}"
+                if not Path(dev_p).exists():
+                    continue
                 cap = cv2.VideoCapture(candidate)
+            else:
+                cap = (
+                    cv2.VideoCapture(candidate, cv2.CAP_DSHOW)
+                    if hasattr(cv2, "CAP_DSHOW")
+                    else cv2.VideoCapture(candidate)
+                )
+            try:
                 if cap.isOpened():
                     ret, _ = cap.read()
-                    cap.release()
                     if ret:
                         return candidate
+            finally:
+                cap.release()
         return 0
 
     def start(self) -> bool:
         """启动相机捕获与后台读取线程."""
+        if cv2 is None:
+            print("[!] 未安装 OpenCV (cv2)，无法启动摄像头。")
+            return False
+
         if self.requested_device == "auto":
             dev_idx = self.auto_detect_camera_index()
         else:
@@ -90,10 +112,18 @@ class TeleopCameraManager:
                 dev_str = str(self.requested_device)
                 dev_idx = int(dev_str.replace("/dev/video", "")) if "video" in dev_str else 0
 
-        self._device_path = f"/dev/video{dev_idx}"
+        is_win = platform.system() == "Windows"
+        self._device_path = f"camera:{dev_idx}" if is_win else f"/dev/video{dev_idx}"
         print(f"[*] 正在初始化摄像头: {self._device_path} (目标分辨率: {self.target_width}x{self.target_height})...")
 
-        cap = cv2.VideoCapture(dev_idx)
+        if is_win and hasattr(cv2, "CAP_DSHOW"):
+            cap = cv2.VideoCapture(dev_idx, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(dev_idx)
+        else:
+            cap = cv2.VideoCapture(dev_idx)
+
         if not cap.isOpened():
             print(f"[!] 无法打开摄像头: {self._device_path}")
             return False
@@ -101,6 +131,12 @@ class TeleopCameraManager:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
         cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+        if is_win:
+            try:
+                fourcc = cv2.VideoWriter.fourcc(*"MJPG") if hasattr(cv2.VideoWriter, "fourcc") else cv2.VideoWriter_fourcc(*"MJPG")
+                cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+            except Exception:
+                pass
 
         self._cap = cap
         self._running = True
@@ -136,12 +172,16 @@ class TeleopCameraManager:
 
             time.sleep(0.005)
 
-    def get_latest_frame(self) -> tuple[np.ndarray | None, float]:
-        """获取当前最新的一帧图像及单调时间戳."""
+    def get_latest_frame(self, max_age_ms: int | None = 500) -> tuple[np.ndarray | None, float]:
+        """获取当前最新的一帧图像及单调时间戳 (支持 max_age_ms 新鲜度检验)."""
         with self._lock:
             if self._latest_frame is None:
                 return None, 0.0
-            return self._latest_frame.copy(), self._latest_timestamp
+            frame = self._latest_frame.copy()
+            ts = self._latest_timestamp
+        if max_age_ms is not None and ts > 0.0 and (time.monotonic() - ts) * 1000.0 > max_age_ms:
+            return None, 0.0
+        return frame, ts
 
     def start_recording(self, task_dir: Path) -> None:
         """开启多模态数据录制 (创建图片目录与 MP4 视频写入器)."""

@@ -25,8 +25,10 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import logging
+import platform
 import sys
 import time
 from pathlib import Path
@@ -36,29 +38,36 @@ _software_root = Path(__file__).resolve().parent
 _lerobot_root = _software_root.parent
 if str(_software_root) not in sys.path:
     sys.path.insert(0, str(_software_root))
-if str(_lerobot_root / "src") not in sys.path:
-    sys.path.insert(0, str(_lerobot_root / "src"))
+for _cand_src in (_lerobot_root / "src", _lerobot_root / "repos" / "lerobot" / "src"):
+    if _cand_src.is_dir() and str(_cand_src) not in sys.path:
+        sys.path.insert(0, str(_cand_src))
 
 from core.config_loader import get_config
-from core.data_types import SO101_JOINT_NAMES
+from core.data_types import SO101_GRIPPER_JOINT_NAME, SO101_JOINT_NAMES
+from hardware.config import resolve_calibration_dir
 
 logger = logging.getLogger("save_pose")
 
 
 def detect_serial_ports() -> list[str]:
-    """扫描系统中可用的物理串口设备."""
-    import glob
-    ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
-    return ports
+    """跨平台扫描系统中可用的物理串口设备 (Windows COM* / Linux /dev/tty*)."""
+    ports: set[str] = set()
+    try:
+        from serial.tools import list_ports
+        for p in list_ports.comports():
+            dev = str(getattr(p, "device", "") or "").strip()
+            if dev:
+                ports.add(dev)
+    except ImportError:
+        pass
+    if platform.system() != "Windows":
+        ports.update(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+    return sorted(ports)
 
 
 def get_calibration_path(arm_type: str, robot_id: str) -> Path:
-    """获取对应的 LeRobot 标定文件路径."""
-    hf_cache = Path.home() / ".cache" / "huggingface" / "lerobot" / "calibration"
-    if arm_type == "follower":
-        return hf_cache / "robots" / "so_follower" / f"{robot_id}.json"
-    else:
-        return hf_cache / "teleoperators" / "so_leader" / f"{robot_id}.json"
+    """获取对应的官方 LeRobot 标定文件路径 (支持 HF_LEROBOT_CALIBRATION / .env)."""
+    return resolve_calibration_dir(arm_type) / f"{robot_id}.json"
 
 
 def auto_expand_calibration_if_needed(cal_path: Path, raw_positions: dict[str, int]) -> bool:
@@ -106,22 +115,33 @@ def capture_pose(
     use_degrees: bool = True,
 ) -> tuple[dict[str, float], dict[str, int]]:
     """以零力矩只读模式读取机械臂当前关节物理角度与底层 raw 计数值."""
+    cal_path = get_calibration_path(arm_type, robot_id)
     try:
-        from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+        if arm_type == "leader":
+            from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
+            cfg = SO101LeaderConfig(
+                port=port,
+                id=robot_id,
+                calibration_dir=cal_path.parent,
+                use_degrees=use_degrees,
+            )
+            robot: Any = SO101Leader(cfg)
+        else:
+            from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+            cfg = SO101FollowerConfig(
+                port=port,
+                id=robot_id,
+                calibration_dir=cal_path.parent,
+                disable_torque_on_disconnect=True,
+                use_degrees=use_degrees,
+            )
+            robot = SO101Follower(cfg)
     except ImportError as exc:
         raise RuntimeError(
             f"缺少 LeRobot 驱动库依赖: {exc}。\n请确保在正确的 Python 环境下执行。"
         ) from exc
 
-    cfg = SO101FollowerConfig(
-        port=port,
-        id=robot_id,
-        disable_torque_on_disconnect=True,
-        use_degrees=use_degrees,
-    )
-    robot = SO101Follower(cfg)
-
-    print(f"[*] 正在建立只读通信连接 (端口: {port}, ID: {robot_id})...")
+    print(f"[*] 正在建立只读通信连接 (类型: {arm_type}, 端口: {port}, ID: {robot_id})...")
     robot.bus.connect()
 
     try:
@@ -139,13 +159,14 @@ def capture_pose(
             except (ValueError, TypeError):
                 pass
 
-        # 检查并自动拓展校准文件的极限范围
-        cal_path = get_calibration_path(arm_type, robot_id)
+        # 检查并自动拓展校准文件的极限范围，并同步刷新内存标定与舵机 EEPROM
         if auto_expand_calibration_if_needed(cal_path, raw_positions):
-            # 重新实例化以使更新后的标定范围生效
-            pass
+            if hasattr(robot, "_load_calibration"):
+                robot._load_calibration(cal_path)
+            if hasattr(robot, "bus") and hasattr(robot.bus, "write_calibration"):
+                robot.bus.write_calibration(robot.calibration, cache=True)
 
-        obs = robot.get_observation()
+        obs = robot.get_action() if hasattr(robot, "get_action") else robot.get_observation()
         joint_positions: dict[str, float] = {}
 
         for key, val in obs.items():
@@ -252,20 +273,26 @@ def main() -> int:
         except Exception as exc:
             print(f"\n[!] 姿态抓取失败: {exc}")
             print("    -> 排查建议:")
-            print(f"       1. 检查 USB 数据线连接: ls -la {port}")
-            print(f"       2. 检查串口读写权限: sudo chmod 666 {port}")
+            if platform.system() == "Windows":
+                print(f"       1. 在设备管理器确认串口号 ({port}) 未被其他程序占用")
+                print("       2. 检查 USB 数据线连接与 CH340/USB-TTL 驱动")
+            else:
+                print(f"       1. 检查 USB 数据线连接: ls -la {port}")
+                print(f"       2. 检查串口读写权限: sudo chmod 666 {port}")
             print("       3. 确认 12V 稳压电源开关是否打开\n")
             return 1
 
     print("[✓] 成功读取当前物理姿态角度与原始计数值:")
     for j_name in SO101_JOINT_NAMES:
-        deg_val = positions.get(j_name, 0.0)
+        val = positions.get(j_name, 0.0)
         raw_val = raw_positions.get(j_name, "N/A")
-        print(f"    • {j_name:<16}: {deg_val:>8.2f}°  (raw: {raw_val})")
+        unit_sym = "%" if j_name == SO101_GRIPPER_JOINT_NAME else "°"
+        print(f"    • {j_name:<16}: {val:>8.2f}{unit_sym}  (raw: {raw_val})")
 
-    # 构造与系统兼容的 JSON 内容
+    # 构造与系统兼容的 JSON 内容 (明确区分臂关节 degree 与夹爪 range_0_100)
     output_data = {
         "unit": "degree",
+        "gripper_unit": "range_0_100",
         "joints": {
             f"{j_name}.pos": positions.get(j_name, 0.0)
             for j_name in SO101_JOINT_NAMES

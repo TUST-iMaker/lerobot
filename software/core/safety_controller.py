@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from core.data_types import (
+    SO101_ARM_JOINT_NAMES,
+    SO101_GRIPPER_JOINT_NAME,
     SO101_JOINT_NAMES,
     ActionType,
     ControlSource,
@@ -25,6 +27,7 @@ from core.data_types import (
     RobotAction,
     SafetyReport,
     SystemState,
+    convert_joint_positions,
     deg_to_rad,
     rad_to_deg,
 )
@@ -32,15 +35,15 @@ from core.state_machine import RobotStateMachine
 
 logger = logging.getLogger(__name__)
 
-# 默认关节安全物理范围 (放宽到真实舵机物理有效范围，避免误拦截)
+# 默认臂关节软限位 (严格对齐 repos/SO-ARM100/Simulation/SO101/so101_new_calib.urdf)
 DEFAULT_JOINT_LIMITS_RAD: dict[str, tuple[float, float]] = {
-    "shoulder_pan": (-3.14, 3.14),
-    "shoulder_lift": (-2.8, 2.8),
-    "elbow_flex": (-2.8, 2.8),
-    "wrist_flex": (-2.8, 2.8),
-    "wrist_roll": (-3.14, 3.14),
-    "gripper": (-1.5, 1.5),
+    "shoulder_pan": (-1.91986, 1.91986),
+    "shoulder_lift": (-1.74533, 1.74533),
+    "elbow_flex": (-1.69, 1.69),
+    "wrist_flex": (-1.65806, 1.65806),
+    "wrist_roll": (-2.74385, 2.84121),
 }
+DEFAULT_GRIPPER_LIMITS_PCT: tuple[float, float] = (0.0, 100.0)
 
 
 def get_default_max_joint_delta_rad() -> float:
@@ -62,14 +65,20 @@ def get_default_max_joint_delta_rad() -> float:
 @dataclass
 class SafetyLimitsConfig:
     """安全限制阈值配置."""
-    # 各关节软限位 (min_rad, max_rad)
+    # 各臂关节软限位 (min_rad, max_rad)
     joint_limits_rad: dict[str, tuple[float, float]] = field(
         default_factory=lambda: dict(DEFAULT_JOINT_LIMITS_RAD)
     )
+    # 夹爪安全百分比软限位 (官方 RANGE_0_100: [0.0, 100.0])
+    gripper_limits_pct: tuple[float, float] = DEFAULT_GRIPPER_LIMITS_PCT
     # 控制周期内单步最大允许角增量 (弧度)，默认与 config.yaml 中的 max_step_deg 联动
     max_joint_delta_rad: float = field(default_factory=get_default_max_joint_delta_rad)
+    # 控制周期内夹爪单步最大允许增量 (百分比 %/step)
+    max_gripper_delta_pct: float = 15.0
     # 跟随误差报警阈值 (当前目标与实际位置相差超过此值视为异常卡死)
     max_tracking_error_rad: float = 0.40
+    # 夹爪跟随误差报警阈值 (百分比 %)
+    max_tracking_error_gripper_pct: float = 25.0
     # 连续允许超差的最大帧数
     max_consecutive_tracking_errors: int = 5
     # 超出限位时的处理策略: "clamp" (自动截断到边界) 或 "reject" (拒绝本帧动作)
@@ -138,12 +147,14 @@ class SafetyController:
             if not action.target_joint_positions:
                 return False, None, "缺少目标关节位置"
 
-            # 目标转为弧度
+            # 臂关节转为弧度，夹爪保持 RANGE_0_100 [0.0, 100.0]
             raw_targets = action.target_joint_positions
-            if action.unit == JointUnit.DEGREE:
-                targets_rad = {k: deg_to_rad(v) for k, v in raw_targets.items()}
-            else:
-                targets_rad = dict(raw_targets)
+            targets_rad = convert_joint_positions(
+                raw_targets,
+                action.unit,
+                JointUnit.RADIAN,
+                gripper_unit=action.gripper_unit,
+            )
 
             safe_targets_rad: dict[str, float] = {}
 
@@ -151,25 +162,40 @@ class SafetyController:
             for joint_name, target_val in targets_rad.items():
                 cur_val = current_state_rad.positions.get(joint_name, target_val)
 
-                # A. 软限位检查
-                if joint_name in self.config.joint_limits_rad:
-                    min_lim, max_lim = self.config.joint_limits_rad[joint_name]
+                if joint_name == SO101_GRIPPER_JOINT_NAME:
+                    min_lim, max_lim = self.config.gripper_limits_pct
                     if target_val < min_lim or target_val > max_lim:
                         if self.config.limit_action_mode == "reject":
                             return (
                                 False,
                                 None,
-                                f"关节 {joint_name} 目标 {target_val:.3f} rad 超出软限位 [{min_lim:.3f}, {max_lim:.3f}]",
+                                f"夹爪目标 {target_val:.1f}% 超出软限位 [{min_lim:.1f}%, {max_lim:.1f}%]",
                             )
-                        # clamp 模式：截断到边界
                         target_val = max(min_lim, min(max_lim, target_val))
 
-                # B. 单步最大角增量限幅 (防止猛甩冲击)
-                delta = target_val - cur_val
-                max_delta = self.config.max_joint_delta_rad
-                if abs(delta) > max_delta:
-                    # 限幅步进
-                    target_val = cur_val + math.copysign(max_delta, delta)
+                    delta = target_val - cur_val
+                    max_delta = self.config.max_gripper_delta_pct
+                    if abs(delta) > max_delta:
+                        target_val = cur_val + math.copysign(max_delta, delta)
+                else:
+                    # A. 臂关节软限位检查
+                    if joint_name in self.config.joint_limits_rad:
+                        min_lim, max_lim = self.config.joint_limits_rad[joint_name]
+                        if target_val < min_lim or target_val > max_lim:
+                            if self.config.limit_action_mode == "reject":
+                                return (
+                                    False,
+                                    None,
+                                    f"关节 {joint_name} 目标 {target_val:.3f} rad 超出软限位 [{min_lim:.3f}, {max_lim:.3f}]",
+                                )
+                            # clamp 模式：截断到边界
+                            target_val = max(min_lim, min(max_lim, target_val))
+
+                    # B. 单步最大角增量限幅 (防止猛甩冲击)
+                    delta = target_val - cur_val
+                    max_delta = self.config.max_joint_delta_rad
+                    if abs(delta) > max_delta:
+                        target_val = cur_val + math.copysign(max_delta, delta)
 
                 safe_targets_rad[joint_name] = target_val
 
@@ -182,6 +208,7 @@ class SafetyController:
                 timestamp=action.timestamp,
                 target_joint_positions=safe_targets_rad,
                 unit=JointUnit.RADIAN,
+                gripper_unit=JointUnit.RANGE_0_100,
             )
             return True, safe_action, "安全检查通过 (已应用限位与增量平滑限制)"
 
@@ -191,28 +218,40 @@ class SafetyController:
                 return False, None, "缺少目标关节增量"
 
             raw_deltas = action.target_joint_deltas
-            if action.unit == JointUnit.DEGREE:
-                deltas_rad = {k: deg_to_rad(v) for k, v in raw_deltas.items()}
-            else:
-                deltas_rad = dict(raw_deltas)
+            deltas_rad = convert_joint_positions(
+                raw_deltas,
+                action.unit,
+                JointUnit.RADIAN,
+                gripper_unit=action.gripper_unit,
+            )
 
             safe_deltas_rad: dict[str, float] = {}
             for joint_name, delta_val in deltas_rad.items():
                 cur_val = current_state_rad.positions.get(joint_name, 0.0)
-                max_delta = self.config.max_joint_delta_rad
-
-                # 速度限幅
-                if abs(delta_val) > max_delta:
-                    delta_val = math.copysign(max_delta, delta_val)
-
-                # 叠加后做限位保护
-                expected_target = cur_val + delta_val
-                if joint_name in self.config.joint_limits_rad:
-                    min_lim, max_lim = self.config.joint_limits_rad[joint_name]
+                if joint_name == SO101_GRIPPER_JOINT_NAME:
+                    max_delta = self.config.max_gripper_delta_pct
+                    if abs(delta_val) > max_delta:
+                        delta_val = math.copysign(max_delta, delta_val)
+                    expected_target = cur_val + delta_val
+                    min_lim, max_lim = self.config.gripper_limits_pct
                     if expected_target < min_lim:
                         delta_val = max(0.0, min_lim - cur_val)
                     elif expected_target > max_lim:
                         delta_val = min(0.0, max_lim - cur_val)
+                else:
+                    max_delta = self.config.max_joint_delta_rad
+                    # 速度限幅
+                    if abs(delta_val) > max_delta:
+                        delta_val = math.copysign(max_delta, delta_val)
+
+                    # 叠加后做限位保护
+                    expected_target = cur_val + delta_val
+                    if joint_name in self.config.joint_limits_rad:
+                        min_lim, max_lim = self.config.joint_limits_rad[joint_name]
+                        if expected_target < min_lim:
+                            delta_val = max(0.0, min_lim - cur_val)
+                        elif expected_target > max_lim:
+                            delta_val = min(0.0, max_lim - cur_val)
 
                 safe_deltas_rad[joint_name] = delta_val
 
@@ -224,6 +263,7 @@ class SafetyController:
                 timestamp=action.timestamp,
                 target_joint_deltas=safe_deltas_rad,
                 unit=JointUnit.RADIAN,
+                gripper_unit=JointUnit.RANGE_0_100,
             )
             return True, safe_action, "增量安全检查通过"
 
@@ -244,10 +284,12 @@ class SafetyController:
 
         current_rad = current_state.to_radians() if current_state.unit != JointUnit.RADIAN else current_state
         targets = commanded_action.target_joint_positions
-        if commanded_action.unit == JointUnit.DEGREE:
-            targets_rad = {k: deg_to_rad(v) for k, v in targets.items()}
-        else:
-            targets_rad = targets
+        targets_rad = convert_joint_positions(
+            targets,
+            commanded_action.unit,
+            JointUnit.RADIAN,
+            gripper_unit=commanded_action.gripper_unit,
+        )
 
         exceeded_joints: list[str] = []
         for joint, target_val in targets_rad.items():
@@ -255,8 +297,16 @@ class SafetyController:
                 continue
             cur_val = current_rad.positions[joint]
             error = abs(target_val - cur_val)
-            if error > self.config.max_tracking_error_rad:
-                exceeded_joints.append(f"{joint}(误差={error:.2f}rad > 阈值{self.config.max_tracking_error_rad:.2f}rad)")
+            if joint == SO101_GRIPPER_JOINT_NAME:
+                if error > self.config.max_tracking_error_gripper_pct:
+                    exceeded_joints.append(
+                        f"{joint}(误差={error:.1f}% > 阈值{self.config.max_tracking_error_gripper_pct:.1f}%)"
+                    )
+            else:
+                if error > self.config.max_tracking_error_rad:
+                    exceeded_joints.append(
+                        f"{joint}(误差={error:.2f}rad > 阈值{self.config.max_tracking_error_rad:.2f}rad)"
+                    )
 
         if exceeded_joints:
             self._consecutive_tracking_errors += 1
