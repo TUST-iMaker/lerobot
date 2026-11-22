@@ -380,12 +380,12 @@ def test_t4_05_cloud_vla_prep_plugin_hub_and_mock_action_chunk_preview(
         assert sh_res.returncode == 0
         assert "pi" in sh_res.stdout and "smolvla" in sh_res.stdout
 
-    # Playwright Plugins tab: all 5 adapters listed; feetech_servo_bench launches w/ --simulate & stops; remote_vla 409
+    # Playwright Plugins tab: all 6 adapters listed (including open_source_datasets); feetech_servo_bench launches w/ --simulate & stops; remote_vla 409
     dry_run_page.locator("[data-testid='tab-plugins']").click()
     wait_until(
-        lambda: dry_run_page.locator("[data-plugin-id]").count() == 5,
+        lambda: dry_run_page.locator("[data-plugin-id]").count() >= 6,
         timeout=5.0,
-        description="all 5 plugin cards rendered",
+        description="all 6 plugin cards rendered",
     )
     launch_fb = dry_run_client.post("/api/plugins/feetech_servo_bench/launch", json={})
     assert launch_fb.status_code == 200

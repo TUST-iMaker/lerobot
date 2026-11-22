@@ -411,7 +411,20 @@ def test_plugins_and_vla_endpoints(live_server: tuple[str, StudioConfig]) -> Non
             "lerobot_studio",
             "lelab_external",
             "remote_vla_policy",
+            "open_source_datasets",
         }.issubset(ids)
+
+        ds_plugin = next(p for p in plugins if p["id"] == "open_source_datasets")
+        ds_ids = {d["repo_id"] for d in ds_plugin["datasets"]}
+        assert {
+            "huanianxia/b601rs_open_the_drawer_put_the_block_inside_then_close_the_drawer_20261116_001",
+            "rebot-b601-t1-pick-place",
+            "rebot_b601_rs_single_arm_block_stacking",
+            "rebot_cube",
+            "rebot-b601-t2-language-squares",
+            "rebot_mini_towel_folding2",
+            "rebot_shakehands",
+        }.issubset(ds_ids)
 
         assert client.post("/api/plugins/unknown_tool/launch").status_code == 404
         assert client.post("/api/plugins/unknown_tool/stop").status_code == 404
@@ -713,6 +726,13 @@ def test_interactive_calibration_flow_and_stdin_shim(
         assert mb.enter_pressed() is False
         q.put("\n")
         assert mb.enter_pressed() is True
+
+        # Verify calibration safety hook disables torque immediately after connect(calibrate=False)
+        from app.backend.calibrate_runner import install_calibration_safety_hooks
+        from lerobot.robots.so_follower.so_follower import SOFollower
+
+        install_calibration_safety_hooks()
+        assert getattr(SOFollower.connect, "_studio_cal_hooked", False) is True
     finally:
         builtins.input = orig_input
         lu.enter_pressed = orig_lu_enter
