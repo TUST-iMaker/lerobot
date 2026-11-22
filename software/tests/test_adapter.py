@@ -124,6 +124,18 @@ class TestHardwareAdapters(unittest.TestCase):
         leader = SO101LeaderArm(cfg)
         self.assertEqual(leader.config.joint_offsets_deg.get("wrist_roll"), 90.0)
 
+    def test_calibration_dir_no_hardcoded_aguiya_and_forwards_robot_id(self) -> None:
+        self.assertNotIn("aguiya", str(DEFAULT_FOLLOWER_CALIBRATION))
+        cfg = ArmConfig.default_follower(
+            port="COM99",
+            robot_id="custom_arm_01",
+            calibration_dir=Path("data/calibration"),
+        )
+        self.assertEqual(cfg.robot_id, "custom_arm_01")
+        self.assertEqual(cfg.calibration_dir.name, "so_follower")
+        self.assertEqual(cfg.calibration_fpath.name, "custom_arm_01.json")
+        self.assertEqual(cfg.max_relative_target, 15.0)
+
 
 if __name__ == "__main__":
     unittest.main()

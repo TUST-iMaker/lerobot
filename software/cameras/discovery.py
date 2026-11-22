@@ -23,6 +23,8 @@ from cameras.config import CameraDeviceInfo
 
 logger = logging.getLogger(__name__)
 
+MAX_OPENCV_INDEX = 60
+
 # Linux V4L2 ioctl 常量
 VIDIOC_QUERYCAP = 0x80685600
 VIDIOC_ENUM_FMT = 0xc0405602
@@ -33,33 +35,76 @@ V4L2_CAP_DEVICE_CAPS = 0x80000000
 V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
 
 
+def _decode_fourcc(raw_val: float) -> list[str]:
+    try:
+        code = int(round(raw_val))
+        if code <= 0:
+            return []
+        chars = "".join(chr((code >> (8 * i)) & 0xFF) for i in range(4)).strip("\x00 ")
+        return [chars] if len(chars) == 4 and chars.isprintable() else []
+    except Exception:
+        return []
+
+
 def discover_cameras() -> list[CameraDeviceInfo]:
-    """探测系统上所有物理 USB 相机设备节点 (Linux V4L2 / Windows DirectShow).
-    
+    """探测系统上所有物理 USB 相机设备节点 (Linux V4L2 / Windows DirectShow & OpenCVCamera).
+
     Returns:
         包含硬件名称、驱动属性、支持格式列表的 CameraDeviceInfo 列表 (按 index 排序).
     """
     discovered: list[CameraDeviceInfo] = []
 
     if fcntl is None or platform.system() == "Windows":
+        if platform.system() == "Windows" and "OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS" not in os.environ:
+            os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
+
+        try:
+            from lerobot.cameras.opencv import OpenCVCamera as UpstreamOpenCVCamera
+            upstream_cams = UpstreamOpenCVCamera.find_cameras()
+            for item in upstream_cams:
+                cam_id = item.get("id", 0)
+                idx = int(cam_id) if isinstance(cam_id, int) or str(cam_id).isdigit() else len(discovered)
+                profile = item.get("default_stream_profile") or {}
+                fourcc = str(profile.get("fourcc") or "").strip()
+                backend_api = str(item.get("backend_api") or "opencv")
+                discovered.append(
+                    CameraDeviceInfo(
+                        index=idx,
+                        device_path=str(cam_id),
+                        card_name=str(item.get("name") or f"Camera {cam_id}"),
+                        driver_name=backend_api.lower(),
+                        bus_info=f"{backend_api.lower()}:{cam_id}",
+                        is_capture=True,
+                        is_metadata=False,
+                        supported_formats=[fourcc] if fourcc else [],
+                    )
+                )
+            return discovered
+        except Exception:
+            pass
+
         try:
             import cv2
         except ImportError:
             return discovered
-        for idx in range(4):
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+
+        api_pref = cv2.CAP_DSHOW if (platform.system() == "Windows" and hasattr(cv2, "CAP_DSHOW")) else cv2.CAP_ANY
+        for idx in range(MAX_OPENCV_INDEX):
+            cap = cv2.VideoCapture(idx, api_pref)
             try:
                 if cap.isOpened():
+                    backend_name = str(cap.getBackendName() if hasattr(cap, "getBackendName") else "opencv")
+                    formats = _decode_fourcc(cap.get(cv2.CAP_PROP_FOURCC))
                     discovered.append(
                         CameraDeviceInfo(
                             index=idx,
                             device_path=str(idx),
-                            card_name=f"Camera {idx} (DirectShow)",
-                            driver_name="dshow",
-                            bus_info=f"dshow:{idx}",
+                            card_name=f"OpenCV Camera {idx}",
+                            driver_name=backend_name.lower(),
+                            bus_info=f"{backend_name.lower()}:{idx}",
                             is_capture=True,
                             is_metadata=False,
-                            supported_formats=["MJPG"],
+                            supported_formats=formats,
                         )
                     )
             finally:

@@ -17,7 +17,7 @@ class TestSO101Kinematics(unittest.TestCase):
         self.L4 = self.kin.config.gripper_offset_m
 
     def test_neutral_fk(self) -> None:
-        # 当所有关节为0时处于物理中位：大臂直立向上、小臂与手腕水平向前
+        # 对齐官方 so101_new_calib.urdf: 零位 gripper_frame_link TCP 应为 (0.39136, -0.00001, 0.22647) m
         joints = {
             "shoulder_pan": 0.0,
             "shoulder_lift": 0.0,
@@ -27,12 +27,15 @@ class TestSO101Kinematics(unittest.TestCase):
             "gripper": 0.0,
         }
         (x, y, z), pitch, roll = self.kin.forward_kinematics(joints)
-        expected_x = self.L3 + self.L4
-        expected_z = self.L1 + self.L2
-        self.assertAlmostEqual(x, expected_x, places=4)
-        self.assertAlmostEqual(y, 0.0, places=4)
-        self.assertAlmostEqual(z, expected_z, places=4)
+        self.assertAlmostEqual(x, 0.39136, places=4)
+        self.assertAlmostEqual(y, -0.00001, places=4)
+        self.assertAlmostEqual(z, 0.22647, places=4)
         self.assertAlmostEqual(pitch, 0.0, places=4)
+
+        # 验证 shoulder_pan 世界轴为 [0, 0, -1]: +0.5 rad 向 -Y 旋转
+        (x2, y2, _), _, _ = self.kin.forward_kinematics({"shoulder_pan": 0.5})
+        self.assertGreater(x2, 0.30)
+        self.assertLess(y2, -0.15)
 
     def test_fk_ik_roundtrip(self) -> None:
         # 挑选典型工作姿态

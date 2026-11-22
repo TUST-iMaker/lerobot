@@ -17,12 +17,15 @@ from typing import Any
 
 from core.data_types import (
     MIDDLE_ORDER,
+    SO101_ARM_JOINT_NAMES,
+    SO101_GRIPPER_JOINT_NAME,
     SO101_JOINT_NAMES,
     ActionType,
     ControlSource,
     JointState,
     JointUnit,
     RobotAction,
+    clamp_gripper_pct,
     deg_to_rad,
     rad_to_deg,
 )
@@ -59,23 +62,43 @@ class SO101FollowerArm(BaseArmAdapter):
             raise RuntimeError(msg) from exc
 
         logger.info("[%s] 正在连接从臂 (端口: %s)...", self.config.robot_id, self.config.port)
+        cal_dir = self.config.calibration_dir or self.config.calibration_fpath.parent
         driver_cfg = SO101FollowerConfig(
             port=self.config.port,
             id=self.config.robot_id,
+            calibration_dir=cal_dir,
             disable_torque_on_disconnect=False,
             use_degrees=self.config.use_degrees,
+            max_relative_target=self.config.max_relative_target,
         )
         follower = SO101Follower(driver_cfg)
 
         try:
-            # 1. 物理连接总线与挂载相机
+            # 1. 物理连接总线、非阻塞校准一致性检查与挂载相机
             follower.bus.connect()
+            try:
+                hw_cal = bool(follower.is_calibrated)
+            except Exception as cal_exc:
+                hw_cal = False
+                logger.warning("[%s] 检查硬件校准状态异常: %s", self.config.robot_id, cal_exc)
+            self._hw_calibrated = hw_cal
+            if not hw_cal:
+                logger.warning(
+                    "[%s] 舵机 EEPROM 与校准文件 %s 不一致或未校准，请运行校准流程!",
+                    self.config.robot_id,
+                    getattr(follower, "calibration_fpath", self.config.calibration_fpath),
+                )
+
             for cam in follower.cameras.values():
                 cam.connect()
 
             # 2. 绝对防跳变时序:
-            # 第一阶段: 在零力矩状态下完成所有电机基础参数与工作模式配置
+            # 预同步: 避免 configure() 内部 with torque_disabled(): 退出自动恢复扭矩时向旧 Goal_Position 跳变
             follower.bus.disable_torque()
+            present_pre = follower.bus.sync_read("Present_Position", normalize=False)
+            follower.bus.sync_write("Goal_Position", present_pre, normalize=False)
+
+            # 第一阶段: 在零力矩状态下完成所有电机基础参数与工作模式配置
             follower.configure()
             # 确保处于禁用扭矩状态
             follower.bus.disable_torque()
@@ -261,6 +284,7 @@ class SO101FollowerArm(BaseArmAdapter):
                 positions=converted_pos,
                 unit=final_unit,
                 torques_enabled=torques if torques else None,
+                gripper_unit=JointUnit.RANGE_0_100,
             )
 
             is_valid, err = state.validate(require_all_joints=False)
@@ -285,11 +309,8 @@ class SO101FollowerArm(BaseArmAdapter):
                 return False
             targets = action.target_joint_positions
 
-            # 转换为驱动单位
-            if action.unit == JointUnit.RADIAN and self.config.use_degrees:
-                targets_driver = {k: rad_to_deg(v) for k, v in targets.items()}
-            else:
-                targets_driver = dict(targets)
+            # 转换为驱动单位 (arm 转 degree, gripper 保持 RANGE_0_100 [0, 100])
+            targets_driver = self._convert_internal_to_driver_unit(targets, action.unit)
 
         elif action.action_type == ActionType.JOINT_DELTA:
             if not action.target_joint_deltas:
@@ -299,11 +320,21 @@ class SO101FollowerArm(BaseArmAdapter):
             for j, delta in action.target_joint_deltas.items():
                 if j not in cur_state.positions:
                     continue
-                cur_val = cur_state.positions[j]
-                if action.unit == JointUnit.RADIAN and self.config.use_degrees:
-                    targets_driver[j] = cur_val + rad_to_deg(delta)
+                cur_val = float(cur_state.positions[j])
+                if j == SO101_GRIPPER_JOINT_NAME:
+                    targets_driver[j] = clamp_gripper_pct(cur_val + float(delta))
                 else:
-                    targets_driver[j] = cur_val + delta
+                    cur_driver = (
+                        rad_to_deg(cur_val)
+                        if (cur_state.unit == JointUnit.RADIAN and self.config.use_degrees)
+                        else cur_val
+                    )
+                    delta_driver = (
+                        rad_to_deg(float(delta))
+                        if (action.unit == JointUnit.RADIAN and self.config.use_degrees)
+                        else float(delta)
+                    )
+                    targets_driver[j] = cur_driver + delta_driver
         else:
             logger.error("[%s] 暂不支持直接下发 %s 动作，需先经运动学解算", self.config.robot_id, action.action_type)
             return False
@@ -338,28 +369,38 @@ class SO101FollowerArm(BaseArmAdapter):
         step_deg: float = 3.0,
         tolerance_deg: float = 1.0,
         timeout_s: float = 60.0,
+        gripper_target: float | None = None,
     ) -> bool:
-        """按安全次序平稳移动回物理校准零位 (中位 0°: 大臂垂直、小臂水平、手腕水平向前)."""
+        """按安全次序平稳移动回物理校准零位 (5 臂关节归 0.0°; gripper 默认保持当前开合度，不强行闭合)."""
         if not self.is_connected or self._follower is None:
             raise RuntimeError(f"[{self.config.robot_id}] 机械臂未连接")
 
         logger.info("[%s] 开始安全回标准中位 (0.0°)...", self.config.robot_id)
         deadline = time.monotonic() + timeout_s
-        motors = [m for m in MIDDLE_ORDER if m in SO101_JOINT_NAMES]
+        arm_motors = [m for m in MIDDLE_ORDER if m in SO101_ARM_JOINT_NAMES]
 
         while True:
             cur_state = self.read_state()
             action_deg: dict[str, float] = {}
-            for m in motors:
-                cur_deg = rad_to_deg(cur_state.positions.get(m, 0.0))
+            for m in arm_motors:
+                cur_val = float(cur_state.positions.get(m, 0.0))
+                cur_deg = rad_to_deg(cur_val) if cur_state.unit == JointUnit.RADIAN else cur_val
                 err = 0.0 - cur_deg
                 if abs(err) <= tolerance_deg:
                     continue
                 step = max(-step_deg, min(step_deg, err))
                 action_deg[m] = cur_deg + step
 
-            if not action_deg:
-                logger.info("[%s] 从臂全部关节已安全归位至标准中位 (0.0°)", self.config.robot_id)
+            gripper_next: float | None = None
+            if gripper_target is not None and SO101_GRIPPER_JOINT_NAME in cur_state.positions:
+                cur_g = float(cur_state.positions[SO101_GRIPPER_JOINT_NAME])
+                g_err = clamp_gripper_pct(gripper_target) - cur_g
+                if abs(g_err) > tolerance_deg:
+                    g_step = max(-step_deg, min(step_deg, g_err))
+                    gripper_next = clamp_gripper_pct(cur_g + g_step)
+
+            if not action_deg and gripper_next is None:
+                logger.info("[%s] 从臂全部臂关节已安全归位至标准中位 (0.0°)", self.config.robot_id)
                 return True
 
             if time.monotonic() > deadline:
@@ -367,19 +408,32 @@ class SO101FollowerArm(BaseArmAdapter):
                 self.stop_motion()
                 return False
 
-            targets_rad = {k: deg_to_rad(v) for k, v in action_deg.items()}
-            # 补齐未调节的关节保持原位
-            for j in SO101_JOINT_NAMES:
-                if j not in targets_rad and j in cur_state.positions:
-                    targets_rad[j] = cur_state.positions[j]
+            targets: dict[str, float] = {}
+            for j in SO101_ARM_JOINT_NAMES:
+                if j in action_deg:
+                    targets[j] = (
+                        deg_to_rad(action_deg[j])
+                        if cur_state.unit == JointUnit.RADIAN
+                        else action_deg[j]
+                    )
+                elif j in cur_state.positions:
+                    targets[j] = float(cur_state.positions[j])
+
+            if SO101_GRIPPER_JOINT_NAME in cur_state.positions:
+                targets[SO101_GRIPPER_JOINT_NAME] = (
+                    gripper_next
+                    if gripper_next is not None
+                    else float(cur_state.positions[SO101_GRIPPER_JOINT_NAME])
+                )
 
             self.send_action(
                 RobotAction(
                     action_type=ActionType.JOINT_POSITION,
                     source=ControlSource.UI,
                     timestamp=time.monotonic(),
-                    target_joint_positions=targets_rad,
-                    unit=JointUnit.RADIAN,
+                    target_joint_positions=targets,
+                    unit=cur_state.unit,
+                    gripper_unit=JointUnit.RANGE_0_100,
                 )
             )
             time.sleep(0.04)

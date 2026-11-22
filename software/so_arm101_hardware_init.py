@@ -45,27 +45,35 @@ _software_dir = _here if (_here / "core").is_dir() else _here.parent
 if str(_software_dir) not in sys.path:
     sys.path.insert(0, str(_software_dir))
 
+from core.config_loader import get_config
 from core.data_types import (
     MIDDLE_ORDER,
+    SO101_ARM_JOINT_NAMES,
+    SO101_GRIPPER_JOINT_NAME,
     SO101_JOINT_NAMES,
     JointState,
     JointUnit,
 )
+from hardware.config import ArmRole, resolve_calibration_dir
 
-FIXED_CALIBRATION_FILE = Path(
-    "/home/aguiya/.cache/huggingface/lerobot/calibration/robots/so_follower/zihao_follower_arm.json"
-)
+
+def get_default_calibration_file(follower_id: str | None = None) -> Path:
+    """动态解析当前工作区/环境对应的从臂校准 JSON 路径."""
+    fid = follower_id or get_config().follower.id
+    return resolve_calibration_dir(ArmRole.FOLLOWER) / f"{fid}.json"
 
 
 def ensure_repo_on_path() -> None:
-    """Make src/lerobot importable when running from a repository checkout."""
+    """Make src/lerobot (or repos/lerobot/src) importable when running from a repository checkout."""
     here = Path(__file__).resolve().parent
     for candidate in (here, *here.parents):
-        if (candidate / "pyproject.toml").is_file() and (candidate / "src" / "lerobot").is_dir():
-            src = str(candidate / "src")
-            if src not in sys.path:
-                sys.path.insert(0, src)
-            return
+        for rel in (("src", "lerobot"), ("repos", "lerobot", "src")):
+            pkg_dir = candidate.joinpath(*rel)
+            if pkg_dir.is_dir():
+                src = str(pkg_dir.parent)
+                if src not in sys.path:
+                    sys.path.insert(0, src)
+                return
 
 
 def module_available(name: str) -> bool:
@@ -211,14 +219,26 @@ def report_torque(
 def connect_follower_safely(follower: Any) -> None:
     """Connect the follower without ever enabling torque at a stale goal."""
     follower.bus.connect()
+    try:
+        if not bool(follower.is_calibrated):
+            log("WARN", f"舵机 EEPROM 与校准文件 {getattr(follower, 'calibration_fpath', '')} 不一致或未校准")
+    except Exception as exc:
+        log("WARN", f"校准状态核验异常: {exc}")
+
     for camera in follower.cameras.values():
         camera.connect()
 
-    # Keep torque disabled until Goal_Position matches Present_Position.
+    # Keep torque disabled until Goal_Position matches Present_Position before AND after configure().
     follower.bus.disable_torque()
+    present_pre = follower.bus.sync_read("Present_Position", normalize=False)
+    follower.bus.sync_write("Goal_Position", present_pre, normalize=False)
+    follower.configure()
+    follower.bus.disable_torque()
+    time.sleep(0.05)
     present = follower.bus.sync_read("Present_Position", normalize=False)
     follower.bus.sync_write("Goal_Position", present, normalize=False)
-    follower.configure()
+    time.sleep(0.02)
+    follower.bus.enable_torque()
     log("OK", "Follower 已在当前位置使能扭矩（不会跳向旧目标）")
 
 
@@ -259,16 +279,21 @@ def move_all_to_middle(
     args: argparse.Namespace,
     ranges: dict[str, tuple[int, int]],
 ) -> dict[str, Any]:
-    """Move every follower joint to the raw midpoint of the calibration file."""
+    """Move 5 arm follower joints to official half-turn 2047 (clamped to calibration range); leave gripper unchanged."""
     bus = follower.bus
-    motors = [motor for motor in MIDDLE_ORDER if motor in ranges]
+    motors = [
+        motor
+        for motor in MIDDLE_ORDER
+        if motor in ranges and motor != SO101_GRIPPER_JOINT_NAME and motor in SO101_ARM_JOINT_NAMES
+    ]
+    half_turn = (4096 - 1) // 2  # 2047, aligned with SerialMotorsBus.set_half_turn_homings()
     raw_targets = {
-        motor: int(round((ranges[motor][0] + ranges[motor][1]) / 2))
+        motor: max(ranges[motor][0], min(ranges[motor][1], half_turn))
         for motor in motors
     }
-    raw_step = max(1, int(round(args.middle_step * 4096 / 360)))
-    raw_tolerance = max(1, int(round(args.middle_tolerance * 4096 / 360)))
-    log("INFO", f"中位目标为各舵机 raw 中点；单步 {raw_step}，容差 {raw_tolerance}")
+    raw_step = max(1, int(round(args.middle_step * 4095 / 360)))
+    raw_tolerance = max(1, int(round(args.middle_tolerance * 4095 / 360)))
+    log("INFO", f"中位目标为官方半圈中心 {half_turn} (夹爪保持现状不强闭)；单步 {raw_step}，容差 {raw_tolerance}")
 
     if not args.yes:
         confirm("确认周围无人、运动范围内无障碍后，按 Enter 开始移动到中位 ...")
@@ -300,8 +325,7 @@ def move_all_to_middle(
                 f"中位回零在 {args.middle_timeout:.1f}s 内未完成，剩余 raw 误差: {summary}"
             )
 
-        for motor, goal in action.items():
-            bus.write("Goal_Position", motor, goal, normalize=False, num_retry=2)
+        bus.sync_write("Goal_Position", action, normalize=False, num_retry=2)
 
         now = time.monotonic()
         if now - last_log >= 0.5:
@@ -348,9 +372,11 @@ def connect_follower(
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
     section("Follower 初始化")
+    cal_dir = args.calibration_file.parent if args.calibration_file else resolve_calibration_dir(ArmRole.FOLLOWER)
     config = SO101FollowerConfig(
         port=args.follower_port,
         id=args.follower_id,
+        calibration_dir=cal_dir,
         disable_torque_on_disconnect=False,
         use_degrees=args.use_degrees,
     )
@@ -448,6 +474,7 @@ def connect_follower(
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser."""
+    cfg = get_config()
     parser = argparse.ArgumentParser(
         description=(
             "SO-ARM101 从臂初始化：连接、读取校准文件、使能并回中位"
@@ -460,19 +487,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--port",
         "--follower-port",
         dest="follower_port",
-        default="/dev/ttyACM0",
-        help="Follower 串口（默认 /dev/ttyACM0）",
+        default=cfg.follower.port,
+        help=f"Follower 串口（默认 {cfg.follower.port}）",
     )
     parser.add_argument(
         "--follower-id",
-        default="zihao_follower_arm",
-        help="Follower 校准 id（默认 zihao_follower_arm）",
+        default=cfg.follower.id,
+        help=f"Follower 校准 id（默认 {cfg.follower.id}）",
     )
     parser.add_argument(
         "--calibration-file",
         type=Path,
-        default=FIXED_CALIBRATION_FILE,
-        help="Follower 校准 JSON 文件（默认 zihao_follower_arm）",
+        default=None,
+        help="Follower 校准 JSON 文件（默认按 HF_LEROBOT_CALIBRATION / .env 动态解析）",
     )
     parser.add_argument(
         "--keep-torque-on-exit",
@@ -535,6 +562,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.keep_torque_on_exit and args.release_torque_on_exit:
         parser.error("--keep-torque-on-exit 与 --release-torque-on-exit 不能同时使用")
 
+    if args.calibration_file is None:
+        args.calibration_file = get_default_calibration_file(args.follower_id)
+
     ensure_repo_on_path()
     section("SO-ARM101 从臂初始化")
 
@@ -542,14 +572,14 @@ def main(argv: list[str] | None = None) -> int:
         log("FAIL", "找不到 lerobot；请在仓库根目录执行 uv sync，或先激活虚拟环境")
         return 1
     if sys.version_info < (3, 12):
-        log("FAIL", f"Python {platform.python_version()}；LeRobot 0.6.x 需要 Python >= 3.12")
+        log("FAIL", f"Python {platform.python_version()}；LeRobot 0.7.1 需要 Python >= 3.12")
         return 1
 
     required = {
         "numpy": "uv sync --locked",
         "draccus": "uv sync --locked",
         "serial": "uv sync --locked --extra hardware",
-        "scservo_sdk": "uv sync --locked --extra feetech",
+        "rustypot": "uv sync --locked --extra feetech",
     }
     missing = [f"{module} ({hint})" for module, hint in required.items() if not module_available(module)]
     if missing:

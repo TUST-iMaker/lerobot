@@ -75,6 +75,10 @@ class ToolAdapter(ABC):
     def build_launch_cmd(self, args: dict[str, Any]) -> list[str]:
         """Build the OS subprocess command for launching this tool."""
 
+    def launch_cwd(self) -> Path:
+        """Return working directory for subprocess launch (defaults to workspace_root)."""
+        return self.config.workspace_root
+
     def launch(self, args: dict[str, Any] | None = None) -> dict[str, Any]:
         args = args or {}
         info = self.probe()
@@ -99,7 +103,7 @@ class ToolAdapter(ABC):
             }
         cmd = self.build_launch_cmd(args)
         managed = self.process_registry.spawn(
-            self.proc_id, self.id, cmd, cwd=self.config.workspace_root
+            self.proc_id, self.id, cmd, cwd=self.launch_cwd()
         )
         return {
             "status": "running",
@@ -365,9 +369,15 @@ class RemoteVLAPolicyAdapter(ToolAdapter):
             "install_hint": hint,
         }
 
+    def launch_cwd(self) -> Path:
+        return self.config.repos_dir / "openpi"
+
     def build_launch_cmd(self, args: dict[str, Any]) -> list[str]:
         port = int(args.get("port") or 8000)
-        policy_config = str(args.get("policy_config") or "pi05_so101_custom")
+        raw_cfg = str(args.get("policy_config") or "pi05_droid")
+        if raw_cfg == "pi05_so101_custom":
+            raw_cfg = "pi05_droid"
+        policy_config = raw_cfg
         policy_dir = str(args.get("policy_dir") or "models/checkpoints/pi05_so101")
         return [
             "uv",

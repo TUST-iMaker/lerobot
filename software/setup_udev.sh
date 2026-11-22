@@ -10,8 +10,8 @@ echo "============================================================"
 echo "[*] 将用户 $(whoami) 加入 dialout, video, plugdev 用户组..."
 sudo usermod -a -G dialout,video,plugdev "$USER" || true
 
-# 2. 写入 udev 规则文件
-RULE_FILE="/etc/udev/rules.d/99-so-arm101.rules"
+# 2. 写入 udev 规则文件 (与 scripts/ubuntu/setup_ubuntu.sh 统一命名)
+RULE_FILE="/etc/udev/rules.d/99-lerobot-arms.rules"
 echo "[*] 正在写入硬件规则到 ${RULE_FILE} ..."
 
 sudo tee "$RULE_FILE" > /dev/null << 'EOF'

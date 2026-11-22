@@ -18,9 +18,10 @@
 | **6. VLA 数据与云训练** | [`03_vla_and_pi/01_vla_data_and_cloud_training.md`](03_vla_and_pi/01_vla_data_and_cloud_training.md) | 数据上传/传输、RTX 5060 (8GB) 与云端 GPU 显存对比、HF Jobs / Featurize / AutoDL、`torchrun` 与 `trackio` | F13 |
 | **7. `pi0.7` 与 Pi 系列 VLA** | [`03_vla_and_pi/02_pi_series_and_pi07.md`](03_vla_and_pi/02_pi_series_and_pi07.md) | `pi0.7`（`arXiv:2604.15483v2`）闭源现状核查、`lerobot-annotate`，以及 `pi0` / `pi0_fast` / `pi05` / `openpi` / `smolvla` 实操 | F14 |
 | **开源前端调研与集成** | [`04_frontend_and_tools/open_source_frontend_survey.md`](04_frontend_and_tools/open_source_frontend_survey.md) | 10+ 款开源前端/舵机工具横评、许可证与系统限制、依赖隔离原则及 `ToolAdapter` 接入架构 | F15 |
-| **本地串联软件指南** | `./04_frontend_and_tools/local_app_guide.md` *(M3 配套文档)* | **Arm101 Studio**（`../app/run_studio.py` / `python -m app.backend.main`）使用与 `dry_run` 无硬件演示指南 | M3 |
+| **本地串联软件指南** | [`04_frontend_and_tools/local_app_guide.md`](04_frontend_and_tools/local_app_guide.md) | **Arm101 Studio**（`../app/run_studio.py` / `python -m app.backend.main`）使用与 `dry_run` 无硬件演示指南 | M3 |
+| **官方原仓溯源与对齐说明书** | [`05_official_alignment_manual.md`](05_official_alignment_manual.md) | 官方 `repos/lerobot` v0.7.1 与 `SO-ARM100` URDF 深度研究报告、全文件比对与底层 100% 对齐方案 | V4 |
 
-> **说明**：`04_frontend_and_tools/local_app_guide.md` 及 [`../app/`](../app/) 源码由后续本地软件模块（M3）维护与交付；本文档体系已提前约定一致的启动入口（`python ../app/run_studio.py` 或 `python -m app.backend.main`）与职责边界。
+> **说明**：[`04_frontend_and_tools/local_app_guide.md`](04_frontend_and_tools/local_app_guide.md) 及 [`../app/`](../app/) 源码提供统一启动入口（`python ../app/run_studio.py` 或 `python -m app.backend.main`）。
 
 ---
 
@@ -42,7 +43,7 @@
 ### 路线 C：工具与前端集成开发者
 1. [`sources/README.md`](sources/README.md) — 核查各上游仓库版本、提交哈希与许可证
 2. [`04_frontend_and_tools/open_source_frontend_survey.md`](04_frontend_and_tools/open_source_frontend_survey.md) — 掌握冲突隔离边界（为何不直接混装 `leLab@v0.7.0` / `solo-bot` / `phosphobot`）与 `ToolAdapter` 接入规范
-3. `./04_frontend_and_tools/local_app_guide.md` *(M3 交付)* 与 [`../app/`](../app/) — 启动与扩展 **Arm101 Studio**（`python -m app.backend.main` / `python app/run_studio.py`）
+3. [`04_frontend_and_tools/local_app_guide.md`](04_frontend_and_tools/local_app_guide.md) 与 [`../app/`](../app/) — 启动与扩展 **Arm101 Studio**（`python -m app.backend.main` / `python app/run_studio.py`）
 
 ---
 

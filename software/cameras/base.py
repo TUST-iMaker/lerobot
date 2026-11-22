@@ -100,6 +100,8 @@ class BaseCamera(abc.ABC):
 
         # 异步后台抓帧相关
         self._latest_frame: CameraFrame | None = None
+        self._latest_timestamp: float | None = None
+        self._new_frame_event = threading.Event()
         self._stream_running: bool = False
         self._stream_thread: threading.Thread | None = None
         self._fps_tracker_time: float = time.monotonic()
@@ -152,39 +154,75 @@ class BaseCamera(abc.ABC):
             try:
                 self._close_device()
             except Exception as e:
-                logger.warning("[%s] 断开相机时发生异常: %e", self.camera_id, e)
+                logger.warning("[%s] 断开相机时发生异常: %s", self.camera_id, e)
             finally:
                 self._connected = False
                 self._latest_frame = None
+                self._latest_timestamp = None
+                self._new_frame_event.clear()
 
     def read_frame(self) -> CameraFrame:
-        """同步读取一帧 (若异步线程开启，返回最新缓存帧并等待首帧就绪)."""
+        """同步读取一帧 (若异步线程开启，等待最新有效帧就绪)."""
         if not self._connected:
             raise RuntimeError(f"[{self.camera_id}] 相机未连接，无法读取帧")
 
         if self.config.async_mode and self._stream_running:
             deadline = time.monotonic() + 1.5
             while time.monotonic() < deadline:
-                frame = self.get_latest_frame()
+                frame = self.get_latest_frame(max_age_ms=self.config.max_age_ms)
                 if frame is not None:
                     return frame
-                time.sleep(0.01)
-            frame = self.get_latest_frame()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._new_frame_event.wait(timeout=min(0.05, remaining))
+                self._new_frame_event.clear()
+            frame = self.get_latest_frame(max_age_ms=self.config.max_age_ms)
             if frame is not None:
                 return frame
             raise TimeoutError(f"[{self.camera_id}] 等待异步视频首帧超时")
 
-        # 同步非异步模式: 直接读取底层硬件单帧
+        # 同步非异步模式: 阻塞 I/O 在锁外执行，仅持锁交换帧指针与统计
+        frame = self._capture_frame_raw()
         with self._lock:
-            frame = self._capture_frame_raw()
-            self._update_fps_stats()
             self._latest_frame = frame
-            return frame
+            self._latest_timestamp = frame.timestamp
+            self._update_fps_stats()
+        self._new_frame_event.set()
+        return frame
 
-    def get_latest_frame(self) -> CameraFrame | None:
-        """获取当前最新捕获的一帧图像 (零等待非阻塞，适合 30Hz 控制循环)."""
+    def get_latest_frame(self, max_age_ms: int | None = 500) -> CameraFrame | None:
+        """获取当前最新捕获的一帧图像 (非阻塞，支持 max_age_ms 新鲜度校验)."""
         with self._lock:
-            return self._latest_frame
+            frame = self._latest_frame
+            ts = self._latest_timestamp
+
+        if frame is None:
+            return None
+        if max_age_ms is not None and ts is not None:
+            age_ms = (time.monotonic() - ts) * 1000.0
+            if age_ms > max_age_ms:
+                return None
+        return frame
+
+    def read_latest(self, max_age_ms: int = 500) -> CameraFrame:
+        """非阻塞读取最新帧 (对齐官方 OpenCVCamera.read_latest，超时抛 TimeoutError)."""
+        if not self._connected:
+            raise RuntimeError(f"[{self.camera_id}] 相机未连接，无法读取帧")
+
+        with self._lock:
+            frame = self._latest_frame
+            ts = self._latest_timestamp
+
+        if frame is None or ts is None:
+            raise RuntimeError(f"[{self.camera_id}] 尚未采集到有效视频帧")
+
+        age_ms = (time.monotonic() - ts) * 1000.0
+        if age_ms > max_age_ms:
+            raise TimeoutError(
+                f"[{self.camera_id}] 最新视频帧已过期 ({age_ms:.1f}ms > {max_age_ms}ms)"
+            )
+        return frame
 
     def start_stream(self) -> None:
         """启动后台独立抓帧守护线程."""
@@ -207,17 +245,19 @@ class BaseCamera(abc.ABC):
             self._stream_thread = None
 
     def _async_capture_loop(self) -> None:
-        """异步抓帧线程主循环."""
+        """异步抓帧线程主循环 (硬件 I/O 在锁外执行，仅在指针交换时短持锁)."""
         target_interval = 1.0 / max(1, self.config.fps)
         while self._stream_running and self._connected:
             t0 = time.monotonic()
             try:
+                frame = self._capture_frame_raw()
                 with self._lock:
                     if not self._connected:
                         break
-                    frame = self._capture_frame_raw()
                     self._latest_frame = frame
+                    self._latest_timestamp = frame.timestamp
                     self._update_fps_stats()
+                self._new_frame_event.set()
             except Exception as e:
                 logger.warning("[%s] 异步抓帧异常: %s", self.camera_id, e)
                 time.sleep(0.05)

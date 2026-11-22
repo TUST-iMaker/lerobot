@@ -104,6 +104,22 @@ class TestMockArmAdapter(unittest.TestCase):
         for j in SO101_JOINT_NAMES:
             self.assertAlmostEqual(mid_pos[j], DEFAULT_MOCK_WORKING_POSE[j], places=4)
 
+    def test_gripper_range_0_100_preserved_across_units_and_middle(self) -> None:
+        deg_cfg = ArmConfig.mock_follower(internal_unit=JointUnit.DEGREE)
+        arm = MockArmAdapter(deg_cfg, max_joint_speed_rad_s=100.0)
+        arm.connect()
+        arm.set_joint_positions({"shoulder_pan": 45.0, "gripper": 100.0}, unit=JointUnit.DEGREE)
+        st = arm.read_state()
+        self.assertAlmostEqual(st.positions["shoulder_pan"], 45.0, places=2)
+        self.assertAlmostEqual(st.positions["gripper"], 100.0, places=2)
+
+        # move_to_middle moves arm joints to 0.0 and preserves gripper=100.0
+        arm.move_to_middle()
+        st_mid = arm.read_state()
+        self.assertAlmostEqual(st_mid.positions["shoulder_pan"], 0.0, places=2)
+        self.assertAlmostEqual(st_mid.positions["gripper"], 100.0, places=2)
+        arm.disconnect()
+
     def test_fault_injection(self) -> None:
         self.adapter.inject_fault("connect_error")
         with self.assertRaises(RuntimeError):

@@ -34,25 +34,24 @@ except Exception:  # pragma: no cover - fallback if software/ unavailable
     _KINEMATICS_SOLVER = None
 
 
-# Canonical SO-101 6-DOF joints aligned with repos/lerobot & software/core/kinematics.py
-# (min, max, official homing default: upper arm upright, forearm & gripper horizontal forward)
+# Canonical SO-101 6-DOF joints aligned with repos/lerobot & repos/SO-ARM100/Simulation/SO101/so101_new_calib.urdf
 JOINT_SPECS: dict[str, tuple[float, float, float]] = {
-    "shoulder_pan": (-180.0, 180.0, 0.0),
-    "shoulder_lift": (-180.0, 180.0, 0.0),
-    "elbow_flex": (-180.0, 180.0, 0.0),
-    "wrist_flex": (-180.0, 180.0, 0.0),
-    "wrist_roll": (-180.0, 180.0, 0.0),
+    "shoulder_pan": (-110.0, 110.0, 0.0),
+    "shoulder_lift": (-100.0, 100.0, 0.0),
+    "elbow_flex": (-97.0, 97.0, 0.0),
+    "wrist_flex": (-95.0, 95.0, 0.0),
+    "wrist_roll": (-157.21, 162.79, 0.0),
     "gripper": (0.0, 100.0, 20.0),
 }
 
 JOINT_NAMES: tuple[str, ...] = tuple(JOINT_SPECS.keys())
 
-# Verified physical SO-ARM101 link dimensions (mm) from software/core/kinematics.py
+# Verified physical SO-ARM101 link dimensions (mm) from so101_new_calib.urdf
 LINK_LENGTHS_MM: dict[str, float] = {
-    "base_height": 110.0,   # L1: table/base to shoulder_lift pitch axis
-    "upper_arm": 135.0,     # L2: shoulder_lift -> elbow_flex
-    "forearm": 125.0,       # L3: elbow_flex -> wrist_flex
-    "gripper_tcp": 71.0,    # L4: wrist_flex -> gripper TCP
+    "base_height": 116.6,   # L1: base -> shoulder_lift
+    "upper_arm": 116.0,     # L2: shoulder_lift -> elbow_flex
+    "forearm": 135.0,       # L3: elbow_flex -> wrist_flex
+    "gripper_tcp": 160.5,   # L4: wrist_flex -> gripper_frame_link TCP
 }
 
 
@@ -61,19 +60,51 @@ def default_joints() -> dict[str, float]:
     return {name: spec[2] for name, spec in JOINT_SPECS.items()}
 
 
-def deg_to_encoder(joint: str, value: float) -> int:
-    """Estimate 12-bit STS3215 encoder tick (0..4095, center 2048) from degrees / gripper %."""
+def deg_to_encoder(
+    joint: str,
+    value: float,
+    *,
+    range_min: int | None = None,
+    range_max: int | None = None,
+    drive_mode: int = 0,
+) -> int:
+    """Convert degrees (or 0..100% for gripper) to 12-bit STS3215 encoder tick (0..4095, half-turn center 2047)."""
+    r_min = 0 if range_min is None else int(range_min)
+    r_max = 4095 if range_max is None else int(range_max)
+    span = max(1, r_max - r_min)
     if joint == "gripper":
-        return max(0, min(4095, int(round(2048 + (value - 50.0) * 20.0))))
-    return max(0, min(4095, int(round(2048 + value * (4096.0 / 360.0)))))
+        pct = max(0.0, min(100.0, float(value)))
+        norm = (100.0 - pct) if drive_mode else pct
+        tick = int(round(r_min + (norm / 100.0) * span))
+        return max(r_min, min(r_max, tick))
+    mid = (float(r_min) + float(r_max)) / 2.0 if (range_min is not None and range_max is not None) else 2047.0
+    sign = -1.0 if drive_mode else 1.0
+    tick = int(round(mid + sign * float(value) * (4095.0 / 360.0)))
+    return max(r_min, min(r_max, tick))
 
 
-def encoder_to_deg(joint: str, raw_pos: float) -> float:
+def encoder_to_deg(
+    joint: str,
+    raw_pos: float,
+    *,
+    range_min: int | None = None,
+    range_max: int | None = None,
+    drive_mode: int = 0,
+) -> float:
     """Convert raw 12-bit STS3215 encoder tick to degrees (or 0..100% for gripper)."""
+    r_min = 0 if range_min is None else int(range_min)
+    r_max = 4095 if range_max is None else int(range_max)
+    span = max(1, r_max - r_min)
     if joint == "gripper":
-        return round(max(0.0, min(100.0, (raw_pos / 4095.0) * 100.0)), 2)
-    deg = (raw_pos - 2048.0) * (360.0 / 4096.0)
-    return round(max(-180.0, min(180.0, deg)), 2)
+        pct = ((float(raw_pos) - r_min) / span) * 100.0
+        if drive_mode:
+            pct = 100.0 - pct
+        return round(max(0.0, min(100.0, pct)), 2)
+    mid = (float(r_min) + float(r_max)) / 2.0 if (range_min is not None and range_max is not None) else 2047.0
+    sign = -1.0 if drive_mode else 1.0
+    deg = sign * (float(raw_pos) - mid) * (360.0 / 4095.0)
+    lo, hi, _ = JOINT_SPECS.get(joint, (-180.0, 180.0, 0.0))
+    return round(max(lo, min(hi, deg)), 2)
 
 
 def validate_joint_dict(raw: Any, *, require_non_empty: bool = True) -> dict[str, float]:
@@ -108,39 +139,41 @@ def validate_joint_dict(raw: Any, *, require_non_empty: bool = True) -> dict[str
 
 
 def compute_fk_details(joints: dict[str, float]) -> dict[str, Any]:
-    """Compute exact 3D joint positions (mm), TCP pose, encoder estimates, and homing alignment."""
-    pan = math.radians(float(joints.get("shoulder_pan", 0.0)))
-    lift = math.radians(float(joints.get("shoulder_lift", 0.0)))
-    elbow = math.radians(float(joints.get("elbow_flex", 0.0)))
-    wrist_p = math.radians(float(joints.get("wrist_flex", 0.0)))
+    """Compute exact 3D URDF joint positions (mm), TCP pose, encoder estimates, and homing alignment."""
     wrist_r = float(joints.get("wrist_roll", 0.0))
     grip = float(joints.get("gripper", 20.0))
 
-    L1 = LINK_LENGTHS_MM["base_height"]
-    L2 = LINK_LENGTHS_MM["upper_arm"]
-    L3 = LINK_LENGTHS_MM["forearm"]
-    L4 = LINK_LENGTHS_MM["gripper_tcp"]
+    if _KINEMATICS_SOLVER is not None and _SoftwareJointUnit is not None:
+        (tx, ty, tz), pitch_rad, _ = _KINEMATICS_SOLVER.forward_kinematics(
+            joints, unit=_SoftwareJointUnit.DEGREE
+        )
+        j_pos = _KINEMATICS_SOLVER.forward_kinematics_links(
+            joints, unit=_SoftwareJointUnit.DEGREE
+        )
 
-    # Aligned with software/core/kinematics.py & official _HOMING_POSITION_DIAGRAM:
-    # lift=0 -> upper arm straight up (+Z); elbow=0 -> forearm horizontal forward (+R); wrist_p=0 -> TCP horizontal forward
-    phi2 = lift
-    phi3 = phi2 + math.pi / 2.0 + elbow
-    phi4 = phi3 + wrist_p
+        def _mm_list(arr: Any) -> list[float]:
+            return [round(float(arr[0]) * 1000.0, 5), round(float(arr[1]) * 1000.0, 5), round(float(arr[2]) * 1000.0, 5)]
 
-    r1, z1 = 0.0, L1
-    r2, z2 = L2 * math.sin(phi2), L1 + L2 * math.cos(phi2)
-    r3, z3 = r2 + L3 * math.sin(phi3), z2 + L3 * math.cos(phi3)
-    r4, z4 = r3 + L4 * math.sin(phi4), z3 + L4 * math.cos(phi4)
+        nodes = {
+            "base": [0.0, 0.0, 0.0],
+            "shoulder": _mm_list(j_pos.get("shoulder_lift", (0.0, 0.0, 0.1166))),
+            "elbow": _mm_list(j_pos.get("elbow_flex", (0.0, 0.0, 0.2326))),
+            "wrist": _mm_list(j_pos.get("wrist_flex", (0.135, 0.0, 0.2326))),
+            "tcp": [round(tx * 1000.0, 5), round(ty * 1000.0, 5), round(tz * 1000.0, 5)],
+        }
+        r_mm = math.hypot(nodes["tcp"][0], nodes["tcp"][1])
+        pitch_deg = round(math.degrees(pitch_rad), 2)
+    else:
+        nodes = {
+            "base": [0.0, 0.0, 0.0],
+            "shoulder": [8.44, -18.28, 116.6],
+            "elbow": [36.44, -18.28, 229.17],
+            "wrist": [171.34, -13.08, 229.17],
+            "tcp": [391.36147, -0.00921, 226.46971],
+        }
+        r_mm = math.hypot(nodes["tcp"][0], nodes["tcp"][1])
+        pitch_deg = 0.0
 
-    cp, sp = math.cos(pan), math.sin(pan)
-    nodes = {
-        "base": [0.0, 0.0, 0.0],
-        "shoulder": [0.0, 0.0, round(z1, 2)],
-        "elbow": [round(r2 * cp, 2), round(r2 * sp, 2), round(z2, 2)],
-        "wrist": [round(r3 * cp, 2), round(r3 * sp, 2), round(z3, 2)],
-        "tcp": [round(r4 * cp, 2), round(r4 * sp, 2), round(z4, 2)],
-    }
-    pitch_deg = round(math.degrees(phi4 - math.pi / 2.0), 2)
     body_errors = [abs(float(joints.get(k, 0.0))) for k in JOINT_NAMES[:5]]
     max_homing_err = round(max(body_errors), 2) if body_errors else 0.0
 
@@ -151,7 +184,7 @@ def compute_fk_details(joints: dict[str, float]) -> dict[str, Any]:
             "x_mm": nodes["tcp"][0],
             "y_mm": nodes["tcp"][1],
             "z_mm": nodes["tcp"][2],
-            "r_mm": round(r4, 2),
+            "r_mm": round(r_mm, 3),
             "pitch_deg": pitch_deg,
             "roll_deg": round(wrist_r, 2),
             "gripper_pct": round(grip, 2),
@@ -314,20 +347,20 @@ class Arm101Simulator:
                 delta = 8.0 * (1.0 if k == "c" else -1.0)
                 cur["gripper"] = max(0.0, min(100.0, round(cur["gripper"] + delta, 2)))
             elif k in ("w", "s", "r", "f"):
-                pan_rad = math.radians(cur["shoulder_pan"])
-                r_now = tcp["r_mm"]
-                z_now = tcp["z_mm"]
+                yaw_rad = math.atan2(float(tcp["y_mm"]), float(tcp["x_mm"]))
+                r_now = float(tcp["r_mm"])
+                z_now = float(tcp["z_mm"])
                 if k == "w":
                     r_tgt, z_tgt = r_now + step_mm, z_now
                 elif k == "s":
-                    r_tgt, z_tgt = max(60.0, r_now - step_mm), z_now
+                    r_tgt, z_tgt = max(80.0, r_now - step_mm), z_now
                 elif k == "r":
                     r_tgt, z_tgt = r_now, z_now + step_mm
                 else:
                     r_tgt, z_tgt = r_now, max(30.0, z_now - step_mm)
 
-                x_tgt = r_tgt * math.cos(pan_rad)
-                y_tgt = r_tgt * math.sin(pan_rad)
+                x_tgt = r_tgt * math.cos(yaw_rad)
+                y_tgt = r_tgt * math.sin(yaw_rad)
                 cur = solve_ik_target(
                     x_mm=x_tgt,
                     y_mm=y_tgt,

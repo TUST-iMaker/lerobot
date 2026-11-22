@@ -18,7 +18,7 @@ from typing import Any, Generator
 
 from core.data_types import CameraFrameRef
 from cameras.base import BaseCamera, CameraFrame
-from cameras.config import CameraBackendType, CameraConfig
+from cameras.config import CameraBackendType, CameraConfig, CameraDeviceInfo
 from cameras.discovery import list_capture_cameras
 from cameras.mock_camera import MockCamera
 from cameras.v4l2_camera import V4L2Camera

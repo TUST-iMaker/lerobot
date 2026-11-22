@@ -78,7 +78,7 @@ class TestSafetyController(unittest.TestCase):
     def test_soft_limit_clamping(self) -> None:
         self.sm.claim_control(ControlSource.KEYBOARD)
 
-        # shoulder_pan 限制为 [-1.8, 1.8] rad
+        # shoulder_pan URDF 限位为 [-1.91986, 1.91986] rad
         # 下发超出限位的 3.0 rad
         action = RobotAction(
             action_type=ActionType.JOINT_POSITION,
@@ -88,17 +88,87 @@ class TestSafetyController(unittest.TestCase):
             unit=JointUnit.RADIAN,
         )
 
-        # 设置当前位置就在 1.7 rad (只看限位)
+        # 设置当前位置在 1.90 rad (仅触发限位截断至 1.91986)
         cur = JointState(
             timestamp=100.0,
-            positions={"shoulder_pan": 1.7},
+            positions={"shoulder_pan": 1.90},
             unit=JointUnit.RADIAN,
         )
         ok, safe_act, msg = self.controller.filter_and_verify(action, cur)
         self.assertTrue(ok)
         self.assertIsNotNone(safe_act)
-        # clamp 到了边界 1.8，同时受到单步增量 0.08 限制 -> 1.7 + 0.08 = 1.78
-        self.assertLessEqual(safe_act.target_joint_positions["shoulder_pan"], 1.8)
+        self.assertAlmostEqual(safe_act.target_joint_positions["shoulder_pan"], 1.91986, places=5)
+
+    def test_gripper_range_0_100_and_delta_clamping(self) -> None:
+        self.sm.claim_control(ControlSource.KEYBOARD)
+
+        # 1. 夹爪从 90% 到 100% 不被旧弧度限位 (85.94%) 截断
+        cur = JointState(timestamp=100.0, positions={"gripper": 90.0}, unit=JointUnit.RADIAN)
+        act_open = RobotAction(
+            action_type=ActionType.JOINT_POSITION,
+            source=ControlSource.KEYBOARD,
+            timestamp=101.0,
+            target_joint_positions={"gripper": 100.0},
+            unit=JointUnit.RADIAN,
+            gripper_unit=JointUnit.RANGE_0_100,
+        )
+        ok, safe_act, _ = self.controller.filter_and_verify(act_open, cur)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(safe_act.target_joint_positions["gripper"], 100.0, places=4)
+
+        # 2. 越界值 (-10, 120) 被截断到 [0, 100], 且受 max_gripper_delta_pct=15.0 限幅
+        cur_mid = JointState(timestamp=101.0, positions={"gripper": 95.0}, unit=JointUnit.RADIAN)
+        act_over = RobotAction(
+            action_type=ActionType.JOINT_POSITION,
+            source=ControlSource.KEYBOARD,
+            timestamp=102.0,
+            target_joint_positions={"gripper": 120.0},
+            unit=JointUnit.DEGREE,
+            gripper_unit=JointUnit.RANGE_0_100,
+        )
+        ok, safe_over, _ = self.controller.filter_and_verify(act_over, cur_mid)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(safe_over.target_joint_positions["gripper"], 100.0, places=4)
+
+        cur_low = JointState(timestamp=102.0, positions={"gripper": 5.0}, unit=JointUnit.RADIAN)
+        act_under = RobotAction(
+            action_type=ActionType.JOINT_POSITION,
+            source=ControlSource.KEYBOARD,
+            timestamp=103.0,
+            target_joint_positions={"gripper": -10.0},
+            unit=JointUnit.RADIAN,
+            gripper_unit=JointUnit.RANGE_0_100,
+        )
+        ok, safe_under, _ = self.controller.filter_and_verify(act_under, cur_low)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(safe_under.target_joint_positions["gripper"], 0.0, places=4)
+
+        # 3. 单步增量超过 max_gripper_delta_pct=15.0% 时被平滑截断到 15.0%
+        act_jump = RobotAction(
+            action_type=ActionType.JOINT_POSITION,
+            source=ControlSource.KEYBOARD,
+            timestamp=104.0,
+            target_joint_positions={"gripper": 60.0},
+            unit=JointUnit.RADIAN,
+            gripper_unit=JointUnit.RANGE_0_100,
+        )
+        ok, safe_jump, _ = self.controller.filter_and_verify(act_jump, cur_low)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(safe_jump.target_joint_positions["gripper"], 20.0, places=4)
+
+        # 4. 夹爪跟随误差阈值 25.0% 不会因 10% 误差误触发 FAULT
+        cmd_g = RobotAction(
+            action_type=ActionType.JOINT_POSITION,
+            source=ControlSource.KEYBOARD,
+            timestamp=105.0,
+            target_joint_positions={"gripper": 15.0},
+            unit=JointUnit.RADIAN,
+            gripper_unit=JointUnit.RANGE_0_100,
+        )
+        for _ in range(5):
+            ok_trk, _ = self.controller.check_tracking_error(cmd_g, cur_low)
+            self.assertTrue(ok_trk)
+        self.assertEqual(self.sm.current_state, SystemState.TELEOP)
 
     def test_delta_rate_limiting(self) -> None:
         self.sm.claim_control(ControlSource.KEYBOARD)

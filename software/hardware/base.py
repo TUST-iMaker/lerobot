@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from core.data_types import (
+    SO101_GRIPPER_JOINT_NAME,
     SO101_JOINT_NAMES,
     JointState,
     JointUnit,
@@ -50,6 +51,7 @@ class BaseArmAdapter(abc.ABC):
         self.config = config
         self._connected: bool = False
         self._calibration_ranges: dict[str, tuple[int, int]] = {}
+        self._hw_calibrated: bool | None = None
         self._health = ArmHealth()
         self._latencies: list[float] = []
 
@@ -60,8 +62,8 @@ class BaseArmAdapter(abc.ABC):
 
     @property
     def is_calibrated(self) -> bool:
-        """是否已成功加载校准配置."""
-        return bool(self._calibration_ranges)
+        """是否已成功加载校准配置且硬件 EEPROM 未校验失败."""
+        return bool(self._calibration_ranges) and (self._hw_calibrated is not False)
 
     @property
     def calibration_ranges(self) -> dict[str, tuple[int, int]]:
@@ -109,18 +111,37 @@ class BaseArmAdapter(abc.ABC):
         positions: dict[str, float],
         driver_unit: JointUnit,
     ) -> tuple[dict[str, float], JointUnit]:
-        """将驱动输出的单位转换为配置的内部统一基准单位 (如 degree -> radian)."""
+        """将驱动输出的单位转换为内部基准单位 (arm 转换, gripper 始终保持 RANGE_0_100)."""
         if self.config.internal_unit == driver_unit:
-            return positions, driver_unit
+            return {k: float(v) for k, v in positions.items()}, driver_unit
 
         if self.config.internal_unit == JointUnit.RADIAN and driver_unit == JointUnit.DEGREE:
-            return {k: deg_to_rad(v) for k, v in positions.items()}, JointUnit.RADIAN
+            return {
+                k: (float(v) if k == SO101_GRIPPER_JOINT_NAME else deg_to_rad(float(v)))
+                for k, v in positions.items()
+            }, JointUnit.RADIAN
 
         if self.config.internal_unit == JointUnit.DEGREE and driver_unit == JointUnit.RADIAN:
-            return {k: rad_to_deg(v) for k, v in positions.items()}, JointUnit.DEGREE
+            return {
+                k: (float(v) if k == SO101_GRIPPER_JOINT_NAME else rad_to_deg(float(v)))
+                for k, v in positions.items()
+            }, JointUnit.DEGREE
 
         # 归一化等其他情况保持原状返回
-        return positions, driver_unit
+        return {k: float(v) for k, v in positions.items()}, driver_unit
+
+    def _convert_internal_to_driver_unit(
+        self,
+        positions: dict[str, float],
+        source_unit: JointUnit,
+    ) -> dict[str, float]:
+        """将内部动作单位转换为驱动目标单位 (arm 转 DEGREE, gripper 始终保持 RANGE_0_100)."""
+        if source_unit == JointUnit.RADIAN and self.config.use_degrees:
+            return {
+                k: (float(v) if k == SO101_GRIPPER_JOINT_NAME else rad_to_deg(float(v)))
+                for k, v in positions.items()
+            }
+        return {k: float(v) for k, v in positions.items()}
 
     def _record_read_latency(self, latency_ms: float) -> None:
         """记录状态读取延迟并更新健康统计."""

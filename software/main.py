@@ -153,8 +153,8 @@ def cmd_config(args: argparse.Namespace) -> int:
 def cmd_data(args: argparse.Namespace) -> int:
     """查看已录制的官方 LeRobot 数据集与 Episode 列表."""
     import json
-    from pathlib import Path
-    hf_lerobot = Path.home() / ".cache" / "huggingface" / "lerobot"
+    from core.config_loader import resolve_lerobot_home
+    hf_lerobot = resolve_lerobot_home()
     print("\n" + "=" * 65)
     print("📁  LeRobot 官方多模态数据集目录 (Dataset Catalog)")
     print("=" * 65)
@@ -176,7 +176,7 @@ def cmd_data(args: argparse.Namespace) -> int:
                 print(f"     • 规格: {total_ep} 个 Episode | {total_frames} 帧 | {fps} Hz")
             except Exception:
                 pass
-            vids = list(ds_dir.glob("videos/*.mp4"))
+            vids = list(ds_dir.glob("videos/**/*.mp4"))
             if vids:
                 print(f"     • 视频镜头: {len(vids)} 个视角录像")
             print(f"     • 一键回放: python main.py replay --repo-id {rel_repo} --episode 0\n")

@@ -21,6 +21,7 @@ from cameras.config import (
 from cameras.discovery import discover_cameras, list_capture_cameras
 from cameras.manager import CameraManager, create_camera
 from cameras.mock_camera import MockCamera
+from cameras.opencv_camera import OpenCVCamera
 from cameras.v4l2_camera import V4L2Camera
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "CameraBackendType",
     "CameraManager",
     "MockCamera",
+    "OpenCVCamera",
     "V4L2Camera",
     "create_camera",
     "discover_cameras",

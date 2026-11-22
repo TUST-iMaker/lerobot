@@ -43,6 +43,7 @@ if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
 from core.action_api import ActionAPI
+from core.config_loader import get_config
 from core.data_types import (
     SO101_JOINT_NAMES,
     ActionType,
@@ -50,6 +51,7 @@ from core.data_types import (
     JointState,
     JointUnit,
     RobotAction,
+    clamp_gripper_pct,
     deg_to_rad,
     rad_to_deg,
 )
@@ -120,14 +122,15 @@ def print_banner(step_mm: float) -> None:
 
 def run_cartesian_teleop(args: argparse.Namespace) -> int:
     is_mock = args.mock or args.port == "mock"
+    target_port = args.port or get_config().follower.port
     if is_mock:
         arm_cfg = ArmConfig.mock_follower()
         sys_cfg = RobotSystemConfig.mock_system()
         print("[*] 正在以【纯软件仿真模式】启动机械臂 (无需串口与真机)...")
     else:
-        arm_cfg = ArmConfig.default_follower(port=args.port)
+        arm_cfg = ArmConfig.default_follower(port=target_port)
         sys_cfg = RobotSystemConfig(follower=arm_cfg)
-        print(f"[*] 正在通过 ActionAPI 连接机械臂 (端口: {args.port})...")
+        print(f"[*] 正在通过 ActionAPI 连接机械臂 (端口: {target_port})...")
 
     api = ActionAPI(config=sys_cfg)
     kin = SO101Kinematics()
@@ -141,7 +144,9 @@ def run_cartesian_teleop(args: argparse.Namespace) -> int:
         api.disconnect()
         return 1
 
-    # 转向符号定义 (A/D 默认已根据实测校准为负号对齐; 可通过 --invert-ad 反转)
+    # 转向符号对齐官方 URDF shoulder_pan 世界轴 [0, 0, -1]:
+    # a (+Y 左移) 需减小 shoulder_pan (-d_pan), d (-Y 右移) 需增大 shoulder_pan (+d_pan),
+    # 与 pan_dir = (+1 if a else -1) 相乘故默认为 -1.0 (--invert-ad 可反转).
     sign_ad = 1.0 if args.invert_ad else -1.0
     sign_lift = 1.0
     sign_elbow = 1.0
@@ -246,16 +251,26 @@ def run_cartesian_teleop(args: argparse.Namespace) -> int:
                     continue
 
                 # =============================================================
-                # W / S 控制: 前后水平平推 (W向前平推, S向后收缩, 高度与俯角严格锁定)
+                # W / S 控制: 沿当前 URDF 径向平面水平前后平推 (高度与俯角严格锁定)
                 # =============================================================
                 elif key in ("w", "s"):
                     ws_dir = 1.0 if key == "w" else -1.0
                     step_m = (step_mm / 1000.0) * ws_dir
-                    target_R = current_R_gripper + step_m
 
+                    fk_cur = forward_kinematics_detailed(cur_positions)
+                    cur_x_m = fk_cur["tcp"]["x_mm"] / 1000.0
+                    cur_y_m = fk_cur["tcp"]["y_mm"] / 1000.0
+                    cur_r_m = math.hypot(cur_x_m, cur_y_m)
                     cur_pan = cur_positions.get("shoulder_pan", 0.0)
-                    target_x = target_R * math.cos(cur_pan)
-                    target_y = target_R * math.sin(cur_pan)
+                    if cur_r_m >= 1e-3:
+                        ux, uy = cur_x_m / cur_r_m, cur_y_m / cur_r_m
+                    else:
+                        # URDF shoulder_pan 轴为 [0, 0, -1], 水平前向单位向量为 (cos(-pan), sin(-pan))
+                        ux, uy = math.cos(-cur_pan), math.sin(-cur_pan)
+
+                    target_x = cur_x_m + step_m * ux
+                    target_y = cur_y_m + step_m * uy
+                    target_R = math.hypot(target_x, target_y)
 
                     ok, solved, msg = inverse_kinematics_deterministic(
                         target_x_m=target_x,
@@ -266,10 +281,10 @@ def run_cartesian_teleop(args: argparse.Namespace) -> int:
                     )
 
                     if not ok or solved is None:
-                        # 达到连杆几何极限，静默保持在当前位置，不乱动画圈
                         continue
 
                     target_joints = {
+                        "shoulder_pan": solved["shoulder_pan"],
                         "shoulder_lift": solved["shoulder_lift"],
                         "elbow_flex": solved["elbow_flex"],
                         "wrist_flex": solved["wrist_flex"],
@@ -296,16 +311,16 @@ def run_cartesian_teleop(args: argparse.Namespace) -> int:
                     continue
 
                 # =============================================================
-                # R / F 控制: 垂直升降 (R整体抬升, F整体下降, 半径与俯角严格锁定)
+                # R / F 控制: 垂直升降 (R整体抬升, F整体下降, 水平位置与俯角严格锁定)
                 # =============================================================
                 elif key in ("r", "f"):
                     z_dir = 1.0 if key == "r" else -1.0
                     step_m = (step_mm / 1000.0) * z_dir
                     target_Z = locked_Z_gripper + step_m
 
-                    cur_pan = cur_positions.get("shoulder_pan", 0.0)
-                    target_x = current_R_gripper * math.cos(cur_pan)
-                    target_y = current_R_gripper * math.sin(cur_pan)
+                    fk_cur = forward_kinematics_detailed(cur_positions)
+                    target_x = fk_cur["tcp"]["x_mm"] / 1000.0
+                    target_y = fk_cur["tcp"]["y_mm"] / 1000.0
 
                     ok, solved, msg = inverse_kinematics_deterministic(
                         target_x_m=target_x,
@@ -316,10 +331,10 @@ def run_cartesian_teleop(args: argparse.Namespace) -> int:
                     )
 
                     if not ok or solved is None:
-                        # 达到升降上下几何极限，静默保持在当前位置
                         continue
 
                     target_joints = {
+                        "shoulder_pan": solved["shoulder_pan"],
                         "shoulder_lift": solved["shoulder_lift"],
                         "elbow_flex": solved["elbow_flex"],
                         "wrist_flex": solved["wrist_flex"],
@@ -388,10 +403,10 @@ def run_cartesian_teleop(args: argparse.Namespace) -> int:
                     api.submit_action(action)
                     continue
 
-                elif key in ("c", "v"):  # 夹爪开合
+                elif key in ("c", "v"):  # 夹爪开合 (RANGE_0_100: 0..100%)
                     g_dir = 1.0 if key == "c" else -1.0
-                    cur_g = cur_positions.get("gripper", cur_gripper_val)
-                    target_g = cur_g + g_dir * 0.08
+                    cur_g = float(cur_positions.get("gripper", cur_gripper_val))
+                    target_g = clamp_gripper_pct(cur_g + g_dir * 5.0)
                     target_joints = {"gripper": target_g}
                     action = RobotAction(
                         action_type=ActionType.JOINT_POSITION,
@@ -399,6 +414,7 @@ def run_cartesian_teleop(args: argparse.Namespace) -> int:
                         timestamp=time.monotonic(),
                         target_joint_positions=target_joints,
                         unit=JointUnit.RADIAN,
+                        gripper_unit=JointUnit.RANGE_0_100,
                     )
                     sub_ok, _ = api.submit_action(action)
                     if sub_ok:
@@ -422,7 +438,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--port", default="/dev/ttyACM0", help="从臂串口 (默认 /dev/ttyACM0)")
+    parser.add_argument("--port", default=None, help="从臂串口 (默认从全局配置解析)")
     parser.add_argument("--step-mm", type=float, default=5.0, help="单次平移步长 (毫米, 默认 5.0mm)")
     parser.add_argument(
         "--keep-torque",

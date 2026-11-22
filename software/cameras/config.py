@@ -73,6 +73,27 @@ class CameraConfig:
     rotation: int = 0
     buffer_size: int = 2
     async_mode: bool = True
+    fourcc: str | None = None
+    max_age_ms: int = 500
+    cv2_backend: int | None = None
+
+    def __post_init__(self) -> None:
+        normalized_color = str(self.color_mode).strip().upper()
+        if normalized_color not in ("RGB", "BGR", "GRAY"):
+            raise ValueError(f"不支持的 color_mode: {self.color_mode} (仅支持 RGB, BGR, GRAY)")
+        object.__setattr__(self, "color_mode", normalized_color)
+
+        if self.rotation not in (0, 90, 180, 270, -90):
+            raise ValueError(f"不支持的 rotation: {self.rotation} (仅支持 0, 90, 180, 270, -90)")
+
+        if self.fourcc is not None:
+            fc = str(self.fourcc).strip().upper()
+            if len(fc) != 4:
+                raise ValueError(f"fourcc 必须为 4 个字符 (如 'MJPG'), 当前为: {self.fourcc!r}")
+            object.__setattr__(self, "fourcc", fc)
+
+        if self.max_age_ms < 0:
+            raise ValueError(f"max_age_ms 不能为负数: {self.max_age_ms}")
 
     @classmethod
     def default_usb(
@@ -128,5 +149,7 @@ class CameraConfig:
             "rotation": self.rotation,
             "buffer_size": self.buffer_size,
             "async_mode": self.async_mode,
+            "fourcc": self.fourcc,
+            "max_age_ms": self.max_age_ms,
         }
 

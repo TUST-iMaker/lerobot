@@ -1246,9 +1246,9 @@ function bindActions() {
   });
 
   $("btn-apply-ik")?.addEventListener("click", async () => {
-    const x_mm = Number($("ik-x")?.value || 196);
+    const x_mm = Number($("ik-x")?.value || 391);
     const y_mm = Number($("ik-y")?.value || 0);
-    const z_mm = Number($("ik-z")?.value || 245);
+    const z_mm = Number($("ik-z")?.value || 226);
     const gripper = Number($("ik-grip")?.value || 20);
     const res = await apiFetch("/api/sim/ik", {
       method: "POST",

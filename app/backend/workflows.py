@@ -342,9 +342,11 @@ class WorkflowManager:
         episode_time_s: float,
         reset_time_s: float,
         fps: int,
+        push_to_hub: bool = False,
     ) -> list[str]:
         f_cal = str(self.config.calibration_dir / "robots" / "so_follower")
         l_cal = str(self.config.calibration_dir / "teleoperators" / "so_leader")
+        ds_root = self.config.datasets_dir / dataset_name
         cmd = [
             sys.executable,
             "-m",
@@ -358,16 +360,19 @@ class WorkflowManager:
             f"--teleop.id={self.config.leader_id}",
             f"--teleop.calibration_dir={l_cal}",
             f"--dataset.repo_id=local/{dataset_name}",
-            f"--dataset.root={self.config.datasets_dir / dataset_name}",
+            f"--dataset.root={ds_root}",
             f"--dataset.single_task={single_task}",
             f"--dataset.num_episodes={num_episodes}",
             f"--dataset.episode_time_s={episode_time_s}",
             f"--dataset.reset_time_s={reset_time_s}",
             f"--dataset.fps={fps}",
-            "--dataset.push_to_hub=false",
+            f"--dataset.push_to_hub={'true' if push_to_hub else 'false'}",
+            "--dataset.streaming_encoding=true",
             "--play_sounds=false",
             "--display_data=false",
         ]
+        if ds_root.exists():
+            cmd.append("--resume=true")
         cams = self.build_cameras_dict()
         if cams:
             cmd.append(f"--robot.cameras={json.dumps(cams, separators=(',', ':'))}")
@@ -856,6 +861,7 @@ class WorkflowManager:
         episode_time_s: float = 5.0,
         reset_time_s: float = 1.0,
         fps: int = 30,
+        push_to_hub: bool = False,
     ) -> dict[str, Any]:
         self._sync_process_state()
         await self._ensure_idle()
@@ -870,6 +876,7 @@ class WorkflowManager:
                 episode_time_s=episode_time_s,
                 reset_time_s=reset_time_s,
                 fps=fps,
+                push_to_hub=push_to_hub,
             )
             proc_id = "workflow_collect"
             self.process_registry.spawn(
@@ -1376,15 +1383,21 @@ class WorkflowManager:
     def save_custom_pose(self, target: Literal["home", "rest"]) -> dict[str, Any]:
         _, follower, _ = self.simulator.snapshot()
         filename = "upright_pose.json" if target == "home" else "rest_pose.json"
-        out_path = self.config.workspace_root / "software" / filename
+        if self.hardware.active_mode == "real":
+            out_path = self.config.workspace_root / "software" / filename
+            rel_path = f"software/{filename}"
+        else:
+            out_path = self.config.dry_run_dir / filename
+            rel_path = f"data/dry_run/{filename}"
         payload = {
             "unit": "degree",
+            "gripper_unit": "range_0_100",
             "joints": {f"{k}.pos": follower[k] for k in JOINT_NAMES},
         }
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        self.log(f"[POSE] Saved current follower pose to software/{filename}.")
-        return {"status": "saved", "target": target, "path": f"software/{filename}", "joints": follower}
+        self.log(f"[POSE] Saved current follower pose to {rel_path}.")
+        return {"status": "saved", "target": target, "path": rel_path, "joints": follower}
 
     def get_episode_frames(self, dataset_name: str, episode_index: int) -> dict[str, Any]:
         if ".." in dataset_name or "/" in dataset_name or "\\" in dataset_name:

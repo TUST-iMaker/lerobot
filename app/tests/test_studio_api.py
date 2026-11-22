@@ -749,7 +749,7 @@ def test_v3_safety_dual_arm_ik_sync_and_routines(
         # 2. IK solver (valid workspace target + unreachable 422)
         ik_ok = client.post(
             "/api/sim/ik",
-            json={"arm": "follower", "x_mm": 180.0, "y_mm": 20.0, "z_mm": 210.0, "pitch_deg": 0.0},
+            json={"arm": "follower", "x_mm": 340.0, "y_mm": -30.0, "z_mm": 215.0, "pitch_deg": 0.0},
         )
         assert ik_ok.status_code == 200
         ik_body = ik_ok.json()

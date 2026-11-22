@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+import platform
 import socketserver
 import sys
 import threading
@@ -28,13 +29,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-# 确保软件根目录加入模块搜索路径
+# 确保软件根目录与官方 lerobot 源码加入模块搜索路径
 _software_root = Path(__file__).resolve().parent
 _lerobot_root = _software_root.parent
 if str(_software_root) not in sys.path:
     sys.path.insert(0, str(_software_root))
-if str(_lerobot_root / "src") not in sys.path:
-    sys.path.insert(0, str(_lerobot_root / "src"))
+for _cand_src in (_lerobot_root / "src", _lerobot_root / "repos" / "lerobot" / "src"):
+    if _cand_src.is_dir() and str(_cand_src) not in sys.path:
+        sys.path.insert(0, str(_cand_src))
 
 from core.action_api import ActionAPI
 from core.config_loader import get_config
@@ -43,12 +45,17 @@ from core.data_types import (
     ControlSource,
     JointUnit,
     RobotAction,
+    SO101_GRIPPER_JOINT_NAME,
     SO101_JOINT_NAMES,
+    clamp_gripper_pct,
     deg_to_rad,
     rad_to_deg,
 )
 from hardware.config import RobotSystemConfig
 from teleop.demo_routine import DemoRoutineRunner
+
+if platform.system() == "Windows":
+    os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 
 try:
     import cv2
@@ -155,11 +162,22 @@ class CameraStreamer:
                 pass
 
         try:
-            cap = cv2.VideoCapture(idx)
+            if platform.system() == "Windows" and isinstance(idx, int) and hasattr(cv2, "CAP_DSHOW"):
+                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                if not cap.isOpened():
+                    cap.release()
+                    cap = cv2.VideoCapture(idx)
+            else:
+                cap = cv2.VideoCapture(idx)
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
                 cap.set(cv2.CAP_PROP_FPS, self.fps)
+                # Windows DSHOW 必须在分辨率与帧率之后设置 FOURCC
+                try:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"MJPG"))
+                except Exception:
+                    pass
                 self._cap = cap
                 self._is_real_camera = True
                 logger.info("物理相机 (%s) 连接成功", self.device)
@@ -768,7 +786,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       { name: "elbow_flex", label: "小臂肘部 (Elbow)", min: -120, max: 120 },
       { name: "wrist_flex", label: "手腕俯仰 (Wrist Flex)", min: -120, max: 120 },
       { name: "wrist_roll", label: "手腕翻滚 (Wrist Roll)", min: -180, max: 180 },
-      { name: "gripper", label: "末端夹爪 (Gripper)", min: -20, max: 110 }
+      { name: "gripper", label: "末端夹爪 (Gripper)", min: 0, max: 100, unit: "%" }
     ];
 
     let currentMode = "demo";
@@ -902,7 +920,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const pos = data.joints || {};
         JOINTS.forEach(j => {
           const val = pos[j.name] !== undefined ? pos[j.name] : 0.0;
-          document.getElementById(`val-${j.name}`).innerText = `${val.toFixed(2)}°`;
+          document.getElementById(`val-${j.name}`).innerText = `${val.toFixed(2)}${j.unit || "°"}`;
           const range = j.max - j.min;
           const pct = Math.max(0, Math.min(100, ((val - j.min) / range) * 100));
           document.getElementById(`bar-${j.name}`).style.width = `${pct}%`;
@@ -1150,8 +1168,11 @@ class WebRequestHandler(BaseHTTPRequestHandler):
 
                 if st and st.positions:
                     for k in SO101_JOINT_NAMES:
-                        val = st.positions.get(k, 0.0)
-                        joints_deg[k] = round(rad_to_deg(val) if st.unit == JointUnit.RADIAN else val, 2)
+                        val = float(st.positions.get(k, 0.0))
+                        if k == SO101_GRIPPER_JOINT_NAME or st.unit != JointUnit.RADIAN:
+                            joints_deg[k] = round(val, 2)
+                        else:
+                            joints_deg[k] = round(rad_to_deg(val), 2)
             except Exception:
                 pass
 
@@ -1316,7 +1337,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             return
 
         if key == " ":
-            _GLOBAL_API.trigger_emergency_stop("键盘空格触发急停")
+            _GLOBAL_API.request_estop("键盘空格触发急停")
             add_web_log("🛑 键盘拍下空格键触发急停！")
             self.send_json({"ok": True, "message": "急停已触发"})
             return
@@ -1335,30 +1356,31 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             return
 
         pos = dict(st.positions)
-        step_rad = deg_to_rad(2.5)
-        step_gripper = deg_to_rad(4.0)
+        arm_step = 2.5 if st.unit == JointUnit.DEGREE else deg_to_rad(2.5)
+        wrist_roll_step = 3.5 if st.unit == JointUnit.DEGREE else deg_to_rad(3.5)
+        step_gripper = 4.0  # RANGE_0_100 百分比 (%)
 
-        # 按键映射
+        # 按键映射 (shoulder_pan 与 URDF -Z 对齐: a 左转减, d 右转加)
         if key == "a":
-            pos["shoulder_pan"] = pos.get("shoulder_pan", 0.0) + step_rad
+            pos["shoulder_pan"] = pos.get("shoulder_pan", 0.0) - arm_step
         elif key == "d":
-            pos["shoulder_pan"] = pos.get("shoulder_pan", 0.0) - step_rad
+            pos["shoulder_pan"] = pos.get("shoulder_pan", 0.0) + arm_step
         elif key == "w":
-            pos["shoulder_lift"] = pos.get("shoulder_lift", 0.0) - step_rad
+            pos["shoulder_lift"] = pos.get("shoulder_lift", 0.0) - arm_step
         elif key == "s":
-            pos["shoulder_lift"] = pos.get("shoulder_lift", 0.0) + step_rad
+            pos["shoulder_lift"] = pos.get("shoulder_lift", 0.0) + arm_step
         elif key == "r":
-            pos["elbow_flex"] = pos.get("elbow_flex", 0.0) - step_rad
+            pos["elbow_flex"] = pos.get("elbow_flex", 0.0) - arm_step
         elif key == "f":
-            pos["elbow_flex"] = pos.get("elbow_flex", 0.0) + step_rad
+            pos["elbow_flex"] = pos.get("elbow_flex", 0.0) + arm_step
         elif key == "u":
-            pos["wrist_roll"] = pos.get("wrist_roll", 0.0) - deg_to_rad(3.5)
+            pos["wrist_roll"] = pos.get("wrist_roll", 0.0) - wrist_roll_step
         elif key == "i":
-            pos["wrist_roll"] = pos.get("wrist_roll", 0.0) + deg_to_rad(3.5)
+            pos["wrist_roll"] = pos.get("wrist_roll", 0.0) + wrist_roll_step
         elif key == "c":
-            pos["gripper"] = pos.get("gripper", 0.0) + step_gripper
+            pos["gripper"] = clamp_gripper_pct(pos.get("gripper", 0.0) + step_gripper)
         elif key == "v":
-            pos["gripper"] = pos.get("gripper", 0.0) - step_gripper
+            pos["gripper"] = clamp_gripper_pct(pos.get("gripper", 0.0) - step_gripper)
         else:
             self.send_json({"ok": False, "message": f"未知按键: {key}"})
             return
@@ -1368,7 +1390,8 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             source=ControlSource.KEYBOARD,
             timestamp=time.monotonic(),
             target_joint_positions=pos,
-            unit=JointUnit.RADIAN,
+            unit=st.unit,
+            gripper_unit=JointUnit.RANGE_0_100,
         )
         ok, reason = _GLOBAL_API.submit_action(action)
         self.send_json({"ok": ok, "message": reason})
@@ -1459,7 +1482,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         global _TELEOP_RUNNING
         _TELEOP_RUNNING = False
         if _GLOBAL_API is not None:
-            _GLOBAL_API.trigger_emergency_stop("Web 前端触发急停")
+            _GLOBAL_API.request_estop("Web 前端触发急停")
             add_web_log("🛑 Web 前端拍下紧急停止按钮！")
         self.send_json({"ok": True, "message": "急停已触发"})
 
@@ -1481,11 +1504,12 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def run_web_server(port: int = 8080, mock: bool = False, follower_port: str = "/dev/ttyACM0") -> int:
+def run_web_server(port: int = 8080, mock: bool = False, follower_port: str | None = None) -> int:
     """初始化硬件并启动 Web 控制中心服务."""
     global _GLOBAL_API, _GLOBAL_RUNNER, _CAMERA_STREAMER
 
     cfg = get_config()
+    follower_port = follower_port or cfg.follower.port
     print("=" * 66)
     print("      SO-ARM101 具身机械臂极速控制中心 (Web Cockpit V2.0)")
     print("=" * 66)
@@ -1560,7 +1584,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SO-ARM101 极速原型 Web 控制中心")
     parser.add_argument("--port", type=int, default=8080, help="Web 监听端口 (默认 8080)")
     parser.add_argument("--mock", action="store_true", help="启用虚拟仿真模式 (无须插硬件)")
-    parser.add_argument("--follower-port", default="/dev/ttyACM0", help="从臂端口")
+    parser.add_argument("--follower-port", default=None, help="从臂端口 (默认从全局配置解析)")
     args = parser.parse_args()
 
     sys.exit(run_web_server(port=args.port, mock=args.mock, follower_port=args.follower_port))
