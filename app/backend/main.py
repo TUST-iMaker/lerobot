@@ -359,7 +359,7 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
                 rt.config.wrist_camera_id = wrist_cam or "none"
 
         saved_env = rt.config.save_device_overrides(persist_env=req.persist_env)
-        probe_data = await asyncio.to_thread(rt.hardware.probe)
+        probe_data = await asyncio.to_thread(rt.hardware.probe, auto_match=bool(req.auto_detect))
         probe_data["robot_profile"] = rt.config.load_robot_profile()
         probe_data["saved_env"] = saved_env
         probe_data["persisted_to_env"] = req.persist_env

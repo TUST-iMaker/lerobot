@@ -391,6 +391,128 @@ class RemoteVLAPolicyAdapter(ToolAdapter):
         ]
 
 
+RECOMMENDED_OPEN_SOURCE_DATASETS: list[dict[str, Any]] = [
+    {
+        "repo_id": "huanianxia/b601rs_open_the_drawer_put_the_block_inside_then_close_the_drawer_20261116_001",
+        "task": "打开抽屉、放入方块并关闭抽屉（B601-RS 复合长程任务）",
+        "stats": "B601-RS 社区数据集",
+        "format": "LeRobot v3",
+        "stars": "★★★★★",
+        "hf_url": "https://huggingface.co/datasets/huanianxia/b601rs_open_the_drawer_put_the_block_inside_then_close_the_drawer_20261116_001",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset?path=/huanianxia/b601rs_open_the_drawer_put_the_block_inside_then_close_the_drawer_20261116_001/episode_0",
+    },
+    {
+        "repo_id": "rebot-b601-t1-pick-place",
+        "task": "抓取方块并放入盒子",
+        "stats": "50 条、43,607 帧",
+        "format": "LeRobot v3",
+        "stars": "★★★★★",
+        "hf_url": "https://huggingface.co/datasets?search=rebot-b601-t1-pick-place",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+    },
+    {
+        "repo_id": "rebot_b601_rs_single_arm_block_stacking",
+        "task": "抓取并堆叠不同颜色的方块",
+        "stats": "60 条、35,185 帧",
+        "format": "LeRobot v3",
+        "stars": "★★★★★",
+        "hf_url": "https://huggingface.co/datasets?search=rebot_b601_rs_single_arm_block_stacking",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+    },
+    {
+        "repo_id": "rebot_cube",
+        "task": "方块操作",
+        "stats": "50 条、20,948 帧",
+        "format": "LeRobot v3",
+        "stars": "★★★★★",
+        "hf_url": "https://huggingface.co/datasets?search=rebot_cube",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+    },
+    {
+        "repo_id": "rebot-b601-t2-language-squares",
+        "task": "根据语言指令放置方块",
+        "stats": "60 条、47,352 帧",
+        "format": "LeRobot v3",
+        "stars": "★★★★",
+        "hf_url": "https://huggingface.co/datasets?search=rebot-b601-t2-language-squares",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+    },
+    {
+        "repo_id": "rebot_mini_towel_folding2",
+        "task": "折叠小毛巾",
+        "stats": "100 条、134,963 帧",
+        "format": "LeRobot",
+        "stars": "★★★",
+        "hf_url": "https://huggingface.co/datasets?search=rebot_mini_towel_folding2",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+    },
+    {
+        "repo_id": "rebot_shakehands",
+        "task": "机械臂握手",
+        "stats": "100 条",
+        "format": "LeRobot v2",
+        "stars": "★★★",
+        "hf_url": "https://huggingface.co/datasets?search=rebot_shakehands",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+    },
+]
+
+
+class OpenSourceDatasetHubAdapter(ToolAdapter):
+    id = "open_source_datasets"
+    name = "B601-RS / LeRobot 开源数据集推荐库"
+    category = "datasets"
+    description = (
+        "内置 7 个精选 LeRobot / B601-RS 开源数据集（含抽屉抓取、堆叠、语言指令、折毛巾、握手），"
+        "支持一键直达 Hugging Face / 官方在线 Visualizer 或启动本地 lerobot-dataset-viz 检视。"
+    )
+    os_support = ("Windows", "Linux", "Darwin")
+    default_url = "https://huggingface.co/spaces/lerobot/visualize_dataset"
+
+    def probe(self) -> dict[str, Any]:
+        has_lerobot = importlib.util.find_spec("lerobot") is not None
+        has_datasets = importlib.util.find_spec("datasets") is not None
+        has_viz = (importlib.util.find_spec("rerun") is not None) or (
+            importlib.util.find_spec("foxglove") is not None
+        )
+        local_viz_ready = has_lerobot and has_datasets and has_viz
+        status = "running" if self.is_running() else "stopped"
+        hint = (
+            None
+            if local_viz_ready
+            else "在线可视化可直接点击条目链接；若需本地 Rerun 检视请运行 `setup_win.ps1 -WithCoreScripts`。"
+        )
+        return {
+            "id": self.id,
+            "name": self.name,
+            "category": self.category,
+            "status": status,
+            "available": True,
+            "local_viz_ready": local_viz_ready,
+            "os_supported": True,
+            "os_support": list(self.os_support),
+            "url": self.default_url,
+            "pid": self.pid(),
+            "description": self.description,
+            "install_hint": hint,
+            "datasets": RECOMMENDED_OPEN_SOURCE_DATASETS,
+        }
+
+    def build_launch_cmd(self, args: dict[str, Any]) -> list[str]:
+        repo_id = str(
+            args.get("repo_id")
+            or RECOMMENDED_OPEN_SOURCE_DATASETS[0]["repo_id"]
+        )
+        episode = int(args.get("episode_index") or 0)
+        return [
+            sys.executable,
+            "-m",
+            "lerobot.scripts.lerobot_dataset_viz",
+            f"--repo-id={repo_id}",
+            f"--episode-index={episode}",
+        ]
+
+
 class PluginRegistry:
     """Registry of extensible ToolAdapter instances."""
 
@@ -407,6 +529,7 @@ class PluginRegistry:
             LeRobotStudioAdapter,
             LeLabExternalAdapter,
             RemoteVLAPolicyAdapter,
+            OpenSourceDatasetHubAdapter,
         ):
             adapter = cls(config, hardware, process_registry)
             self._adapters[adapter.id] = adapter

@@ -809,12 +809,52 @@ async function refreshPlugins() {
           ? `<span class="chip chip-ok">运行中 (PID ${p.pid})</span>`
           : `<span class="chip">${p.status}</span>`;
       const hint = p.install_hint ? `<p class="muted mt-12">${p.install_hint}</p>` : "";
+      let datasetsHtml = "";
+      if (Array.isArray(p.datasets) && p.datasets.length > 0) {
+        const rows = p.datasets
+          .map(
+            (ds) => `
+            <tr>
+              <td class="joint-values" style="word-break:break-all;"><code>${ds.repo_id}</code></td>
+              <td>${ds.task}</td>
+              <td>${ds.stats}</td>
+              <td><span class="chip">${ds.format}</span></td>
+              <td>${ds.stars}</td>
+              <td>
+                <div class="btn-group">
+                  <a class="btn btn-xs btn-secondary" href="${ds.hf_url}" target="_blank" rel="noopener">HF 页面</a>
+                  <a class="btn btn-xs btn-secondary" href="${ds.visualizer_url}" target="_blank" rel="noopener">在线可视化</a>
+                  <button type="button" class="btn btn-xs btn-primary btn-dataset-viz" data-plugin="${p.id}" data-repo="${ds.repo_id}">本地检视</button>
+                </div>
+              </td>
+            </tr>`
+          )
+          .join("");
+        datasetsHtml = `
+          <div class="table-wrap mt-12">
+            <table>
+              <thead>
+                <tr>
+                  <th>数据集 (repo_id)</th>
+                  <th>任务</th>
+                  <th>数据量</th>
+                  <th>格式</th>
+                  <th>推荐</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>`;
+      }
+      const spanStyle = datasetsHtml ? ' style="grid-column: 1 / -1;"' : "";
       return `
-        <div class="card" data-plugin-id="${p.id}">
+        <div class="card" data-plugin-id="${p.id}"${spanStyle}>
           <h3>${p.name}</h3>
           <div class="chip-row">${availBadge}${osBadge}${statusBadge}</div>
           <p class="muted mt-12">${p.description}</p>
           ${hint}
+          ${datasetsHtml}
           <div class="btn-group mt-12">
             <button type="button" class="btn btn-primary btn-plugin-launch" data-id="${p.id}">启动插件</button>
             <button type="button" class="btn btn-danger btn-plugin-stop" data-id="${p.id}">停止</button>
@@ -823,6 +863,19 @@ async function refreshPlugins() {
       `;
     })
     .join("");
+
+  container.querySelectorAll(".btn-dataset-viz").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.plugin;
+      const repo_id = btn.dataset.repo;
+      const r = await apiFetch(`/api/plugins/${id}/launch`, {
+        method: "POST",
+        body: JSON.stringify({ args: { repo_id, episode_index: 0 } }),
+      });
+      if (r.ok) appendLocalLog(`已启动本地可视化检视数据集: ${repo_id}`);
+      await refreshPlugins();
+    });
+  });
 
   container.querySelectorAll(".btn-plugin-launch").forEach((btn) => {
     btn.addEventListener("click", async () => {

@@ -408,7 +408,17 @@ class WorkflowManager:
             return
 
         self.log(line)
-        if "[CAL_PROMPT]" in line:
+        low_line = line.lower()
+        if "[CAL_STAGE]" in line:
+            stage_info = line.split("[CAL_STAGE]", 1)[1].strip()
+            if stage_info.startswith("connecting_bus"):
+                self._cal_state["prompt"] = (
+                    f"正在握手并配置 {self._cal_state.get('target', 'arm')} "
+                    f"({self._cal_state.get('port', '')}) 总线，请稍候..."
+                )
+            elif stage_info.startswith("torque_disabled"):
+                self._cal_state["prompt"] = "已连接总线并安全释放舵机扭矩（机械臂已松弛），正在进入标定引导..."
+        elif "[CAL_PROMPT]" in line:
             raw_prompt = line.split("[CAL_PROMPT]", 1)[1].strip()
             low = raw_prompt.lower()
             self._cal_state["waiting_for_input"] = True
@@ -430,6 +440,22 @@ class WorkflowManager:
                 self._cal_state["stage"] = "waiting_input"
                 self._cal_state["allow_recalibrate"] = False
                 self._cal_state["prompt"] = raw_prompt
+        elif "move the joints to the middle" in low_line or "middle of their range" in low_line:
+            self._cal_state["stage"] = "waiting_middle"
+            self._cal_state["waiting_for_input"] = True
+            self._cal_state["allow_recalibrate"] = False
+            self._cal_state["prompt"] = (
+                "第 1 步（中位归零）：请用手将机械臂所有关节摆到活动范围正中间，"
+                "然后点击【确认 / 下一步 (Enter)】。"
+            )
+        elif "press enter to use provided calibration file" in low_line:
+            self._cal_state["stage"] = "existing_file_prompt"
+            self._cal_state["waiting_for_input"] = True
+            self._cal_state["allow_recalibrate"] = True
+            self._cal_state["prompt"] = (
+                "检测到已有标定文件：点击【确认 / 下一步 (Enter)】直接写入电机，"
+                "或点击【重新标定 (c)】重新采集。"
+            )
         elif "Recording positions" in line or "Press ENTER to stop" in line:
             self._cal_state["stage"] = "recording_range"
             self._cal_state["waiting_for_input"] = True
@@ -443,6 +469,13 @@ class WorkflowManager:
             self._cal_state["waiting_for_input"] = False
             self._cal_state["saved_path"] = line.split("Calibration saved to", 1)[1].strip()
             self._cal_state["prompt"] = f"标定成功！已保存到 {self._cal_state['saved_path']}"
+        elif any(
+            err_tok in line
+            for err_tok in ("ConnectionError:", "OSError:", "TimeoutError:", "RuntimeError:", "ValueError:")
+        ):
+            self.last_error = line
+            if self._cal_state.get("stage") == "connecting":
+                self._cal_state["prompt"] = f"连接或配置失败：{line}"
 
     async def start_calibrate(
         self,
@@ -618,6 +651,19 @@ class WorkflowManager:
 
     async def stop_calibrate(self) -> dict[str, Any]:
         if self.active_workflow == "calibrate":
+            # Close stdin pipe first so calibrate_runner catches EOFError and runs device.disconnect()
+            # (cleanly disabling servo torque instead of leaving the follower arm stiff/locked).
+            if self._active_proc_id is not None:
+                managed = self.process_registry.get(self._active_proc_id)
+                if managed is not None and managed.proc.stdin is not None:
+                    try:
+                        managed.proc.stdin.close()
+                    except Exception:
+                        pass
+                    for _ in range(8):
+                        if managed.proc.poll() is not None:
+                            break
+                        await asyncio.sleep(0.1)
             self._stop_active_process()
             await self._cancel_background_task()
             self._dry_cal_queue = None
@@ -626,6 +672,7 @@ class WorkflowManager:
             self._cal_state["active"] = False
             self._cal_state["waiting_for_input"] = False
             self._cal_state["stage"] = "stopped"
+            self._cal_state["prompt"] = "标定已停止（已释放舵机扭矩）。"
             self.log("Calibration stopped.")
         return {"status": "stopped", "workflow": "calibrate"}
 

@@ -418,11 +418,11 @@ class HardwareManager:
             "leader_file": str(leader_file),
         }
 
-    def probe(self) -> dict[str, Any]:
+    def probe(self, *, auto_match: bool = True) -> dict[str, Any]:
         """Run complete hardware + capability probe and update active mode if auto."""
         serial_ports = self.probe_serial_ports()
         cameras = self.probe_cameras()
-        auto_matched = self.auto_match_devices(serial_ports, cameras, force=False)
+        auto_matched = self.auto_match_devices(serial_ports, cameras, force=False) if auto_match else False
         os_capabilities = self.probe_capabilities()
         lerobot_available = bool(os_capabilities["packages"]["lerobot"])
 
