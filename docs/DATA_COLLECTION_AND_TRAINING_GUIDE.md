@@ -10,7 +10,7 @@
 
 ```powershell
 # 补装 datasets / parquet / 视频读写依赖（录制与回放必需）
-envs\win\lerobot\Scripts\python.exe -m pip install -e "repos/lerobot[dataset]"
+uv pip install --python envs\win\lerobot\Scripts\python.exe -e "repos/lerobot[dataset]"
 
 # 验证安装成功（无报错即 OK）
 envs\win\lerobot\Scripts\lerobot-replay.exe --help

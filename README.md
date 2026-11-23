@@ -22,7 +22,7 @@ python scripts/common/bootstrap_repos.py
 powershell -ExecutionPolicy Bypass -File scripts\windows\setup_win.ps1
 
 # 2. （可选）补装官方 lerobot-record / lerobot-replay 所需的 datasets 依赖
-envs\win\lerobot\Scripts\python.exe -m pip install -e "repos/lerobot[dataset]"
+uv pip install --python envs\win\lerobot\Scripts\python.exe -e "repos/lerobot[dataset]"
 
 # 3. 扫描已接主/从臂 COM 口与摄像头索引
 powershell -ExecutionPolicy Bypass -File scripts\windows\find_ports.ps1
@@ -102,7 +102,7 @@ python scripts/common/bootstrap_repos.py
 powershell -ExecutionPolicy Bypass -File scripts\windows\setup_win.ps1
 
 # 如需官方 lerobot-record / lerobot-replay 数据集读写，补装 dataset 依赖：
-envs\win\lerobot\Scripts\python.exe -m pip install -e "repos/lerobot[dataset]"
+uv pip install --python envs\win\lerobot\Scripts\python.exe -e "repos/lerobot[dataset]"
 
 # 扫描主/从臂 COM 口与摄像头索引
 powershell -ExecutionPolicy Bypass -File scripts\windows\find_ports.ps1
