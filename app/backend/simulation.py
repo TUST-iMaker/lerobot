@@ -315,7 +315,10 @@ class Arm101Simulator:
         self._lock = threading.RLock()
         self.leader_joints: dict[str, float] = default_joints()
         self.follower_joints: dict[str, float] = default_joints()
+        # Separate commanded target from measured encoder feedback to prevent PD gravity-droop ratchet
+        self.follower_cmd_joints: dict[str, float] | None = None
         self.linked_arms: bool = True
+        self.real_leader_active: bool = False
         self.torque_enabled: bool = True
         self.estop_latched: bool = False
         self.max_step_deg: float = 15.0
@@ -342,14 +345,25 @@ class Arm101Simulator:
             if step_immediately and self.linked_arms and not self.estop_latched:
                 self.step(0.05)
 
-    def set_follower_joints(self, updates: dict[str, float]) -> None:
+    def set_follower_joints(
+        self,
+        updates: dict[str, float],
+        *,
+        from_real_feedback: bool = False,
+    ) -> None:
         with self._lock:
-            if self.estop_latched:
+            if self.estop_latched and not from_real_feedback:
                 return
             for name, val in updates.items():
                 if name in JOINT_SPECS:
                     self.follower_joints[name] = round(float(val), 3)
+            if not from_real_feedback:
+                self.follower_cmd_joints = dict(self.follower_joints)
             self.step_count += 1
+
+    def clear_follower_cmd_target(self) -> None:
+        with self._lock:
+            self.follower_cmd_joints = None
 
     def set_arm_joints(
         self,
@@ -379,7 +393,8 @@ class Arm101Simulator:
         with self._lock:
             if self.estop_latched:
                 raise RuntimeError("急停已锁定 (E-STOP)，请先点击解除急停。")
-            cur = dict(self.follower_joints)
+            # Start incremental step from last commanded target (not gravity-drooped present_position)
+            cur = dict(self.follower_cmd_joints or self.follower_joints)
             fk = compute_fk_details(cur)
             tcp = fk["tcp_pose"]
 
@@ -414,7 +429,17 @@ class Arm101Simulator:
                 elif k == "s":
                     r_tgt, z_tgt = max(65.0, r_now - step_mm), z_now
                 elif k in ("q", "r"):
-                    r_tgt, z_tgt = r_now, z_now + step_mm
+                    z_tgt = min(505.0, z_now + step_mm)
+                    # Spherical workspace sliding: when stretched near outer shell (R_max ~ 400mm from shoulder (69.2, 116.6)),
+                    # smoothly pull r_tgt inward along the reachable sphere so Q climbs monotonically instead of stalling.
+                    sh_r, sh_z, r_safe = 69.2, 116.6, 398.0
+                    dz_sh = z_tgt - sh_z
+                    dr_sh = max(0.0, r_now - sh_r)
+                    if dr_sh * dr_sh + dz_sh * dz_sh > r_safe * r_safe:
+                        max_dr = math.sqrt(max(0.0, r_safe * r_safe - dz_sh * dz_sh))
+                        r_tgt = max(65.0, sh_r + max_dr)
+                    else:
+                        r_tgt = r_now
                 else:
                     r_tgt, z_tgt = r_now, max(20.0, z_now - step_mm)
 
@@ -435,7 +460,8 @@ class Arm101Simulator:
                 raise ValueError(f"Unsupported control key '{key}'.")
 
             self.follower_joints = cur
-            if self.linked_arms:
+            self.follower_cmd_joints = dict(cur)
+            if self.linked_arms and not self.real_leader_active:
                 self.leader_joints = dict(cur)
             self.step_count += 1
             return {
