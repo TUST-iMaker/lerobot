@@ -125,10 +125,11 @@ export function computeStickFK(joints) {
 
   const pts = {
     base: [0, 0, 0],
-    shoulder: nodePosMm.shoulder_lift || [0, 0, 116.6],
-    elbow: nodePosMm.elbow_flex || [0, 0, 229.2],
-    wrist: nodePosMm.wrist_flex || [171.3, 0, 229.2],
-    wristRoll: nodePosMm.wrist_roll || [232.4, 0, 229.2],
+    shoulderPan: nodePosMm.shoulder_pan || [38.8, 0, 62.4],
+    shoulder: nodePosMm.shoulder_lift || [69.2, 18.3, 116.6],
+    elbow: nodePosMm.elbow_flex || [97.2, 18.3, 229.2],
+    wrist: nodePosMm.wrist_flex || [232.1, 18.3, 234.4],
+    wristRoll: nodePosMm.wrist_roll || [293.2, 0.2, 234.4],
     tcp: nodePosMm.gripper_frame_joint,
   };
 
@@ -631,8 +632,15 @@ export class StickArmCanvas {
   _drawArmSkeleton(fk, w, h, { ghost = false } = {}) {
     const ctx = this.ctx;
     const isDark = this._isDarkTheme();
-    const pBase = this._project(fk.pts.base, w, h);
-    const pSh = this._project(fk.pts.shoulder, w, h);
+    const pan3 = fk.pts.shoulderPan || [38.8, 0, 62.4];
+    const sh3 = fk.pts.shoulder;
+    // Grounded upright base pedestal directly under #1 shoulder_pan axis (matches real SO-ARM101 vertical base)
+    const baseFoot3 = [pan3[0], pan3[1], 0];
+    const shFoot3 = [sh3[0], sh3[1], pan3[2]];
+    const pBase = this._project(baseFoot3, w, h);
+    const pPan = this._project(pan3, w, h);
+    const pShFoot = this._project(shFoot3, w, h);
+    const pSh = this._project(sh3, w, h);
     const pEl = this._project(fk.pts.elbow, w, h);
     const pWr = this._project(fk.pts.wrist, w, h);
     const pTcp = this._project(fk.pts.tcp, w, h);
@@ -645,18 +653,21 @@ export class StickArmCanvas {
       ctx.strokeStyle = isDark ? "#475569" : "#94A3B8";
       ctx.lineWidth = 1.2;
       ctx.beginPath();
-      ctx.ellipse(pBase.x, pBase.y + 4, 22 * zScale, 8 * zScale, 0, 0, Math.PI * 2);
+      ctx.ellipse(pBase.x, pBase.y + 4, 24 * zScale, 9 * zScale, 0, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
 
       ctx.fillStyle = isDark ? "#64748B" : "#334155";
       ctx.beginPath();
-      ctx.ellipse(pBase.x, pBase.y, 12 * zScale, 4.5 * zScale, 0, 0, Math.PI * 2);
+      ctx.ellipse(pBase.x, pBase.y, 13 * zScale, 5 * zScale, 0, 0, Math.PI * 2);
       ctx.fill();
     }
 
     const isLeader = this.role === "leader";
-    this._drawCylinderLink(pBase, pSh, 9.5 * zScale, "#475569", "#94A3B8", "#1E293B", ghost);
+    // Upright base column + turret bracket -> upright shoulder post (no crooked diagonal base stick)
+    this._drawCylinderLink(pBase, pPan, 10.5 * zScale, "#475569", "#94A3B8", "#1E293B", ghost);
+    this._drawCylinderLink(pPan, pShFoot, 8.5 * zScale, "#475569", "#94A3B8", "#1E293B", ghost);
+    this._drawCylinderLink(pShFoot, pSh, 9.0 * zScale, "#475569", "#94A3B8", "#1E293B", ghost);
     this._drawCylinderLink(
       pSh,
       pEl,

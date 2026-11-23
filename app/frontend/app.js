@@ -541,12 +541,116 @@ function setModeUI(mode) {
     badge.textContent = mode === "real" ? "MODE: REAL" : "MODE: DRY-RUN";
     badge.className = "sb-item";
   }
+  renderReadinessState();
+}
+
+function renderReadinessState() {
+  const pill = $("readiness-pill");
+  const pillDot = $("readiness-pill-dot");
+  const pillText = $("readiness-pill-text");
+  const card = $("readiness-card");
+  const cardDot = $("readiness-card-dot");
+  const cardTitle = $("readiness-card-title");
+  const cardDesc = $("readiness-card-desc");
+  const btn = $("btn-readiness-action");
+
+  const isReal = state.mode === "real";
+  const wf = state.activeWorkflow || "idle";
+  const dir = state.syncDirection || "off";
+
+  let level = "ready"; // ready | info | warn | danger
+  let pillLabel = "仿真就绪";
+  let title = "系统已准备就绪 · 仿真可直接操控";
+  let desc = "当前为 dry_run 仿真模式：拖动左侧 3D 红圈、右侧滑块或 WASD/QE 均会立即生效，不会驱动真机。";
+  let actionLabel = "前往 3. 仿真控臂";
+  let actionType = "tab_sim";
+
+  if (state.estopLatched) {
+    level = "danger";
+    pillLabel = "急停锁定";
+    title = "急停已锁定 · 当前不可操控";
+    desc = "所有真机与仿真运动均已切断。请确认桌面安全后点击「解除急停」恢复。";
+    actionLabel = "解除急停";
+    actionType = "reset_estop";
+  } else if (wf === "calibrate") {
+    level = "warn";
+    pillLabel = "标定进行中";
+    title = "正在执行零点标定 · 红圈 IK 已临时禁用";
+    desc = isReal
+      ? "真机舵机已释放扭矩，请按下方提示摆正大臂竖直、小臂水平向前（中位）并逐步完成标定。"
+      : "模拟标定期间请使用标定卡片内的 6 轴滑块或「一键对齐中位」，完成后再切回正常控臂。";
+    actionLabel = "查看标定步骤";
+    actionType = "tab_dashboard";
+  } else if (isReal) {
+    if (dir === "teleop_bidirectional") {
+      level = "ready";
+      pillLabel = "真机双向就绪";
+      title = "真机双向联动就绪 · 真机与仿真实时同步";
+      desc = "用手移动主臂会实时带动从臂与 3D 画面；在界面拖动滑块、红圈或按 WASD/QE 也会直接驱动真机从臂。";
+      actionLabel = "前往 2. 遥操作";
+      actionType = "tab_teleop";
+    } else if (dir === "sim_to_real") {
+      level = "ready";
+      pillLabel = "仿真→真机就绪";
+      title = "真机驱动已就绪 · 界面操作将带动真机";
+      desc = "拖动 3D 红圈、滑块、WASD/QE 或执行示教回放都会实时驱动真机从臂，并回读编码器更新画面。";
+      actionLabel = "前往 3. 仿真控臂";
+      actionType = "tab_sim";
+    } else if (dir === "real_to_sim") {
+      level = "info";
+      pillLabel = "真机→仿真监听中";
+      title = "自由示教 / 只读同步中 · 掰动真机→3D 跟随";
+      desc = "从臂扭矩已释放，用手掰动真机会实时带动 3D 仿真，可直接记录示教点；点「点击上力」或回放即可切回驱动。";
+      actionLabel = "前往 4. 示教记录";
+      actionType = "tab_teaching";
+    } else {
+      level = "warn";
+      pillLabel = "真机待命（未同步）";
+      title = "真机已连接但未开启同步 · 掰动真机暂不会带动 3D";
+      desc = "当前处于待命：点击右侧按钮可立即开启「真机→仿真」实时读回（掰真机即动 3D），或进入「2. 遥操作」开启双向联动。";
+      actionLabel = "开启真机→仿真实时同步";
+      actionType = "enable_real_to_sim";
+    }
+  } else if (wf === "teleop") {
+    level = "ready";
+    pillLabel = "仿真遥操作中";
+    title = "仿真遥操作运行中 · 主从臂已就绪";
+    desc = "拖动主臂红圈或滑块会同步带动从臂；如需单独调节从臂，取消勾选「主从联动」即可。";
+    actionLabel = "前往 2. 遥操作";
+    actionType = "tab_teleop";
+  } else if (state.linkedArms) {
+    desc = "当前「主从联动」已开启：请拖动主臂（Leader）红圈或滑块控臂，从臂会自动跟随；取消联动可单独控从臂。";
+  }
+
+  const dotClass =
+    level === "danger"
+      ? "status-dot dot-danger"
+      : level === "warn"
+      ? "status-dot dot-warn"
+      : level === "info"
+      ? "status-dot dot-ok"
+      : "status-dot dot-ok";
+
+  if (pill) pill.className = `readiness-pill pill-${level}`;
+  if (pillDot) pillDot.className = dotClass;
+  if (pillText) pillText.textContent = pillLabel;
+  if (card) card.className = `card readiness-card state-${level}`;
+  if (cardDot) cardDot.className = dotClass;
+  if (cardTitle) cardTitle.textContent = title;
+  if (cardDesc) cardDesc.textContent = desc;
+  if (btn) {
+    btn.textContent = actionLabel;
+    btn.dataset.actionType = actionType;
+  }
 }
 
 function updateSafetyUI(safety) {
   if (!safety) return;
   state.torqueEnabled = Boolean(safety.torque_enabled);
   state.estopLatched = Boolean(safety.estop_latched);
+  if (safety.sync_direction !== undefined) {
+    state.syncDirection = safety.sync_direction || "off";
+  }
 
   const tBadge = $("torque-badge");
   if (tBadge) {
@@ -575,6 +679,7 @@ function updateSafetyUI(safety) {
   if (btnReset) {
     btnReset.hidden = !state.estopLatched;
   }
+  renderReadinessState();
 }
 
 function updateConnectionBadge(conn) {
@@ -1133,6 +1238,28 @@ async function refreshWaypoints() {
     .join("");
 }
 
+async function refreshLinearTrajectories() {
+  const res = await apiFetch("/api/workflows/teaching/linear/list");
+  const sel = $("linear-traj-select");
+  if (!res.ok || !sel) return;
+  const items = res.data.trajectories || [];
+  const prev = sel.value;
+  if (!items.length) {
+    sel.innerHTML = '<option value="">暂无已录制连续轨迹</option>';
+    return;
+  }
+  sel.innerHTML = items
+    .map((t) => {
+      const val = JSON.stringify({ name: t.name, episode: t.episode, fps: t.fps });
+      const tag = t.mode === "real" ? "真机" : "仿真";
+      return `<option value='${val.replace(/'/g, "&apos;")}'>[${tag}] ${t.name} (ep${t.episode} · ${t.frames}帧 @ ${t.fps}Hz)</option>`;
+    })
+    .join("");
+  if (prev && Array.from(sel.options).some((o) => o.value === prev)) {
+    sel.value = prev;
+  }
+}
+
 async function replayEpisodeOnStick(dataset, episodeIndex) {
   if (state.epReplayTimer) {
     clearInterval(state.epReplayTimer);
@@ -1641,7 +1768,10 @@ function initTabs() {
       }
 
       refreshCameraImagesOnce(false);
-      if (target === "teaching") refreshWaypoints();
+      if (target === "teaching") {
+        refreshWaypoints();
+        refreshLinearTrajectories();
+      }
       if (target === "collect") {
         validateCollectSpecUI();
         refreshEpisodes();
@@ -1700,12 +1830,14 @@ function connectTelemetryBus() {
       const prevWf = state.activeWorkflow;
       const wf = msg.active_workflow || "idle";
       state.activeWorkflow = wf;
-      if (prevWf === "collect" && wf === "idle") {
+      if ((prevWf === "collect" || prevWf === "linear_teach") && wf === "idle") {
         refreshEpisodes();
+        refreshLinearTrajectories();
       }
       if (prevWf !== wf) {
         updateTeleopButtonsUI();
         syncArmControlMutexUI();
+        renderReadinessState();
       }
       const wfPill = $("workflow-pill");
       if (wfPill) {
@@ -1715,6 +1847,7 @@ function connectTelemetryBus() {
       if (typeof msg.linked_arms === "boolean" && msg.linked_arms !== state.linkedArms) {
         state.linkedArms = msg.linked_arms;
         syncArmControlMutexUI();
+        renderReadinessState();
       }
       if (msg.safety) updateSafetyUI(msg.safety);
       if (msg.connection_status) updateConnectionBadge(msg.connection_status);
@@ -1857,6 +1990,38 @@ function bindActions() {
       }
     } else if (res.detail) {
       showFeedbackToast(res.detail, "warn");
+    }
+  });
+
+  $("readiness-pill")?.addEventListener("click", () => {
+    document.querySelector('.nav-item[data-tab="dashboard"]')?.click();
+  });
+
+  $("btn-readiness-action")?.addEventListener("click", async () => {
+    const action = $("btn-readiness-action")?.dataset.actionType || "tab_sim";
+    if (action === "reset_estop") {
+      await apiFetch("/api/safety/reset", { method: "POST" });
+      showFeedbackToast("急停已解除", "ok");
+    } else if (action === "enable_real_to_sim") {
+      const res = await apiFetch("/api/sim/sync-mode", {
+        method: "POST",
+        body: JSON.stringify({ direction: "real_to_sim", safety_confirmed: false }),
+      });
+      if (res.ok) {
+        state.syncDirection = "real_to_sim";
+        renderReadinessState();
+        showFeedbackToast("已开启真机→仿真实时同步，现在掰动真机会实时带动 3D 画面", "ok");
+      } else {
+        showAnomalyToast(res.error || "开启实时同步失败");
+      }
+    } else if (action === "tab_teleop") {
+      document.querySelector('.nav-item[data-tab="teleop"]')?.click();
+    } else if (action === "tab_teaching") {
+      document.querySelector('.nav-item[data-tab="teaching"]')?.click();
+    } else if (action === "tab_dashboard") {
+      document.querySelector('.nav-item[data-tab="dashboard"]')?.click();
+    } else {
+      document.querySelector('.nav-item[data-tab="sim"]')?.click();
     }
   });
 
@@ -2228,6 +2393,83 @@ function bindActions() {
     }
   });
 
+  $("btn-linear-teach-start")?.addEventListener("click", async () => {
+    ensureStageVisibleForAction();
+    const name = ($("linear-teach-name")?.value || "demo_linear_01").trim();
+    const duration_s = Math.max(2, Number($("linear-teach-duration")?.value || 30));
+    const statusEl = $("linear-teach-status");
+    const res = await apiFetch("/api/workflows/teaching/linear/start", {
+      method: "POST",
+      body: JSON.stringify({ name, duration_s, fps: 30 }),
+    });
+    if (res.ok) {
+      state.activeWorkflow = "linear_teach";
+      if (statusEl) {
+        statusEl.textContent = `录制中 [${res.data.mode}]: ${res.data.name} (${duration_s}s) — 请操作主臂，完成后点「停止并保存」`;
+      }
+      showFeedbackToast(`已开始连续示教录制: ${res.data.name}`, "ok");
+    } else {
+      showAnomalyToast(res.error || "启动连续示教失败");
+    }
+  });
+
+  $("btn-linear-teach-stop")?.addEventListener("click", async () => {
+    const statusEl = $("linear-teach-status");
+    const res = await apiFetch("/api/workflows/teaching/linear/stop", { method: "POST" });
+    await refreshLinearTrajectories();
+    if (res.ok) {
+      const saved = res.data?.saved;
+      if (statusEl) {
+        statusEl.textContent = saved
+          ? `已保存轨迹 ${saved.name} (${saved.frames}帧)，可点击「线性回放选中轨迹」。`
+          : "已停止连续示教并保存，可点击「线性回放选中轨迹」。";
+      }
+      showFeedbackToast("已停止并保存连续轨迹", "ok");
+    }
+  });
+
+  $("btn-linear-replay-start")?.addEventListener("click", async () => {
+    ensureStageVisibleForAction();
+    const sel = $("linear-traj-select");
+    const statusEl = $("linear-teach-status");
+    if (!sel || !sel.value) {
+      showAnomalyToast("请先录制并选择一条连续轨迹");
+      return;
+    }
+    let meta;
+    try {
+      meta = JSON.parse(sel.value);
+    } catch {
+      showAnomalyToast("轨迹选项解析失败");
+      return;
+    }
+    const res = await apiFetch("/api/workflows/teaching/linear/replay", {
+      method: "POST",
+      body: JSON.stringify({ name: meta.name, episode: meta.episode || 0, fps: meta.fps || 30 }),
+    });
+    if (res.ok) {
+      state.activeWorkflow = "linear_replay";
+      if (statusEl) {
+        statusEl.textContent = `线性回放中 [${res.data.mode}]: ${meta.name} (ep${meta.episode || 0})`;
+      }
+      showFeedbackToast(`开始线性回放: ${meta.name}`, "ok");
+    } else {
+      showAnomalyToast(res.error || "启动线性回放失败");
+    }
+  });
+
+  $("btn-linear-replay-stop")?.addEventListener("click", async () => {
+    const statusEl = $("linear-teach-status");
+    await apiFetch("/api/workflows/teaching/linear/replay/stop", { method: "POST" });
+    if (statusEl) statusEl.textContent = "已停止线性回放。";
+    showFeedbackToast("已停止线性回放", "info");
+  });
+
+  $("btn-linear-refresh")?.addEventListener("click", async () => {
+    await refreshLinearTrajectories();
+    showFeedbackToast("已刷新连续轨迹列表", "info");
+  });
+
   $("btn-teach-waypoint")?.addEventListener("click", async () => {
     const label = $("waypoint-label")?.value || "";
     const res = await apiFetch("/api/workflows/teaching/record_waypoint", {
@@ -2371,6 +2613,7 @@ async function bootstrap() {
     apiFetch("/api/hardware/probe"),
     apiFetch("/api/workflows/status"),
     refreshWaypoints(),
+    refreshLinearTrajectories(),
     refreshEpisodes(),
     refreshPlugins(),
     loadVLAConfigs(),
