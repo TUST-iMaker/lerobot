@@ -78,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         host=args.host,
         port=args.port,
         log_level="info",
+        timeout_graceful_shutdown=2,
     )
     return 0
 

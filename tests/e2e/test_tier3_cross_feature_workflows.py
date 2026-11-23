@@ -510,15 +510,16 @@ def test_t3_05_f8_f9_bridge_preemption_on_teleop_and_calibrate_start(
         wf.bridge.set_sync_mode("sim_to_real", is_real_mode=True, safety_confirmed=True)
         assert wf.bridge.connected_follower is True
         await wf.start_teleop()
-        assert wf.bridge.connected_follower is False
-        assert events and "bridge_connected=False" in events[-1]
+        # Real-mode teleop now runs in-process via bidirectional bridge (streaming real encoders to 3D sim)
+        assert wf.bridge.connected_follower is True
+        assert wf.bridge.status()["direction"] == "teleop_bidirectional"
         await wf.stop_teleop()
 
         wf.bridge.set_sync_mode("sim_to_real", is_real_mode=True, safety_confirmed=True)
         assert wf.bridge.connected_follower is True
         await wf.start_calibrate(target="follower")
         assert wf.bridge.connected_follower is False
-        assert "bridge_connected=False" in events[-1]
+        assert events and "bridge_connected=False" in events[-1]
         await wf.stop_calibrate()
 
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -751,11 +752,10 @@ def test_t3_10_f5_f7_f9_calibrate_runner_shims_and_workflow_line_parser(
     assert wf._cal_state["stage"] == "completed"
 
 
-def test_t3_11_f7_f10_package_discovery_and_web_ui_estop_with_mock_arm(
+def test_t3_11_f7_f10_package_discovery_and_action_api_estop_with_mock_arm(
     workspace_root: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """T3-11 (F7 <-> F10): Root pyproject software* package discovery + web_ui E-Stop latch/reset via ActionAPI."""
+    """T3-11 (F7 <-> F10): Root pyproject software* package discovery + ActionAPI E-Stop latch/reset."""
     data = tomllib.loads((workspace_root / "pyproject.toml").read_text(encoding="utf-8"))
     include = data.get("tool", {}).get("setuptools", {}).get("packages", {}).get("find", {}).get("include", [])
     testpaths = data.get("tool", {}).get("pytest", {}).get("ini_options", {}).get("testpaths", [])
@@ -763,7 +763,6 @@ def test_t3_11_f7_f10_package_discovery_and_web_ui_estop_with_mock_arm(
     assert "software/tests" in testpaths
 
     _ensure_paths(workspace_root)
-    import web_ui
     from core.action_api import ActionAPI
     from core.data_types import SystemState
     from hardware.config import RobotSystemConfig
@@ -772,19 +771,13 @@ def test_t3_11_f7_f10_package_discovery_and_web_ui_estop_with_mock_arm(
     adapter = RobotSystemAdapter(RobotSystemConfig.mock_system(with_leader=False))
     api = ActionAPI(hardware=adapter)
     assert api.connect(connect_leader=False) is True
-    monkeypatch.setattr(web_ui, "_GLOBAL_API", api)
-
-    responses: list[dict[str, Any]] = []
-    handler = web_ui.WebRequestHandler.__new__(web_ui.WebRequestHandler)
-    handler.send_json = lambda payload, status=200: responses.append({"status": status, "body": payload})  # type: ignore[method-assign]
 
     try:
-        handler.handle_post_estop()
-        assert responses[-1]["body"]["ok"] is True
+        api.request_estop("T3-11 test")
         assert api.state_machine.current_state == SystemState.ESTOP_LATCHED
 
-        handler.handle_post_reset()
-        assert responses[-1]["body"]["ok"] is True
+        ok, _ = api.request_reset()
+        assert ok is True
         assert api.state_machine.current_state != SystemState.ESTOP_LATCHED
     finally:
         api.disconnect(keep_torque=False, return_to_rest=False)

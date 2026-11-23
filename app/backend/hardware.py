@@ -17,6 +17,7 @@ from app.backend.config import ModeType, StudioConfig
 # Process-wide lock to serialize OpenCV / DirectShow camera access across threads.
 CAMERA_IO_LOCK = threading.Lock()
 
+os.environ.setdefault("OPENCV_LOG_LEVEL", "OFF")
 if platform.system() == "Windows":
     # Must be set before importing cv2 to prevent slow MSMF hardware transforms on Windows.
     os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
@@ -175,6 +176,8 @@ class HardwareManager:
 
         prev_level = None
         try:
+            if hasattr(cv2, "utils") and hasattr(cv2.utils, "logging"):
+                cv2.utils.logging.setLogLevel(0)
             if hasattr(cv2, "getLogLevel") and hasattr(cv2, "setLogLevel"):
                 prev_level = cv2.getLogLevel()
                 cv2.setLogLevel(0)
@@ -433,7 +436,7 @@ class HardwareManager:
         if len(candidate_ports) == 0:
             missing_hardware.extend(["follower_arm", "leader_arm"])
         elif len(candidate_ports) == 1:
-            missing_hardware.append("leader_arm")
+            missing_hardware.append("second_arm_optional")
 
         if any(not p["permission_ok"] for p in candidate_ports):
             missing_hardware.append("serial_permission")
@@ -444,24 +447,35 @@ class HardwareManager:
         if not lerobot_available:
             missing_hardware.append("lerobot_package")
 
+        # Single physical arm (>= 1 valid robot serial port) is sufficient for real-mode experiments
         hardware_ready = bool(
+            lerobot_available
+            and len(candidate_ports) >= 1
+            and any(p["permission_ok"] for p in candidate_ports)
+        )
+        dual_arm_ready = bool(
             lerobot_available
             and len(candidate_ports) >= 2
             and all(p["permission_ok"] for p in candidate_ports[:2])
         )
 
         guidance: list[str] = []
-        if len(candidate_ports) < 2:
+        if len(candidate_ports) == 0:
             if platform.system() == "Windows":
                 guidance.append(
-                    "未检测到双臂 SO-101 USB 串口，已自动降级为 dry_run 模拟模式。"
-                    "连接硬件后请运行 scripts/windows/find_ports.ps1 确认 COM 端口并配置 .env。"
+                    "未检测到 SO-101 USB 串口，已自动降级为 dry_run 模拟模式。"
+                    "连接单臂或双臂硬件后点击「重新探测硬件」即可进入真机模式。"
                 )
             else:
                 guidance.append(
-                    "未检测到双臂 SO-101 USB 串口（/dev/ttyACM*），已自动降级为 dry_run 模拟模式。"
+                    "未检测到 SO-101 USB 串口（/dev/ttyACM*），已自动降级为 dry_run 模拟模式。"
                     "请检查 USB 连接及 udev/dialout 权限。"
                 )
+        elif len(candidate_ports) == 1:
+            guidance.append(
+                f"已检测到单臂 SO-101 串口硬件（{candidate_ports[0]['device']}），已启用真机模式；"
+                "可直接执行单臂标定、上下力、仿真同步与键控（双臂遥操作需接入第 2 条串口）。"
+            )
         if bluetooth_ports:
             bt_names = ", ".join(p["device"] for p in bluetooth_ports)
             guidance.append(f"已自动过滤蓝牙虚拟串口（不作为机械臂端口）：{bt_names}")
@@ -473,9 +487,9 @@ class HardwareManager:
             guidance.append(
                 "未检测到可用物理摄像头，相机预览将使用 2D 运动学合成测试图（DRY-RUN）。"
             )
-        if hardware_ready:
+        if dual_arm_ready:
             guidance.append(
-                f"已检测到 SO-101 串口硬件（当前映射 从臂={self.config.follower_port} / 主臂={self.config.leader_port}），可在下方手动调整并保存。"
+                f"已检测到双臂 SO-101 串口硬件（当前映射 从臂={self.config.follower_port} / 主臂={self.config.leader_port}），可在下方手动调整并保存。"
             )
 
         if self.requested_mode == "dry_run":
@@ -489,6 +503,8 @@ class HardwareManager:
             "lerobot_available": lerobot_available,
             "os_capabilities": os_capabilities,
             "hardware_ready": hardware_ready,
+            "dual_arm_ready": dual_arm_ready,
+            "connected_arm_count": len(candidate_ports),
             "missing_hardware": missing_hardware,
             "guidance": guidance,
             "active_mode": self.active_mode,

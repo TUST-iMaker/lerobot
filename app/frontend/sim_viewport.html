@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Arm101 Virtual Hardware Twin — 独立仿真机械臂</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http%3A//www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%230284c7'/%3E%3Cpath d='M4 19h16M7 19v-4l4-6 4 3 3-5' fill='none' stroke='%23ffffff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='11' cy='9' r='1.8' fill='%23ffffff'/%3E%3Ccircle cx='18' cy='7' r='1.8' fill='%23ffffff'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/styles.css?v=2026112304" />
+</head>
+<body class="sim-twin-body">
+  <div class="sim-twin-shell">
+    <!-- Top Bar: Brand + Camera View Controls + Safety & Recall -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="brand-logo brand-logo-twin" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="15" height="15">
+            <path d="M5 19h14M8 19v-4l4-6 4 3 3-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+            <circle cx="12" cy="9" r="1.8" fill="currentColor" />
+            <circle cx="19" cy="7" r="1.8" fill="currentColor" />
+          </svg>
+        </div>
+        <h1 class="module-heading">SO-ARM101 独立仿真机械臂窗口</h1>
+        <span id="twin-sync-badge" class="status-tag tag-ok">与主程序实时联动中</span>
+      </div>
+
+      <!-- Shared 3D Camera Control Bar -->
+      <div class="stage-cam-bar" role="toolbar" aria-label="3D Camera View Controls">
+        <button type="button" class="btn btn-xs btn-secondary btn-cam-preset" data-view="iso">轴测</button>
+        <button type="button" class="btn btn-xs btn-secondary btn-cam-preset" data-view="front">正视</button>
+        <button type="button" class="btn btn-xs btn-secondary btn-cam-preset" data-view="side">侧视</button>
+        <button type="button" class="btn btn-xs btn-secondary btn-cam-preset" data-view="top">俯视</button>
+        <button type="button" class="btn btn-xs btn-secondary" id="btn-twin-zoom-in" title="放大">+</button>
+        <button type="button" class="btn btn-xs btn-secondary" id="btn-twin-zoom-out" title="缩小">-</button>
+        <button type="button" class="btn btn-xs btn-secondary btn-cam-preset" data-view="reset">1:1 复位</button>
+      </div>
+
+      <div class="topbar-actions">
+        <label class="inline-field">
+          <input id="chk-twin-linked" type="checkbox" checked />
+          <span>主从联动</span>
+        </label>
+        <button type="button" class="btn btn-xs btn-secondary" id="btn-twin-home">归中位</button>
+        <button type="button" class="btn btn-xs btn-secondary" id="btn-twin-rest">休眠位</button>
+        <button type="button" class="btn btn-xs btn-secondary" data-testid="btn-twin-toggle-theme" id="btn-twin-toggle-theme" title="切换白昼浅色 / 工业深色模式">浅色 / 深色</button>
+        <button type="button" class="btn btn-xs btn-estop" data-testid="btn-twin-estop" id="btn-twin-estop">E-STOP 急停</button>
+        <button type="button" class="btn btn-xs btn-primary" id="btn-twin-reset-estop" hidden>解除急停</button>
+        <button type="button" class="btn btn-xs btn-primary" data-testid="btn-recall-to-main" id="btn-recall-to-main">收回至主窗口</button>
+      </div>
+    </header>
+
+    <!-- Full-Height Dual-Arm 3D Interactive Stage -->
+    <main class="sim-twin-main">
+      <div class="sim-twin-grid">
+        <section class="card sim-twin-pane">
+          <div class="panel-header">
+            <h3>Leader Arm (主臂操控端)</h3>
+            <span id="twin-leader-tcp" class="status-tag tag-mono">TCP 391, 0, 226 mm</span>
+          </div>
+          <div class="viewport-box viewport-box-flex">
+            <canvas id="canvas-twin-leader" data-testid="canvas-twin-leader" class="stick-canvas" width="540" height="420"></canvas>
+          </div>
+          <div id="twin-leader-strip" class="telemetry-strip-wrap"></div>
+        </section>
+
+        <section class="card sim-twin-pane">
+          <div class="panel-header">
+            <h3>Follower Arm (从臂执行端 — 拖拽红圈 IK 控臂)</h3>
+            <span id="twin-follower-tcp" class="status-tag tag-mono">TCP 391, 0, 226 mm</span>
+          </div>
+          <div class="viewport-box viewport-box-flex">
+            <canvas id="canvas-twin-follower" data-testid="canvas-twin-follower" class="stick-canvas" width="540" height="420"></canvas>
+          </div>
+          <div id="twin-follower-strip" class="telemetry-strip-wrap"></div>
+        </section>
+      </div>
+    </main>
+
+    <footer class="statusbar">
+      <div class="statusbar-left">
+        <span id="twin-ws-pill" class="sb-item"><span class="status-dot dot-ok"></span>WS Connected</span>
+        <span class="sb-sep">|</span>
+        <span id="twin-mode-pill" class="sb-item">MODE: DRY-RUN</span>
+        <span class="sb-sep">|</span>
+        <span id="twin-wf-pill" class="sb-item">WORKFLOW: IDLE</span>
+        <span class="sb-sep">|</span>
+        <span id="twin-safety-pill" class="sb-item"><span class="status-dot dot-ok"></span>SAFETY: NORMAL</span>
+      </div>
+      <div class="statusbar-right">
+        <span class="mono-meta">左键旋转 / 右键或Shift平移 / 滚轮缩放 / 拖红圈IK控臂</span>
+      </div>
+    </footer>
+  </div>
+
+  <script type="module" src="/static/sim_viewport.js?v=2026112304"></script>
+</body>
+</html>

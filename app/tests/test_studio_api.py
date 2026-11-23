@@ -233,20 +233,34 @@ def test_health_mode_probe_and_offline_assets(live_server: tuple[str, StudioConf
             assert rdata["code"] == "HARDWARE_NOT_READY"
             assert rdata["mode"] == "dry_run"
 
-        # Offline static assets & all 17 required data-testid hooks
+        # Offline static assets, cache-busting ?v= query & no-store headers, and all 17 required data-testid hooks
         root_html = client.get("/")
         assert root_html.status_code == 200
+        assert "no-store" in root_html.headers.get("cache-control", "").lower()
         html_text = root_html.text
         assert not re.search(r"<(script|link)[^>]+https?://", html_text, re.IGNORECASE)
+        assert "data:image/svg+xml" in html_text
+        assert re.search(r"/static/styles\.css\?v=\d+", html_text)
+        assert re.search(r"/static/app\.js\?v=\d+", html_text)
         for testid in REQUIRED_TESTIDS:
             assert f'data-testid="{testid}"' in html_text
 
+        twin_html = client.get("/sim-viewport")
+        assert twin_html.status_code == 200
+        assert "no-store" in twin_html.headers.get("cache-control", "").lower()
+        assert "data:image/svg+xml" in twin_html.text
+        assert re.search(r"/static/sim_viewport\.js\?v=\d+", twin_html.text)
+
         css_res = client.get("/static/styles.css")
         assert css_res.status_code == 200
+        assert "no-store" in css_res.headers.get("cache-control", "").lower()
         assert "@import" not in css_res.text
 
         js_res = client.get("/static/app.js")
         assert js_res.status_code == 200
+        assert "no-store" in js_res.headers.get("cache-control", "").lower()
+        assert "/static/stick_sim.js?v=" in js_res.text
+        assert "/static/studio_bus.js?v=" in js_res.text
 
 
 # ----------------------------------------------------------------------
@@ -426,6 +440,26 @@ def test_plugins_and_vla_endpoints(live_server: tuple[str, StudioConfig]) -> Non
             "rebot_shakehands",
         }.issubset(ds_ids)
 
+        prev_res = client.get(
+            "/api/plugins/open_source_datasets/preview",
+            params={"repo_id": "rebot-b601-t1-pick-place"},
+        )
+        assert prev_res.status_code == 200
+        prev_ds = prev_res.json()["dataset"]
+        assert prev_ds["repo_id"] == "rebot-b601-t1-pick-place"
+        assert len(prev_ds["sample_trajectory"]) >= 4
+
+        diag_res = client.get("/api/plugins/feetech_servo_bench/diagnostics")
+        assert diag_res.status_code == 200
+        diag_body = diag_res.json()
+        assert len(diag_body["servos"]) == 6
+        assert diag_body["servos"][0]["Present_Position"] >= 0
+        if diag_body.get("mode") != "real":
+            assert diag_body["simulated"] is True
+            assert diag_body["servos"][0]["Present_Voltage_V"] == "--"
+            assert diag_body["servos"][0]["Present_Temperature_C"] == "--"
+            assert diag_body["servos"][0]["Lock"] == "--"
+
         assert client.post("/api/plugins/unknown_tool/launch").status_code == 404
         assert client.post("/api/plugins/unknown_tool/stop").status_code == 404
 
@@ -486,6 +520,7 @@ async def test_ws_telemetry_streams_6dof_and_logs(live_server: tuple[str, Studio
     async with websockets.connect(ws_url, open_timeout=5.0) as ws:
         raw = await ws.recv()
         msg = json.loads(raw)
+        assert msg.get("type", "telemetry") == "telemetry"
         assert msg["mode"] in ("real", "dry_run")
         assert "active_workflow" in msg
         assert "workflow_status" in msg
@@ -499,10 +534,13 @@ async def test_ws_telemetry_streams_6dof_and_logs(live_server: tuple[str, Studio
                 "wrist_roll",
                 "gripper",
             }
+        raw_ov = await ws.recv()
+        ov = json.loads(raw_ov)
+        assert ov.get("type") in ("overlay_update", "telemetry")
 
 
 # ----------------------------------------------------------------------
-# Group 5: Playwright Browser E2E Smoke Test
+# Group 5: Playwright Browser E2E Smoke Test (1440x900 & 1280x720 + All 7 Modules)
 # ----------------------------------------------------------------------
 def test_playwright_ui_smoke_and_zero_console_errors(
     live_server: tuple[str, StudioConfig],
@@ -514,7 +552,8 @@ def test_playwright_ui_smoke_and_zero_console_errors(
     with sync_playwright() as p:
         browser = _launch_chromium(p)
         try:
-            page = browser.new_page()
+            context = browser.new_context(viewport={"width": 1440, "height": 900})
+            page = context.new_page()
             page.on(
                 "console",
                 lambda msg: console_errors.append(msg.text) if msg.type == "error" else None,
@@ -524,14 +563,68 @@ def test_playwright_ui_smoke_and_zero_console_errors(
             page.goto(base_url, wait_until="domcontentloaded")
             page.get_by_test_id("mode-badge").wait_for(state="visible", timeout=5000)
             page.get_by_test_id("hardware-status-banner").wait_for(state="visible", timeout=5000)
+
+            # Verify floating Console Drawer opens/closes with ZERO layout shift on workspace
+            ws_box_before = page.locator("#workspace-main").bounding_box()
+            assert ws_box_before is not None
+            page.get_by_test_id("btn-toggle-log-dock").click()
             page.get_by_test_id("log-console").wait_for(state="visible", timeout=5000)
+            ws_box_during = page.locator("#workspace-main").bounding_box()
+            assert ws_box_during is not None
+            assert abs(ws_box_before["height"] - ws_box_during["height"]) < 1.0
+            page.get_by_test_id("btn-toggle-log-dock").click()
+
+            # Verify Torque button state vs action semantic toggle
+            assert "点击卸力" in page.get_by_test_id("btn-toggle-torque").inner_text()
+            page.get_by_test_id("btn-toggle-torque").click()
+            page.wait_for_function(
+                "() => document.getElementById('btn-toggle-torque')?.innerText?.includes('点击上力')",
+                timeout=5000,
+            )
+            page.get_by_test_id("btn-toggle-torque").click()
+            page.wait_for_function(
+                "() => document.getElementById('btn-toggle-torque')?.innerText?.includes('点击卸力')",
+                timeout=5000,
+            )
+
+            # Verify Left Sidebar collapse & expand
+            page.get_by_test_id("btn-toggle-sidebar").click()
+            page.wait_for_timeout(180)
+            assert page.evaluate(
+                "() => document.getElementById('studio-shell')?.classList.contains('sidebar-collapsed')"
+            )
+            page.get_by_test_id("btn-toggle-sidebar").click()
+            page.wait_for_timeout(180)
+            assert not page.evaluate(
+                "() => document.getElementById('studio-shell')?.classList.contains('sidebar-collapsed')"
+            )
+
             page.locator("#mode-select").select_option("dry_run")
             page.wait_for_function(
                 "() => document.querySelector('[data-testid=\"mode-badge\"]')?.innerText?.includes('DRY-RUN')",
                 timeout=5000,
             )
 
-            # Dashboard probe, manual device config, and interactive calibration
+            # Verify persistent 3D stage renders non-blank pixels on daylight #F8F9FA background
+            non_blank_canvas = page.evaluate(
+                """() => {
+                    const c = document.getElementById('canvas-sim-follower');
+                    if (!c || c.width === 0 || c.height === 0) return false;
+                    const ctx = c.getContext('2d');
+                    const data = ctx.getImageData(0, 0, c.width, c.height).data;
+                    let nonBgCount = 0;
+                    for (let i = 0; i < data.length; i += 16) {
+                        const r = data[i], g = data[i + 1], b = data[i + 2];
+                        if (Math.abs(r - 248) > 10 || Math.abs(g - 249) > 10 || Math.abs(b - 250) > 10) {
+                            nonBgCount++;
+                        }
+                    }
+                    return nonBgCount > 25;
+                }"""
+            )
+            assert non_blank_canvas is True, "3D canvas failed non-blank pixel assertion"
+
+            # Module 1: Dashboard probe, manual device config, and interactive calibration
             page.get_by_test_id("tab-dashboard").click()
             page.get_by_test_id("btn-probe-hardware").click()
             page.wait_for_timeout(200)
@@ -540,31 +633,54 @@ def test_playwright_ui_smoke_and_zero_console_errors(
             page.get_by_test_id("btn-save-device-config").click()
             page.wait_for_timeout(200)
 
-            # Interactive calibration in UI
             page.get_by_test_id("btn-start-calibrate").click()
             page.get_by_test_id("btn-calibrate-enter").wait_for(state="visible", timeout=5000)
+            # Dry-run calibration reveals 6-axis joint sliders & auto-home button (no IK drag)
+            page.get_by_test_id("btn-cal-auto-home").wait_for(state="visible", timeout=5000)
+            page.get_by_test_id("btn-cal-auto-home").click()
+            page.wait_for_timeout(200)
             page.get_by_test_id("btn-calibrate-enter").click()
             page.wait_for_timeout(250)
             page.get_by_test_id("btn-calibrate-enter").click()
             page.wait_for_timeout(250)
 
-            # Teleop & Camera JPEG verification
+            # Module 2: Teleop & Camera JPEG verification + strong Start/Stop feedback + Q/E keycaps + camera resizer
             page.get_by_test_id("tab-teleop").click()
+            page.get_by_test_id("teleop-cam-resizer").wait_for(state="visible", timeout=5000)
+            assert page.locator(".btn-dpad[data-key='q']").count() == 1
+            assert page.locator(".btn-dpad[data-key='e']").count() == 1
+            assert page.get_by_test_id("btn-stop-teleop").is_disabled()
             page.wait_for_function(
                 """() => {
                     const f = document.querySelector('[data-testid="camera-preview-front"]');
                     const w = document.querySelector('[data-testid="camera-preview-wrist"]');
-                    return f && f.complete && f.naturalWidth > 0 && w && w.complete && w.naturalWidth > 0;
+                    return f && f.naturalWidth > 0 && w && w.naturalWidth > 0;
                 }""",
                 timeout=5000,
             )
             page.get_by_test_id("btn-start-teleop").click()
             page.wait_for_timeout(250)
+            assert not page.get_by_test_id("btn-stop-teleop").is_disabled()
             page.get_by_test_id("btn-stop-teleop").click()
+            page.wait_for_timeout(150)
+            assert page.get_by_test_id("btn-stop-teleop").is_disabled()
 
-            # Dual-arm 6-DOF stick-figure simulation tab & IK
+            # Module 3: Dual-arm simulation, Link Leader-Follower mutual exclusion, & IK
             page.get_by_test_id("tab-sim").click()
             page.get_by_test_id("btn-apply-ik").wait_for(state="visible", timeout=5000)
+            # When Link Leader-Follower is ON, Follower manual sliders are locked/disabled
+            assert page.evaluate("() => document.getElementById('sim-follower-card')?.classList.contains('card-locked')")
+            assert page.locator("#btn-sim-follower-home").is_disabled()
+            # Toggle Link Leader-Follower OFF and verify it stays unchecked across WS telemetry & unlocks Follower
+            page.get_by_test_id("chk-sim-linked").click()
+            page.wait_for_timeout(300)
+            assert not page.get_by_test_id("chk-sim-linked").is_checked()
+            assert not page.locator("#btn-sim-follower-home").is_disabled()
+            # Toggle Link Leader-Follower back ON
+            page.get_by_test_id("chk-sim-linked").click()
+            page.wait_for_timeout(200)
+            assert page.get_by_test_id("chk-sim-linked").is_checked()
+
             page.get_by_test_id("btn-apply-ik").click()
             page.wait_for_timeout(200)
             sim_canvas_ok = page.evaluate(
@@ -576,14 +692,14 @@ def test_playwright_ui_smoke_and_zero_console_errors(
             )
             assert sim_canvas_ok is True
 
-            # Teaching waypoints
+            # Module 4: Teaching waypoints
             page.get_by_test_id("tab-teaching").click()
             page.get_by_test_id("btn-teach-waypoint").click()
             page.wait_for_timeout(200)
             page.get_by_test_id("btn-replay-waypoints").click()
             page.wait_for_timeout(450)
 
-            # Data collection + Team Data Spec card
+            # Module 5: Data collection + Team Data Spec card
             page.get_by_test_id("tab-collect").click()
             page.get_by_test_id("data-spec-card").wait_for(state="visible", timeout=5000)
             page.get_by_test_id("btn-start-collect").click()
@@ -591,14 +707,92 @@ def test_playwright_ui_smoke_and_zero_console_errors(
             page.get_by_test_id("btn-stop-collect").click()
             page.wait_for_timeout(200)
 
-            # Plugins & VLA tabs
+            # Module 6: Plugins & Open-Source Datasets Workbench
             page.get_by_test_id("tab-plugins").click()
-            assert page.locator('[data-testid="plugin-list"] .card').count() >= 5
+            assert page.locator('[data-testid="plugin-list"] .card').count() >= 4
+            assert page.locator('#open-datasets-tbody tr').count() >= 5
+            page.get_by_test_id("btn-plugin-servo-diag").click()
+            page.wait_for_timeout(200)
+            diag_text = page.get_by_test_id("plugin-workbench-output").inner_text()
+            assert "STS3215" in diag_text and "--" in diag_text
+            page.get_by_test_id("btn-plugin-demo-drawer").click()
+            page.wait_for_timeout(200)
+            assert "b601rs_open_the_drawer" in page.get_by_test_id("plugin-workbench-output").inner_text()
 
+            # Module 7: VLA Policy & Cloud Training
             page.get_by_test_id("tab-vla").click()
             assert "pi0.7" in page.locator("#pi07-notice-card").inner_text()
             page.get_by_test_id("btn-vla-preview").click()
             page.wait_for_timeout(250)
+
+            # Verify zero NaN across entire UI shell
+            shell_text = page.locator("#studio-shell").inner_text()
+            assert "NaN" not in shell_text
+
+            # Verify /sim-viewport multi-window Web Locks + BroadcastChannel mutual exclusion + Light/Dark theme sync
+            twin_page = page.context.new_page()
+            twin_page.on(
+                "console",
+                lambda msg: console_errors.append(msg.text) if msg.type == "error" else None,
+            )
+            twin_page.on("pageerror", lambda err: page_errors.append(str(err)))
+            twin_page.goto(f"{base_url}/sim-viewport", wait_until="domcontentloaded")
+            twin_page.locator("#canvas-twin-follower").wait_for(state="visible", timeout=5000)
+            page.wait_for_function(
+                "() => document.getElementById('studio-shell')?.classList.contains('stage-popped-out')",
+                timeout=5000,
+            )
+            # Toggle Light -> Dark at bottom-left of left sidebar and verify both windows switch to dark
+            page.get_by_test_id("btn-toggle-theme").click()
+            page.wait_for_function("() => document.documentElement.dataset.theme === 'dark'", timeout=5000)
+            twin_page.wait_for_function("() => document.documentElement.dataset.theme === 'dark'", timeout=5000)
+            # Toggle Dark -> Light back
+            page.get_by_test_id("btn-toggle-theme").click()
+            page.wait_for_function("() => document.documentElement.dataset.theme === 'light'", timeout=5000)
+            twin_page.wait_for_function("() => document.documentElement.dataset.theme === 'light'", timeout=5000)
+
+            twin_canvas_ok = twin_page.evaluate(
+                """() => {
+                    const c = document.getElementById('canvas-twin-follower');
+                    return Boolean(c && c.width > 0 && c.height > 0);
+                }"""
+            )
+            assert twin_canvas_ok is True
+            twin_page.close()
+            page.wait_for_function(
+                "() => !document.getElementById('studio-shell')?.classList.contains('stage-popped-out')",
+                timeout=5000,
+            )
+
+            # Verify 1280x720 Compact Laptop Viewport: Zero Horizontal Overflow Across All 7 Tabs
+            page.set_viewport_size({"width": 1280, "height": 720})
+            page.wait_for_timeout(200)
+            for tab_id in (
+                "tab-dashboard",
+                "tab-teleop",
+                "tab-sim",
+                "tab-teaching",
+                "tab-collect",
+                "tab-plugins",
+                "tab-vla",
+            ):
+                page.get_by_test_id(tab_id).click()
+                page.wait_for_timeout(120)
+                metrics = page.evaluate(
+                    """() => {
+                        const doc = document.documentElement;
+                        const shell = document.getElementById('studio-shell');
+                        const collapsed = shell.classList.contains('stage-collapsed');
+                        const c = document.getElementById('canvas-sim-follower');
+                        const rect = c ? c.getBoundingClientRect() : null;
+                        return {
+                            noHorizOverflow: doc.scrollWidth <= doc.clientWidth,
+                            canvasOk: collapsed || Boolean(c && c.width > 0 && rect && rect.width > 180 && rect.height >= 120),
+                        };
+                    }"""
+                )
+                assert metrics["noHorizOverflow"] is True, f"Horizontal overflow on {tab_id} at 1280x720"
+                assert metrics["canvasOk"] is True, f"Canvas sizing invalid on {tab_id} at 1280x720"
 
             assert console_errors == [], f"Unexpected console errors: {console_errors}"
             assert page_errors == [], f"Unexpected page errors: {page_errors}"
@@ -766,7 +960,11 @@ def test_v3_safety_dual_arm_ik_sync_and_routines(
         assert d_fol["follower_joints"]["shoulder_pan"] == -25.0
         assert d_fol["leader_joints"]["shoulder_pan"] == 35.0
 
-        # 2. IK solver (valid workspace target + unreachable 422)
+        # 2. IK solver (valid workspace target, #5 wrist_roll lock, clamped boundary, & unreachable 422)
+        assert (
+            client.post("/api/sim/joints", json={"arm": "follower", "joints": {"wrist_roll": 45.0}}).status_code
+            == 200
+        )
         ik_ok = client.post(
             "/api/sim/ik",
             json={"arm": "follower", "x_mm": 340.0, "y_mm": -30.0, "z_mm": 215.0, "pitch_deg": 0.0},
@@ -775,12 +973,27 @@ def test_v3_safety_dual_arm_ik_sync_and_routines(
         ik_body = ik_ok.json()
         assert "follower_fk" in ik_body
         assert len(ik_body["follower_fk"]["nodes_mm"]) == 5
+        assert ik_body["follower_joints"]["wrist_roll"] == 45.0
+
+        ik_clamped = client.post(
+            "/api/sim/ik",
+            json={"arm": "follower", "x_mm": 650.0, "y_mm": 0.0, "z_mm": 220.0, "clamp_to_workspace": True},
+        )
+        assert ik_clamped.status_code == 200
+        assert ik_clamped.json()["clamped"] is True
+        assert ik_clamped.json()["follower_joints"]["wrist_roll"] == 45.0
 
         ik_bad = client.post(
             "/api/sim/ik",
             json={"arm": "follower", "x_mm": 999.0, "y_mm": 0.0, "z_mm": 999.0},
         )
         assert ik_bad.status_code == 422
+
+        # 2b. Dedicated Link Leader-Follower endpoint
+        lk_off = client.post("/api/sim/linked", json={"linked": False})
+        assert lk_off.status_code == 200 and lk_off.json()["linked_arms"] is False
+        lk_on = client.post("/api/sim/linked", json={"linked": True})
+        assert lk_on.status_code == 200 and lk_on.json()["linked_arms"] is True
 
         # 3. Bidirectional sync mode safety gate
         assert (
@@ -810,8 +1023,14 @@ def test_v3_safety_dual_arm_ik_sync_and_routines(
         assert tq.json()["torque_enabled"] is False
         assert client.post("/api/safety/torque", json={"enabled": True}).status_code == 200
 
-        # 5. WASD height-locked Cartesian step + presets + routine
+        # 5. WASD + Q/E (plus R/F backward compat) Cartesian step + presets + routine
         assert client.post("/api/workflows/control/key", json={"key": "w", "step_mm": 12.0}).status_code == 200
+        q_res = client.post("/api/workflows/control/key", json={"key": "q", "step_mm": 12.0})
+        assert q_res.status_code == 200
+        e_res = client.post("/api/workflows/control/key", json={"key": "e", "step_mm": 12.0})
+        assert e_res.status_code == 200
+        assert client.post("/api/workflows/control/key", json={"key": "r", "step_mm": 8.0}).status_code == 200
+        assert client.post("/api/workflows/control/key", json={"key": "f", "step_mm": 8.0}).status_code == 200
         assert client.post("/api/workflows/teaching/pose", json={"pose": "inspect"}).status_code == 200
         assert client.post("/api/workflows/teaching/pose", json={"pose": "home"}).status_code == 200
         assert client.post("/api/workflows/teaching/routine", json={"routine": "wave"}).status_code == 200

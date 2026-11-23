@@ -5,19 +5,26 @@ from __future__ import annotations
 import asyncio
 import math
 import platform
+import re
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.backend.config import ModeType, StudioConfig, load_config
 from app.backend.hardware import HardwareManager
-from app.backend.plugins import PluginRegistry, PluginUnavailableError
+from app.backend.plugins import (
+    PluginRegistry,
+    PluginUnavailableError,
+    get_dataset_preview,
+    get_servo_bench_diagnostics,
+)
 from app.backend.process_manager import ProcessRegistry
 from app.backend.simulation import Arm101Simulator, validate_joint_dict
 from app.backend.workflows import WorkflowConflictError, WorkflowManager
@@ -176,6 +183,11 @@ class SimJointsRequest(BaseModel):
         return validate_joint_dict(value, require_non_empty=True)
 
 
+class SimLinkedRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    linked: bool
+
+
 class SimIKRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     arm: Literal["leader", "follower", "both"] = "follower"
@@ -184,6 +196,7 @@ class SimIKRequest(BaseModel):
     z_mm: float
     pitch_deg: float | None = None
     gripper: float | None = Field(default=None, ge=0.0, le=100.0)
+    clamp_to_workspace: bool = False
 
 
 class SimSyncModeRequest(BaseModel):
@@ -221,6 +234,7 @@ class StudioRuntime:
         self.config = config or load_config()
         self.config.ensure_directories()
         self.started_at = time.monotonic()
+        self.shutting_down = False
         self.process_registry = ProcessRegistry(logs_dir=self.config.logs_dir)
         self.hardware = HardwareManager(self.config)
         self.simulator = Arm101Simulator()
@@ -245,6 +259,7 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
         try:
             yield
         finally:
+            runtime.shutting_down = True
             await runtime.workflows.shutdown()
             runtime.plugins.stop_all()
             runtime.process_registry.terminate_all()
@@ -266,15 +281,65 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     def _rt() -> StudioRuntime:
         return fastapi_app.state.runtime  # type: ignore[no-any-return]
 
+    def _asset_version(frontend_dir: Path) -> str:
+        try:
+            mtimes = [int(p.stat().st_mtime * 1000) for p in frontend_dir.glob("*") if p.is_file()]
+            return str(max(mtimes)) if mtimes else str(int(time.time() * 1000))
+        except Exception:
+            return str(int(time.time() * 1000))
+
+    @fastapi_app.middleware("http")
+    async def disable_static_cache(request: Request, call_next: Any) -> Response:
+        path = request.url.path
+        if path in ("/", "/sim-viewport") or path.startswith("/static/"):
+            # Suppress conditional If-None-Match / If-Modified-Since so browsers never reuse stale 304 cache
+            request.scope["headers"] = [
+                (k, v)
+                for (k, v) in request.scope.get("headers", [])
+                if k.lower() not in (b"if-none-match", b"if-modified-since")
+            ]
+        response: Response = await call_next(request)
+        if path in ("/", "/sim-viewport") or path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            for hdr in ("etag", "last-modified"):
+                if hdr in response.headers:
+                    del response.headers[hdr]
+        return response
+
+    def _render_versioned_html(filename: str) -> HTMLResponse:
+        frontend_dir = _rt().config.frontend_dir
+        html_file = frontend_dir / filename
+        if not html_file.exists():
+            raise HTTPException(status_code=404, detail=f"Frontend {filename} not found.")
+        ver = _asset_version(frontend_dir)
+        raw_html = html_file.read_text(encoding="utf-8")
+        versioned_html = re.sub(
+            r'(/static/(?:styles\.css|app\.js|stick_sim\.js|studio_bus\.js|sim_viewport\.js))(?:\?v=[^"\'\s>]*)?',
+            rf"\1?v={ver}",
+            raw_html,
+        )
+        return HTMLResponse(
+            content=versioned_html,
+            media_type="text/html; charset=utf-8",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
+
     # ------------------------------------------------------------------
-    # Frontend Root
+    # Frontend Root & Standalone Sim Viewport
     # ------------------------------------------------------------------
     @fastapi_app.get("/", include_in_schema=False)
-    async def index() -> FileResponse:
-        index_file = _rt().config.frontend_dir / "index.html"
-        if not index_file.exists():
-            raise HTTPException(status_code=404, detail="Frontend index.html not found.")
-        return FileResponse(index_file, media_type="text/html; charset=utf-8")
+    async def index() -> HTMLResponse:
+        return _render_versioned_html("index.html")
+
+    @fastapi_app.get("/sim-viewport", include_in_schema=False)
+    async def sim_viewport() -> HTMLResponse:
+        return _render_versioned_html("sim_viewport.html")
 
     # ------------------------------------------------------------------
     # System, Hardware & Mode
@@ -295,6 +360,7 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     @fastapi_app.get("/api/hardware/probe")
     async def hardware_probe() -> dict[str, Any]:
         rt = _rt()
+        await asyncio.to_thread(rt.workflows.release_cameras)
         data = await asyncio.to_thread(rt.hardware.probe)
         data["robot_profile"] = rt.config.load_robot_profile()
         return data
@@ -317,7 +383,13 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
                 if req.leader_port is not None
                 else rt.config.leader_port
             )
-            if f_port and l_port and f_port == l_port:
+            if (
+                f_port
+                and l_port
+                and f_port.lower() != "none"
+                and l_port.lower() != "none"
+                and f_port == l_port
+            ):
                 raise HTTPException(
                     status_code=422,
                     detail="从臂串口与主臂串口不能选择同一个端口。",
@@ -432,7 +504,10 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
 
     @fastapi_app.post("/api/workflows/teleop/joints")
     async def teleop_joints(req: TeleopJointsRequest) -> dict[str, Any]:
-        return _rt().workflows.update_teleop_joints(req.joints)
+        try:
+            return _rt().workflows.update_teleop_joints(req.joints)
+        except WorkflowConflictError as exc:
+            raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
 
     @fastapi_app.post("/api/workflows/teaching/record_waypoint")
     async def teaching_record_waypoint(
@@ -518,6 +593,10 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
         except WorkflowConflictError as exc:
             raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
 
+    @fastapi_app.post("/api/sim/linked")
+    async def sim_linked(req: SimLinkedRequest) -> dict[str, Any]:
+        return _rt().workflows.set_linked_arms(req.linked)
+
     @fastapi_app.post("/api/sim/ik")
     async def sim_ik(req: SimIKRequest) -> dict[str, Any]:
         try:
@@ -528,6 +607,7 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
                 z_mm=req.z_mm,
                 pitch_deg=req.pitch_deg,
                 gripper=req.gripper,
+                clamp_to_workspace=req.clamp_to_workspace,
             )
         except WorkflowConflictError as exc:
             raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
@@ -551,6 +631,8 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     async def workflow_control_key(req: ControlKeyRequest) -> dict[str, Any]:
         try:
             return _rt().workflows.send_control_key(req.key, step_mm=req.step_mm)
+        except WorkflowConflictError as exc:
+            raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except ValueError as exc:
@@ -580,9 +662,9 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     # Cameras
     # ------------------------------------------------------------------
     @fastapi_app.get("/api/cameras/{cam_id}/frame")
-    async def camera_frame(cam_id: str) -> Response:
+    async def camera_frame(cam_id: str, theme: str = "light") -> Response:
         try:
-            jpg = await asyncio.to_thread(_rt().workflows.get_camera_jpeg, cam_id)
+            jpg = await asyncio.to_thread(_rt().workflows.get_camera_jpeg, cam_id, theme)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
         return Response(
@@ -591,12 +673,59 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
             headers={"Cache-Control": "no-store"},
         )
 
+    @fastapi_app.get("/api/cameras/{cam_id}/stream")
+    async def camera_stream(cam_id: str, request: Request, theme: str = "light") -> StreamingResponse:
+        wf = _rt().workflows
+        if cam_id not in wf._valid_camera_ids():
+            raise HTTPException(status_code=404, detail=f"Camera '{cam_id}' not found.")
+
+        async def _mjpeg_generator():
+            rt = _rt()
+            while not rt.shutting_down:
+                if await request.is_disconnected():
+                    break
+                try:
+                    jpg = await asyncio.to_thread(wf.get_camera_jpeg, cam_id, theme)
+                except Exception:
+                    break
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    + f"Content-Length: {len(jpg)}\r\n\r\n".encode("ascii")
+                    + jpg
+                    + b"\r\n"
+                )
+                interval = 0.04 if wf.hardware.active_mode == "real" else 0.066
+                await asyncio.sleep(interval)
+
+        return StreamingResponse(
+            _mjpeg_generator(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     # ------------------------------------------------------------------
     # Open-Source Tool Plugins & VLA Config Viewer
     # ------------------------------------------------------------------
     @fastapi_app.get("/api/plugins")
     async def list_plugins() -> dict[str, Any]:
         return {"plugins": _rt().plugins.list_plugins()}
+
+    @fastapi_app.get("/api/plugins/open_source_datasets/preview")
+    async def plugin_dataset_preview(repo_id: str | None = None) -> dict[str, Any]:
+        try:
+            return get_dataset_preview(repo_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @fastapi_app.get("/api/plugins/feetech_servo_bench/diagnostics")
+    async def plugin_servo_diagnostics() -> dict[str, Any]:
+        rt = _rt()
+        return get_servo_bench_diagnostics(rt.simulator, rt.hardware.active_mode)
 
     @fastapi_app.post("/api/plugins/{plugin_id}/launch")
     async def launch_plugin(
@@ -652,20 +781,32 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     async def vla_mock_predict(req: VLAMockPredictRequest) -> dict[str, Any]:
         rt = _rt()
         _, follower, _ = rt.simulator.snapshot()
+        base_pan = float(follower.get("shoulder_pan", 0.0))
+        base_lift = float(follower.get("shoulder_lift", 0.0))
+        base_elbow = float(follower.get("elbow_flex", 0.0))
+        base_wrist = float(follower.get("wrist_flex", 0.0))
+        base_roll = float(follower.get("wrist_roll", 0.0))
+        waypoints_5 = [
+            (-18.0, 12.0, 10.0, -16.0, 0.0, 75.0),
+            (-6.0, 24.0, 20.0, -32.0, 8.0, 75.0),
+            (4.0, 34.0, 28.0, -48.0, 12.0, 18.0),
+            (18.0, 18.0, 14.0, -24.0, 6.0, 18.0),
+            (32.0, 28.0, 22.0, -38.0, 0.0, 70.0),
+        ]
         chunk = []
-        for step in range(1, 6):
-            phase = step * 0.25
+        for step, (d_pan, d_lift, d_elbow, d_wrist, d_roll, grip) in enumerate(waypoints_5, start=1):
             chunk.append(
                 {
                     "step": step,
-                    "shoulder_pan": round(follower["shoulder_pan"] + math.sin(phase) * 8.0, 2),
-                    "shoulder_lift": round(follower["shoulder_lift"] + math.cos(phase) * 5.0, 2),
-                    "elbow_flex": round(follower["elbow_flex"] + math.sin(phase) * 6.0, 2),
-                    "wrist_flex": round(follower["wrist_flex"] - math.sin(phase) * 4.0, 2),
-                    "wrist_roll": round(follower["wrist_roll"], 2),
-                    "gripper": round(max(0.0, min(100.0, follower["gripper"] + step * 5.0)), 2),
+                    "shoulder_pan": round(max(-110.0, min(110.0, base_pan * 0.2 + d_pan)), 2),
+                    "shoulder_lift": round(max(-100.0, min(100.0, base_lift * 0.2 + d_lift)), 2),
+                    "elbow_flex": round(max(-97.0, min(97.0, base_elbow * 0.2 + d_elbow)), 2),
+                    "wrist_flex": round(max(-95.0, min(95.0, base_wrist * 0.2 + d_wrist)), 2),
+                    "wrist_roll": round(max(-157.0, min(163.0, base_roll * 0.2 + d_roll)), 2),
+                    "gripper": round(grip, 2),
                 }
             )
+        rt.workflows.set_vla_chunk(chunk, badge=f"VLA 5 步预测 ({req.policy_name})")
         rt.workflows.log(
             f"VLA preview chunk generated for policy '{req.policy_name}' ({req.endpoint})."
         )
@@ -679,16 +820,36 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
         }
 
     # ------------------------------------------------------------------
-    # WebSocket Telemetry
+    # WebSocket Telemetry (25~30Hz during motion + Dual-Frame Split)
     # ------------------------------------------------------------------
     @fastapi_app.websocket("/ws/telemetry")
     async def ws_telemetry(websocket: WebSocket) -> None:
         await websocket.accept()
+        wf = _rt().workflows
+        last_overlay_seq = -1
         try:
-            while True:
-                payload = _rt().workflows.get_telemetry_frame()
-                await websocket.send_json(payload)
-                await asyncio.sleep(0.1)
+            # First frame: telemetry (satisfies single-frame WS health tests)
+            await websocket.send_json(wf.get_telemetry_frame())
+            # Second frame: initial overlay_update snapshot
+            ov = wf.get_overlay_frame()
+            last_overlay_seq = ov["overlay_seq"]
+            await websocket.send_json(ov)
+
+            while not _rt().shutting_down:
+                now = time.monotonic()
+                is_active = wf.active_workflow != "idle" or (now - wf.last_motion_ts) < 1.5
+                timeout_s = 0.033 if is_active else 0.10
+                try:
+                    await asyncio.wait_for(wf.motion_event.wait(), timeout=timeout_s)
+                    wf.motion_event.clear()
+                except asyncio.TimeoutError:
+                    pass
+
+                await websocket.send_json(wf.get_telemetry_frame())
+                if wf.overlay_seq != last_overlay_seq:
+                    ov = wf.get_overlay_frame()
+                    last_overlay_seq = ov["overlay_seq"]
+                    await websocket.send_json(ov)
         except WebSocketDisconnect:
             return
         except Exception:

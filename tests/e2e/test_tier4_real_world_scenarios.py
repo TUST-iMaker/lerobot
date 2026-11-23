@@ -363,7 +363,7 @@ def test_t4_04_dataset_collector_multi_session_resume_and_ui_replay(
         description="episode replay buttons in Collect tab",
     )
     dry_run_page.locator(".btn-ep-stick-replay[data-dataset='e2e_pick_cube']").first.click()
-    dry_run_page.locator("[data-testid='canvas-collect-stick']").wait_for(state="visible", timeout=5000)
+    dry_run_page.locator("[data-testid='canvas-sim-follower']").wait_for(state="visible", timeout=5000)
 
 
 def test_t4_05_cloud_vla_prep_plugin_hub_and_mock_action_chunk_preview(
