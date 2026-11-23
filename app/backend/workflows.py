@@ -7,6 +7,7 @@ import json
 import math
 import re
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -22,8 +23,10 @@ from app.backend.simulation import (
     Arm101Simulator,
     compute_fk_details,
     default_joints,
+    deg_to_encoder,
     encoder_to_deg,
     solve_ik_target,
+    solve_ik_target_with_status,
     validate_joint_dict,
 )
 
@@ -40,6 +43,115 @@ class WorkflowConflictError(Exception):
         self.code = code
 
 
+class _PersistentCameraHub:
+    """Maintains persistent low-latency OpenCV VideoCapture handles for real-time MJPEG streaming.
+
+    - Opens each physical camera once (MJPG + CAP_PROP_BUFFERSIZE=1) instead of per-frame open/close.
+    - Auto-releases idle handles after `idle_timeout_s` or immediately on `release_all()`.
+    """
+
+    def __init__(self, idle_timeout_s: float = 3.0) -> None:
+        self._idle_timeout_s = idle_timeout_s
+        self._lock = threading.Lock()
+        self._workers: dict[str, dict[str, Any]] = {}
+
+    def get_frame(self, index_or_path: int | str) -> bytes | None:
+        key = str(index_or_path)
+        now = time.monotonic()
+        with self._lock:
+            worker = self._workers.get(key)
+            if worker is None or not worker["thread"].is_alive():
+                stop_ev = threading.Event()
+                ready_ev = threading.Event()
+                worker = {
+                    "key": key,
+                    "index_or_path": index_or_path,
+                    "stop_ev": stop_ev,
+                    "ready_ev": ready_ev,
+                    "latest_jpeg": None,
+                    "last_access": now,
+                    "failed": False,
+                }
+                t = threading.Thread(
+                    target=self._capture_loop,
+                    args=(worker,),
+                    name=f"cam-stream-{key}",
+                    daemon=True,
+                )
+                worker["thread"] = t
+                self._workers[key] = worker
+                t.start()
+            else:
+                worker["last_access"] = now
+
+        if worker["latest_jpeg"] is None and not worker["failed"]:
+            worker["ready_ev"].wait(timeout=1.5)
+        return worker["latest_jpeg"]
+
+    def _capture_loop(self, worker: dict[str, Any]) -> None:
+        cap = None
+        try:
+            import cv2
+
+            backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2
+            with CAMERA_IO_LOCK:
+                cap = cv2.VideoCapture(worker["index_or_path"], backend)
+                if not cap.isOpened():
+                    worker["failed"] = True
+                    worker["ready_ev"].set()
+                    return
+                try:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                except Exception:
+                    pass
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
+
+            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 78]
+            while not worker["stop_ev"].is_set():
+                if time.monotonic() - worker["last_access"] > self._idle_timeout_s:
+                    break
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    enc_ok, buf = cv2.imencode(".jpg", frame, encode_params)
+                    if enc_ok:
+                        worker["latest_jpeg"] = bytes(buf)
+                        worker["ready_ev"].set()
+                else:
+                    time.sleep(0.03)
+                time.sleep(0.033)  # ~25-30 FPS
+        except Exception:
+            worker["failed"] = True
+            worker["ready_ev"].set()
+        finally:
+            worker["ready_ev"].set()
+            if cap is not None:
+                with CAMERA_IO_LOCK:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+            with self._lock:
+                if self._workers.get(worker["key"]) is worker:
+                    self._workers.pop(worker["key"], None)
+
+    def release_all(self) -> None:
+        with self._lock:
+            workers = list(self._workers.values())
+            self._workers.clear()
+        for w in workers:
+            w["stop_ev"].set()
+        for w in workers:
+            t = w.get("thread")
+            if t is not None and t.is_alive():
+                t.join(timeout=1.5)
+
+
 class WorkflowManager:
     """Coordinates real-mode lerobot CLI processes and dry-run 6-DOF workflows."""
 
@@ -54,7 +166,8 @@ class WorkflowManager:
         self.hardware = hardware
         self.simulator = simulator
         self.process_registry = process_registry
-        self.bridge = SO101RealBridge(config, simulator)
+        self.bridge = SO101RealBridge(config, simulator, on_motion=self._notify_motion)
+        self._camera_hub = _PersistentCameraHub(idle_timeout_s=3.0)
 
         self.active_workflow: WorkflowName = "idle"
         self.state: str = "idle"
@@ -70,6 +183,11 @@ class WorkflowManager:
         self._dry_cal_queue: asyncio.Queue[str] | None = None
         self._cal_state: dict[str, Any] = self._empty_cal_state()
         self._waypoints: list[dict[str, Any]] = []
+        self.vla_chunk: list[dict[str, Any]] = []
+        self.overlay_badge: str = ""
+        self.overlay_seq: int = 1
+        self.last_motion_ts: float = 0.0
+        self.motion_event: asyncio.Event = asyncio.Event()
         self._load_waypoints()
 
     @staticmethod
@@ -179,6 +297,70 @@ class WorkflowManager:
             "logs": list(self.logs),
         }
 
+    def _notify_motion(self) -> None:
+        self.last_motion_ts = time.monotonic()
+        try:
+            self.motion_event.set()
+        except Exception:
+            pass
+
+    def get_overlay_frame(self) -> dict[str, Any]:
+        return {
+            "type": "overlay_update",
+            "overlay_seq": self.overlay_seq,
+            "waypoints": list(self._waypoints),
+            "vla_chunk": list(self.vla_chunk),
+            "overlay_badge": self.overlay_badge,
+        }
+
+    def set_vla_chunk(self, chunk: list[dict[str, Any]], badge: str = "") -> None:
+        self.vla_chunk = list(chunk)
+        self.overlay_badge = badge
+        self.overlay_seq += 1
+        self._notify_motion()
+
+    def _arbitrate_manual_write(self, *, allow_dry_calibrate: bool = False) -> None:
+        self._sync_process_state()
+        if self.active_workflow == "calibrate":
+            if allow_dry_calibrate and self.hardware.active_mode == "dry_run":
+                return
+            raise WorkflowConflictError(
+                "当前正在执行标定任务（关节空间模式），已锁定笛卡尔/IK 控制，请使用标定滑块或先停止标定。",
+                code="WORKFLOW_BUSY",
+            )
+        if self.active_workflow == "collect":
+            raise WorkflowConflictError(
+                "当前正在执行 'collect' 数据采集任务，手动控臂已锁定，请先停止该任务。",
+                code="WORKFLOW_BUSY",
+            )
+        if self.active_workflow in ("teaching_replay", "demo_routine"):
+            if self._task is not None and not self._task.done():
+                self._task.cancel()
+            self._task = None
+            self.active_workflow = "idle"
+            self.state = "idle"
+            self.overlay_badge = ""
+
+    def _record_dry_cal_live_table(self, joints: dict[str, float]) -> None:
+        """Update min/pos/max encoder table during dry_run calibration Step 2 (recording_range)."""
+        if (
+            self.active_workflow != "calibrate"
+            or self.hardware.active_mode != "dry_run"
+            or self._cal_state.get("stage") != "recording_range"
+        ):
+            return
+        for jname in JOINT_NAMES:
+            pos = int(deg_to_encoder(jname, float(joints.get(jname, 0.0))))
+            prev = self._cal_state["live_table"].get(jname)
+            vmin = min(int(prev["min"]), pos) if prev else pos
+            vmax = max(int(prev["max"]), pos) if prev else pos
+            self._cal_state["live_table"][jname] = {
+                "name": jname,
+                "min": str(vmin),
+                "pos": str(pos),
+                "max": str(vmax),
+            }
+
     def get_telemetry_frame(self) -> dict[str, Any]:
         self._sync_process_state()
         leader, follower, sim_steps = self.simulator.snapshot()
@@ -187,6 +369,9 @@ class WorkflowManager:
         bridge_st = self.bridge.status()
         hw_ready = bool(self.hardware.last_probe.get("hardware_ready", False))
         return {
+            "type": "telemetry",
+            "overlay_seq": self.overlay_seq,
+            "overlay_badge": self.overlay_badge,
             "timestamp": round(time.time(), 3),
             "mode": self.hardware.active_mode,
             "active_workflow": self.active_workflow,
@@ -274,6 +459,7 @@ class WorkflowManager:
             )
             return [
                 sys.executable,
+                "-u",
                 "-m",
                 "app.backend.calibrate_runner",
                 "--robot.type=so101_follower",
@@ -288,6 +474,7 @@ class WorkflowManager:
         )
         return [
             sys.executable,
+            "-u",
             "-m",
             "app.backend.calibrate_runner",
             "--teleop.type=so101_leader",
@@ -544,7 +731,7 @@ class WorkflowManager:
         self._cal_state["stage"] = "waiting_middle"
         self._cal_state["waiting_for_input"] = True
         self._cal_state["prompt"] = (
-            "【模拟标定 1/2】请摆好中位，然后点击【确认 / 下一步 (Enter)】。"
+            "【模拟标定 1/2】请通过下方关节滑块（或一键对齐中位）将蓝臂对齐灰虚线中位，然后点击【确认 / 下一步】。"
         )
         self._dry_cal_queue = asyncio.Queue()
         cal_queue = self._dry_cal_queue
@@ -552,58 +739,89 @@ class WorkflowManager:
 
         async def _sim_calibrate() -> None:
             try:
+                # Step 1 (waiting_middle): show an unaligned initial pose against the translucent URDF homing ghost
+                unaligned_pose = {
+                    "shoulder_pan": -16.0,
+                    "shoulder_lift": 22.0,
+                    "elbow_flex": -25.0,
+                    "wrist_flex": 18.0,
+                    "wrist_roll": 0.0,
+                    "gripper": 35.0,
+                }
+                if target == "leader":
+                    self.simulator.set_leader_joints(unaligned_pose, step_immediately=False)
+                else:
+                    self.simulator.set_follower_joints(unaligned_pose)
+                self._notify_motion()
+
                 await cal_queue.get()
 
+                # User confirmed middle position -> enter recording_range; allow manual slider sweep OR optional 'sweep' demo
                 self._cal_state["stage"] = "recording_range"
                 self._cal_state["waiting_for_input"] = True
                 self._cal_state["prompt"] = (
-                    "【模拟标定 2/2】正在模拟活动各关节限位，点击【确认 / 下一步 (Enter)】保存。"
+                    "【模拟标定 2/2】请拖动下方滑块活动各关节（或点【自动演示扫限位】），完成后点击【确认保存】。"
                 )
                 self.current_step = 2
-                tick = 0
+                cur_l, cur_f, _ = self.simulator.snapshot()
+                cur_target = cur_l if target == "leader" else cur_f
+                self._record_dry_cal_live_table(cur_target)
+                self._notify_motion()
+
                 while True:
-                    for idx, jname in enumerate(JOINT_NAMES):
-                        pos = int(2048 + math.sin(tick * 0.35 + idx) * 600)
-                        prev = self._cal_state["live_table"].get(jname)
-                        vmin = min(int(prev["min"]), pos) if prev else pos
-                        vmax = max(int(prev["max"]), pos) if prev else pos
-                        self._cal_state["live_table"][jname] = {
-                            "name": jname,
-                            "min": str(vmin),
-                            "pos": str(pos),
-                            "max": str(vmax),
-                        }
-                    tick += 1
-                    try:
-                        await asyncio.wait_for(cal_queue.get(), timeout=0.15)
-                        break
-                    except asyncio.TimeoutError:
+                    cmd_val = await cal_queue.get()
+                    if str(cmd_val).strip().lower() == "sweep":
+                        for tick in range(18):
+                            sweep_joints: dict[str, float] = {}
+                            for idx, jname in enumerate(JOINT_NAMES):
+                                pos = int(2048 + math.sin(tick * 0.45 + idx * 0.7) * 620)
+                                sweep_joints[jname] = encoder_to_deg(jname, float(pos))
+                            if target == "leader":
+                                self.simulator.set_leader_joints(sweep_joints, step_immediately=False)
+                            else:
+                                self.simulator.set_follower_joints(sweep_joints)
+                            self._record_dry_cal_live_table(sweep_joints)
+                            self._notify_motion()
+                            await asyncio.sleep(0.06)
                         continue
+                    break
 
                 self.current_step = 3
+                # Hard isolation: dry_run calibration NEVER writes to self.config.calibration_dir (real hardware config)
                 cal_dir = self.config.dry_run_dir / "calibration"
+                if cal_dir.resolve() == self.config.calibration_dir.resolve():
+                    cal_dir = self.config.dry_run_dir / "sim_calibration"
                 cal_dir.mkdir(parents=True, exist_ok=True)
                 cal_file = cal_dir / f"{target}_{resolved_id}.json"
+                joints_cal = {}
+                for j in JOINT_NAMES:
+                    row = self._cal_state["live_table"].get(j)
+                    rmin = int(row["min"]) if row else 0
+                    rmax = int(row["max"]) if row else 4095
+                    joints_cal[j] = {
+                        "homing_offset": 0,
+                        "range_min": min(rmin, rmax),
+                        "range_max": max(rmin, rmax),
+                    }
                 cal_payload = {
+                    "simulated": True,
                     "target": target,
                     "arm_id": resolved_id,
                     "port": resolved_port,
                     "mode": "dry_run",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "joints": {
-                        j: {"homing_offset": 0, "range_min": 0, "range_max": 4095}
-                        for j in JOINT_NAMES
-                    },
+                    "joints": joints_cal,
                 }
                 cal_file.write_text(
                     json.dumps(cal_payload, indent=2, ensure_ascii=False), encoding="utf-8"
                 )
                 self.simulator.reset()
+                self._notify_motion()
                 self._cal_state["stage"] = "completed"
                 self._cal_state["waiting_for_input"] = False
                 self._cal_state["saved_path"] = str(cal_file)
-                self._cal_state["prompt"] = f"模拟标定完成 -> {cal_file.name}"
-                self.log(f"[dry_run] Calibration complete -> {cal_file.name}")
+                self._cal_state["prompt"] = f"模拟标定完成（已隔离保存至模拟目录 -> {cal_file.name}）"
+                self.log(f"[dry_run] Isolated sim calibration complete -> {cal_file.name}")
             except asyncio.CancelledError:
                 self.log("[dry_run] Calibration cancelled.")
                 raise
@@ -700,23 +918,30 @@ class WorkflowManager:
         )
 
         if self.hardware.active_mode == "real":
-            self.bridge.disconnect(return_to_rest=False, keep_torque=False)
-            proc_id = "workflow_teleop"
-            self.process_registry.spawn(
-                proc_id, "lerobot_teleoperate", cmd, cwd=self.config.workspace_root, on_line=self.log
+            dual_arm = bool(self.hardware.last_probe.get("dual_arm_ready", False))
+            self.simulator.set_linked_arms(True)
+            bridge_st = await asyncio.to_thread(
+                self.bridge.start_bidirectional_teleop,
+                fps=fps,
+                connect_leader=dual_arm,
             )
-            self._active_proc_id = proc_id
             self.active_workflow = "teleop"
             self.state = "running"
-            self.log(f"Started real teleoperation at {fps} FPS.")
+            self._notify_motion()
+            self.log(
+                f"Started real bidirectional teleop at {fps} FPS "
+                f"(follower={bridge_st['connected_follower']}, leader={bridge_st['connected_leader']})."
+            )
             return {
                 "status": "started",
                 "workflow": "teleop",
                 "mode": "real",
                 "fps": fps,
+                "bridge": bridge_st,
                 "command": cmd,
             }
 
+        self.simulator.set_linked_arms(True)
         self.active_workflow = "teleop"
         self.state = "running"
         self.current_step = 0
@@ -743,21 +968,33 @@ class WorkflowManager:
 
     async def stop_teleop(self) -> dict[str, Any]:
         if self.active_workflow == "teleop":
+            if self.bridge.direction == "teleop_bidirectional":
+                await asyncio.to_thread(
+                    self.bridge.disconnect, return_to_rest=False, keep_torque=False
+                )
             self._stop_active_process()
             await self._cancel_background_task()
             self.active_workflow = "idle"
             self.state = "idle"
-            self.log("Teleoperation stopped.")
+            self.log("Teleoperation stopped (servo torque safely released).")
         return {"status": "stopped", "workflow": "teleop"}
 
     def update_teleop_joints(self, raw_joints: dict[str, Any]) -> dict[str, Any]:
+        self._arbitrate_manual_write()
         validated = validate_joint_dict(raw_joints, require_non_empty=True)
+        # Respect user's current Link Leader-Follower toggle instead of forcing it back ON
         self.simulator.set_leader_joints(validated, step_immediately=True)
+        self._notify_motion()
         leader, follower, _ = self.simulator.snapshot()
+        real_dispatched = (
+            self.bridge.send_follower_target_deg(follower) if self.simulator.linked_arms else False
+        )
         return {
             "status": "ok",
             "leader_joints": leader,
             "follower_joints": follower,
+            "linked_arms": self.simulator.linked_arms,
+            "real_dispatched": real_dispatched,
         }
 
     # ------------------------------------------------------------------
@@ -786,6 +1023,8 @@ class WorkflowManager:
         }
         self._waypoints.append(wp)
         self._save_waypoints()
+        self.overlay_seq += 1
+        self._notify_motion()
         self.log(f"Recorded waypoint '{wp['label']}' (#{idx + 1}).")
         return {
             "status": "recorded",
@@ -804,6 +1043,19 @@ class WorkflowManager:
             "storage_path": rel_path.replace("\\", "/"),
         }
 
+    async def _ensure_real_drive_bridge(self) -> None:
+        """In real mode, ensure the follower bridge is connected in drive mode before replay/preset/routine."""
+        if self.hardware.active_mode != "real":
+            return
+        if self.bridge.direction in ("sim_to_real", "teleop_bidirectional"):
+            return
+        await asyncio.to_thread(
+            self.bridge.set_sync_mode,
+            "sim_to_real",
+            is_real_mode=True,
+            safety_confirmed=True,
+        )
+
     async def replay_waypoints(self, *, speed: float = 1.0, loop: bool = False) -> dict[str, Any]:
         self._sync_process_state()
         if len(self._waypoints) == 0:
@@ -811,6 +1063,7 @@ class WorkflowManager:
                 "No waypoints recorded to replay.", code="NO_WAYPOINTS"
             )
         await self._ensure_idle()
+        await self._ensure_real_drive_bridge()
         self.last_error = None
         self.active_workflow = "teaching_replay"
         self.state = "running"
@@ -819,14 +1072,14 @@ class WorkflowManager:
         self.log(f"Replaying {len(waypoints_snapshot)} waypoints (speed={speed}x).")
 
         async def _run_replay() -> None:
-            substeps = max(4, int(8 / max(0.1, speed)))
+            substeps = max(6, int(12 / max(0.1, speed)))
             try:
                 while True:
                     for wp in waypoints_snapshot:
                         _, start_j, _ = self.simulator.snapshot()
                         target_j = wp["joints"]
                         for s in range(1, substeps + 1):
-                            t = s / substeps
+                            t = 0.5 * (1.0 - math.cos(math.pi * (s / substeps)))
                             interp = {
                                 k: round(
                                     start_j[k] + (float(target_j[k]) - start_j[k]) * t, 3
@@ -835,8 +1088,10 @@ class WorkflowManager:
                             }
                             self.simulator.set_leader_joints(interp, step_immediately=False)
                             self.simulator.set_follower_joints(interp)
+                            self.bridge.send_follower_target_deg(interp)
+                            self._notify_motion()
                             self.current_step += 1
-                            await asyncio.sleep(0.02)
+                            await asyncio.sleep(0.03)
                     if not loop:
                         break
                 self.log("Waypoint replay finished.")
@@ -864,6 +1119,8 @@ class WorkflowManager:
             self.state = "idle"
         self._waypoints = []
         self._save_waypoints()
+        self.overlay_seq += 1
+        self._notify_motion()
         self.log("Cleared all teaching waypoints.")
         return {"status": "cleared", "count": 0}
 
@@ -989,12 +1246,29 @@ class WorkflowManager:
 
         async def _sim_collect() -> None:
             tick = max(0.03, min(0.1, 1.0 / max(1, fps)))
-            frames_per_ep = max(5, min(60, int(episode_time_s * 5)))
+            frames_per_ep = max(6, min(60, int(episode_time_s * 5)))
+            self.simulator.set_linked_arms(True)
             try:
                 for ep_num in range(1, num_episodes + 1):
                     self.current_episode = ep_num
                     for frame_i in range(frames_per_ep):
-                        self.simulator.step(tick)
+                        progress = frame_i / max(1, frames_per_ep - 1)
+                        wave = math.sin(progress * math.pi)
+                        pan = round(-24.0 + 52.0 * progress, 2)
+                        lift = round(30.0 * wave, 2)
+                        elbow = round(26.0 * wave, 2)
+                        wrist = round(-44.0 * wave, 2)
+                        grip = 72.0 if progress < 0.35 or progress > 0.82 else 14.0
+                        target_pose = {
+                            "shoulder_pan": pan,
+                            "shoulder_lift": lift,
+                            "elbow_flex": elbow,
+                            "wrist_flex": wrist,
+                            "wrist_roll": round(15.0 * math.sin(progress * math.pi * 2), 2),
+                            "gripper": grip,
+                        }
+                        self.simulator.set_leader_joints(target_pose, step_immediately=False)
+                        self.simulator.step(max(0.08, tick))
                         leader, follower, _ = self.simulator.snapshot()
                         if self._collect_ctx is not None:
                             self._collect_ctx["frames"].append(
@@ -1099,7 +1373,10 @@ class WorkflowManager:
                 valid.add(str(cid))
         return valid
 
-    def get_camera_jpeg(self, cam_id: str) -> bytes:
+    def release_cameras(self) -> None:
+        self._camera_hub.release_all()
+
+    def get_camera_jpeg(self, cam_id: str, theme: str = "light") -> bytes:
         if cam_id not in self._valid_camera_ids():
             raise KeyError(f"Camera '{cam_id}' not found.")
 
@@ -1114,7 +1391,7 @@ class WorkflowManager:
 
         if (
             self.hardware.active_mode == "real"
-            and self.active_workflow in ("idle", "calibrate")
+            and self.active_workflow in ("idle", "calibrate", "teleop")
             and (configured_raw is None or configured_raw.lower() != "none")
         ):
             for cam in self.hardware.last_probe.get("cameras", []):
@@ -1125,31 +1402,19 @@ class WorkflowManager:
                     else str(cam.get("id")) in (cam_id, logical_id)
                 )
                 if matched and cam.get("available"):
-                    try:
-                        import cv2
-
-                        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2
-                        with CAMERA_IO_LOCK:
-                            cap = cv2.VideoCapture(cam["index_or_path"], backend)
-                            try:
-                                if cap.isOpened():
-                                    ok, frame = cap.read()
-                                    if ok and frame is not None:
-                                        enc_ok, buf = cv2.imencode(".jpg", frame)
-                                        if enc_ok:
-                                            return bytes(buf)
-                            finally:
-                                cap.release()
-                    except Exception:
-                        pass
+                    frame_bytes = self._camera_hub.get_frame(cam["index_or_path"])
+                    if frame_bytes:
+                        return frame_bytes
 
         return self.simulator.render_camera_jpeg(
             logical_id,
             mode=self.hardware.active_mode,
             active_workflow=self.active_workflow,
+            theme=theme,
         )
 
     async def shutdown(self) -> None:
+        self._camera_hub.release_all()
         self.bridge.disconnect(return_to_rest=False, keep_torque=False)
         self._stop_active_process()
         await self._cancel_background_task()
@@ -1190,13 +1455,47 @@ class WorkflowManager:
     async def set_torque(self, enabled: bool) -> dict[str, Any]:
         if enabled and self.simulator.estop_latched:
             raise WorkflowConflictError("急停已锁定，请先解除急停后再使能扭矩。", code="ESTOP_LATCHED")
-        self.bridge.set_torque(enabled)
+        is_real = self.hardware.active_mode == "real"
+        if is_real and self._active_proc_id is not None and self.process_registry.is_running(self._active_proc_id):
+            raise WorkflowConflictError(
+                f"当前正在运行 '{self.active_workflow}'（串口被占用），请先停止该任务再切换真机扭矩。",
+                code="WORKFLOW_BUSY",
+            )
+        hw_ok, hw_msg = await asyncio.to_thread(
+            self.bridge.set_torque, enabled, is_real_mode=is_real
+        )
+        # In real mode, when disabling torque while idle, automatically start read-only real_to_sim
+        # so hand-guiding the limp arm immediately animates the 3D Studio for teaching & waypoint recording.
+        if is_real and not enabled and self.active_workflow == "idle" and self.bridge.direction == "off":
+            try:
+                await asyncio.to_thread(
+                    self.bridge.set_sync_mode,
+                    "real_to_sim",
+                    is_real_mode=True,
+                    safety_confirmed=False,
+                )
+                hw_ok = True
+                hw_msg = f"{hw_msg}（已自动开启真机→3D实时跟随，可直接手掰示教）"
+            except Exception:
+                pass
         self.simulator.torque_enabled = bool(enabled)
-        self.log(f"[SAFETY] Torque {'enabled' if enabled else 'disabled (sleep)'}.")
+        self._notify_motion()
+        self.log(f"[SAFETY] Torque {'enabled' if enabled else 'disabled'}: {hw_msg}")
         return {
             "status": "ok",
             "torque_enabled": self.simulator.torque_enabled,
             "estop_latched": self.simulator.estop_latched,
+            "hardware_applied": hw_ok,
+            "message": hw_msg,
+        }
+
+    def set_linked_arms(self, linked: bool) -> dict[str, Any]:
+        val = self.simulator.set_linked_arms(linked)
+        self._notify_motion()
+        self.log(f"Leader-Follower link {'enabled' if val else 'disabled'}.")
+        return {
+            "status": "ok",
+            "linked_arms": val,
         }
 
     def set_sim_joints(
@@ -1206,14 +1505,26 @@ class WorkflowManager:
         raw_joints: dict[str, Any],
         linked: bool | None = None,
     ) -> dict[str, Any]:
+        self._arbitrate_manual_write(allow_dry_calibrate=True)
         if self.simulator.estop_latched and arm in ("follower", "both"):
             raise WorkflowConflictError("急停已锁定 (E-STOP)，无法驱动从臂。", code="ESTOP_LATCHED")
         if linked is not None:
             self.simulator.set_linked_arms(linked)
         validated = validate_joint_dict(raw_joints, require_non_empty=True)
-        leader, follower = self.simulator.set_arm_joints(arm, validated, step_immediately=True)
+        in_dry_cal = self.active_workflow == "calibrate" and self.hardware.active_mode == "dry_run"
+        leader, follower = self.simulator.set_arm_joints(
+            arm,
+            validated,
+            step_immediately=not in_dry_cal,
+        )
+        if in_dry_cal:
+            cal_target = self._cal_state.get("target", "follower")
+            self._record_dry_cal_live_table(leader if cal_target == "leader" else follower)
+        self._notify_motion()
         real_dispatched = False
-        if arm in ("follower", "both") or (arm == "leader" and self.simulator.linked_arms):
+        if not in_dry_cal and (
+            arm in ("follower", "both") or (arm == "leader" and self.simulator.linked_arms)
+        ):
             real_dispatched = self.bridge.send_follower_target_deg(follower)
         return {
             "status": "ok",
@@ -1235,26 +1546,37 @@ class WorkflowManager:
         z_mm: float,
         pitch_deg: float | None = None,
         gripper: float | None = None,
+        clamp_to_workspace: bool = False,
     ) -> dict[str, Any]:
-        if self.simulator.estop_latched and arm in ("follower", "both"):
+        self._arbitrate_manual_write(allow_dry_calibrate=False)
+        if self.simulator.estop_latched and (
+            arm in ("follower", "both") or (arm == "leader" and self.simulator.linked_arms)
+        ):
             raise WorkflowConflictError("急停已锁定 (E-STOP)，无法执行 IK 驱动。", code="ESTOP_LATCHED")
         leader_cur, follower_cur, _ = self.simulator.snapshot()
         base_joints = leader_cur if arm == "leader" else follower_cur
-        solved = solve_ik_target(
+        solved, clamped, boundary_msg = solve_ik_target_with_status(
             x_mm=x_mm,
             y_mm=y_mm,
             z_mm=z_mm,
             current_joints=base_joints,
             pitch_deg=pitch_deg,
             gripper=gripper,
+            clamp_to_workspace=clamp_to_workspace,
         )
-        leader, follower = self.simulator.set_arm_joints(arm, solved, step_immediately=True)
+        effective_arm: Literal["leader", "follower", "both"] = (
+            "both" if (arm == "leader" and self.simulator.linked_arms) else arm
+        )
+        leader, follower = self.simulator.set_arm_joints(effective_arm, solved, step_immediately=True)
+        self._notify_motion()
         real_dispatched = False
-        if arm in ("follower", "both"):
+        if effective_arm in ("follower", "both"):
             real_dispatched = self.bridge.send_follower_target_deg(follower)
         return {
             "status": "ok",
             "arm": arm,
+            "clamped": clamped,
+            "boundary_message": boundary_msg if clamped else "",
             "solved_joints": solved,
             "leader_joints": leader,
             "follower_joints": follower,
@@ -1278,7 +1600,9 @@ class WorkflowManager:
         return res
 
     def send_control_key(self, key: str, step_mm: float = 8.0) -> dict[str, Any]:
+        self._arbitrate_manual_write()
         res = self.simulator.step_cartesian_key(key, step_mm=step_mm)
+        self._notify_motion()
         if res.get("action") == "estop":
             self.bridge.trigger_estop("Keyboard SPACE E-Stop")
             self.log("[SAFETY] Keyboard SPACE triggered E-STOP.")
@@ -1343,6 +1667,7 @@ class WorkflowManager:
         if self.simulator.estop_latched:
             raise WorkflowConflictError("急停已锁定，请先解除急停。", code="ESTOP_LATCHED")
         await self._ensure_idle()
+        await self._ensure_real_drive_bridge()
         target = self._load_preset_pose_deg(pose_name)
         self.active_workflow = "demo_routine"
         self.state = "running"
@@ -1383,6 +1708,7 @@ class WorkflowManager:
         if self.simulator.estop_latched:
             raise WorkflowConflictError("急停已锁定，请先解除急停。", code="ESTOP_LATCHED")
         await self._ensure_idle()
+        await self._ensure_real_drive_bridge()
         self.active_workflow = "demo_routine"
         self.state = "running"
         self.log(f"[DEMO] Starting routine '{routine}'...")

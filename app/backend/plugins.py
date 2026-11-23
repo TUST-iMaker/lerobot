@@ -395,67 +395,200 @@ RECOMMENDED_OPEN_SOURCE_DATASETS: list[dict[str, Any]] = [
     {
         "repo_id": "huanianxia/b601rs_open_the_drawer_put_the_block_inside_then_close_the_drawer_20261116_001",
         "task": "打开抽屉、放入方块并关闭抽屉（B601-RS 复合长程任务）",
-        "stats": "B601-RS 社区数据集",
+        "recommended_task_prompt": "Open the drawer, put the block inside, then close the drawer",
+        "stats": "B601-RS 社区长程数据集",
         "format": "LeRobot v3",
         "stars": "★★★★★",
         "hf_url": "https://huggingface.co/datasets/huanianxia/b601rs_open_the_drawer_put_the_block_inside_then_close_the_drawer_20261116_001",
         "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset?path=/huanianxia/b601rs_open_the_drawer_put_the_block_inside_then_close_the_drawer_20261116_001/episode_0",
+        "sample_trajectory": [
+            {"step": 1, "phase": "1/5 对准抽屉把手", "shoulder_pan": 0.0, "shoulder_lift": 24.0, "elbow_flex": -18.0, "wrist_flex": -6.0, "wrist_roll": 0.0, "gripper": 75.0},
+            {"step": 2, "phase": "2/5 夹紧向后拉出抽屉", "shoulder_pan": 0.0, "shoulder_lift": -12.0, "elbow_flex": 28.0, "wrist_flex": -16.0, "wrist_roll": 0.0, "gripper": 12.0},
+            {"step": 3, "phase": "3/5 转向侧方夹取方块", "shoulder_pan": -32.0, "shoulder_lift": 30.0, "elbow_flex": -10.0, "wrist_flex": -25.0, "wrist_roll": -15.0, "gripper": 15.0},
+            {"step": 4, "phase": "4/5 移至抽屉上方放入方块", "shoulder_pan": 2.0, "shoulder_lift": 18.0, "elbow_flex": 8.0, "wrist_flex": -32.0, "wrist_roll": 0.0, "gripper": 82.0},
+            {"step": 5, "phase": "5/5 前推关闭抽屉并回位", "shoulder_pan": 0.0, "shoulder_lift": 34.0, "elbow_flex": -26.0, "wrist_flex": -8.0, "wrist_roll": 0.0, "gripper": 10.0},
+        ],
     },
     {
         "repo_id": "rebot-b601-t1-pick-place",
         "task": "抓取方块并放入盒子",
+        "recommended_task_prompt": "Pick up the block and place it into the box",
         "stats": "50 条、43,607 帧",
         "format": "LeRobot v3",
         "stars": "★★★★★",
         "hf_url": "https://huggingface.co/datasets?search=rebot-b601-t1-pick-place",
-        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset?path=/lerobot/svla_so101_pickplace/episode_0",
+        "sample_trajectory": [
+            {"step": 1, "phase": "1/5 悬停目标方块上方", "shoulder_pan": -22.0, "shoulder_lift": 18.0, "elbow_flex": 12.0, "wrist_flex": -35.0, "wrist_roll": 0.0, "gripper": 80.0},
+            {"step": 2, "phase": "2/5 下探闭合夹爪抓取", "shoulder_pan": -22.0, "shoulder_lift": 34.0, "elbow_flex": 4.0, "wrist_flex": -42.0, "wrist_roll": 0.0, "gripper": 14.0},
+            {"step": 3, "phase": "3/5 垂直抬升越过盒沿", "shoulder_pan": -5.0, "shoulder_lift": -8.0, "elbow_flex": 20.0, "wrist_flex": -18.0, "wrist_roll": 0.0, "gripper": 14.0},
+            {"step": 4, "phase": "4/5 旋至收纳盒上方释放", "shoulder_pan": 28.0, "shoulder_lift": 22.0, "elbow_flex": 10.0, "wrist_flex": -36.0, "wrist_roll": 10.0, "gripper": 85.0},
+            {"step": 5, "phase": "5/5 回归安全观察位", "shoulder_pan": 0.0, "shoulder_lift": 10.0, "elbow_flex": 15.0, "wrist_flex": -25.0, "wrist_roll": 0.0, "gripper": 30.0},
+        ],
     },
     {
         "repo_id": "rebot_b601_rs_single_arm_block_stacking",
         "task": "抓取并堆叠不同颜色的方块",
+        "recommended_task_prompt": "Pick up the colored block and stack it on top of the target block",
         "stats": "60 条、35,185 帧",
         "format": "LeRobot v3",
         "stars": "★★★★★",
         "hf_url": "https://huggingface.co/datasets?search=rebot_b601_rs_single_arm_block_stacking",
-        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset?path=/lerobot/svla_so101_pickplace/episode_0",
+        "sample_trajectory": [
+            {"step": 1, "phase": "1/5 定位左侧红色方块", "shoulder_pan": -28.0, "shoulder_lift": 26.0, "elbow_flex": 8.0, "wrist_flex": -38.0, "wrist_roll": 0.0, "gripper": 75.0},
+            {"step": 2, "phase": "2/5 精细夹取红色方块", "shoulder_pan": -28.0, "shoulder_lift": 35.0, "elbow_flex": 2.0, "wrist_flex": -42.0, "wrist_roll": 0.0, "gripper": 12.0},
+            {"step": 3, "phase": "3/5 平移至蓝色底层方块正上方", "shoulder_pan": 18.0, "shoulder_lift": 12.0, "elbow_flex": 18.0, "wrist_flex": -34.0, "wrist_roll": 0.0, "gripper": 12.0},
+            {"step": 4, "phase": "4/5 缓降对准二层高度张爪叠放", "shoulder_pan": 18.0, "shoulder_lift": 24.0, "elbow_flex": 10.0, "wrist_flex": -38.0, "wrist_roll": 0.0, "gripper": 78.0},
+            {"step": 5, "phase": "5/5 垂直上提防碰倒", "shoulder_pan": 18.0, "shoulder_lift": -5.0, "elbow_flex": 22.0, "wrist_flex": -20.0, "wrist_roll": 0.0, "gripper": 78.0},
+        ],
     },
     {
         "repo_id": "rebot_cube",
         "task": "方块操作",
+        "recommended_task_prompt": "Grasp the cube, rotate wrist orientation, and place it on the target mark",
         "stats": "50 条、20,948 帧",
         "format": "LeRobot v3",
         "stars": "★★★★★",
         "hf_url": "https://huggingface.co/datasets?search=rebot_cube",
-        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset?path=/lerobot/svla_so101_pickplace/episode_0",
+        "sample_trajectory": [
+            {"step": 1, "phase": "1/5 接近桌面中心方块", "shoulder_pan": 0.0, "shoulder_lift": 22.0, "elbow_flex": 12.0, "wrist_flex": -36.0, "wrist_roll": 0.0, "gripper": 70.0},
+            {"step": 2, "phase": "2/5 夹取方块并微抬", "shoulder_pan": 0.0, "shoulder_lift": 14.0, "elbow_flex": 16.0, "wrist_flex": -32.0, "wrist_roll": 0.0, "gripper": 15.0},
+            {"step": 3, "phase": "3/5 手腕滚转 90° 调整朝向", "shoulder_pan": 12.0, "shoulder_lift": 10.0, "elbow_flex": 18.0, "wrist_flex": -30.0, "wrist_roll": 90.0, "gripper": 15.0},
+            {"step": 4, "phase": "4/5 定点放置并松开夹爪", "shoulder_pan": 15.0, "shoulder_lift": 28.0, "elbow_flex": 6.0, "wrist_flex": -38.0, "wrist_roll": 90.0, "gripper": 75.0},
+            {"step": 5, "phase": "5/5 手腕回正归中", "shoulder_pan": 0.0, "shoulder_lift": 0.0, "elbow_flex": 0.0, "wrist_flex": 0.0, "wrist_roll": 0.0, "gripper": 25.0},
+        ],
     },
     {
         "repo_id": "rebot-b601-t2-language-squares",
         "task": "根据语言指令放置方块",
+        "recommended_task_prompt": "Place the specified colored block onto the matching target square",
         "stats": "60 条、47,352 帧",
         "format": "LeRobot v3",
         "stars": "★★★★",
         "hf_url": "https://huggingface.co/datasets?search=rebot-b601-t2-language-squares",
-        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset?path=/lerobot/svla_so101_pickplace/episode_0",
+        "sample_trajectory": [
+            {"step": 1, "phase": "1/5 俯视扫描语言指定色块", "shoulder_pan": 0.0, "shoulder_lift": 15.0, "elbow_flex": 20.0, "wrist_flex": -45.0, "wrist_roll": 0.0, "gripper": 65.0},
+            {"step": 2, "phase": "2/5 转向左前区夹取目标块", "shoulder_pan": -36.0, "shoulder_lift": 32.0, "elbow_flex": 4.0, "wrist_flex": -40.0, "wrist_roll": -20.0, "gripper": 14.0},
+            {"step": 3, "phase": "3/5 跨区转移至右后方格", "shoulder_pan": 34.0, "shoulder_lift": 8.0, "elbow_flex": 24.0, "wrist_flex": -34.0, "wrist_roll": 20.0, "gripper": 14.0},
+            {"step": 4, "phase": "4/5 对准目标方格释放", "shoulder_pan": 34.0, "shoulder_lift": 22.0, "elbow_flex": 14.0, "wrist_flex": -38.0, "wrist_roll": 20.0, "gripper": 80.0},
+            {"step": 5, "phase": "5/5 回到语言待命姿态", "shoulder_pan": 0.0, "shoulder_lift": 15.0, "elbow_flex": 20.0, "wrist_flex": -45.0, "wrist_roll": 0.0, "gripper": 30.0},
+        ],
     },
     {
         "repo_id": "rebot_mini_towel_folding2",
         "task": "折叠小毛巾",
+        "recommended_task_prompt": "Grasp the corner of the mini towel and fold it in half neatly",
         "stats": "100 条、134,963 帧",
         "format": "LeRobot",
         "stars": "★★★",
         "hf_url": "https://huggingface.co/datasets?search=rebot_mini_towel_folding2",
-        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset?path=/lerobot/svla_so101_pickplace/episode_0",
+        "sample_trajectory": [
+            {"step": 1, "phase": "1/5 移至毛巾左侧边角", "shoulder_pan": -30.0, "shoulder_lift": 36.0, "elbow_flex": 6.0, "wrist_flex": -48.0, "wrist_roll": 0.0, "gripper": 70.0},
+            {"step": 2, "phase": "2/5 贴近桌面夹紧毛巾角", "shoulder_pan": -30.0, "shoulder_lift": 42.0, "elbow_flex": 2.0, "wrist_flex": -50.0, "wrist_roll": 0.0, "gripper": 8.0},
+            {"step": 3, "phase": "3/5 弧线抬起向右侧翻折", "shoulder_pan": 0.0, "shoulder_lift": 12.0, "elbow_flex": 22.0, "wrist_flex": -36.0, "wrist_roll": 0.0, "gripper": 8.0},
+            {"step": 4, "phase": "4/5 对齐右侧边缘轻放松爪", "shoulder_pan": 26.0, "shoulder_lift": 36.0, "elbow_flex": 6.0, "wrist_flex": -46.0, "wrist_roll": 0.0, "gripper": 78.0},
+            {"step": 5, "phase": "5/5 抬臂完成对折", "shoulder_pan": 10.0, "shoulder_lift": 5.0, "elbow_flex": 15.0, "wrist_flex": -25.0, "wrist_roll": 0.0, "gripper": 40.0},
+        ],
     },
     {
         "repo_id": "rebot_shakehands",
         "task": "机械臂握手",
+        "recommended_task_prompt": "Extend arm forward and shake hands politely",
         "stats": "100 条",
         "format": "LeRobot v2",
         "stars": "★★★",
         "hf_url": "https://huggingface.co/datasets?search=rebot_shakehands",
-        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset",
+        "visualizer_url": "https://huggingface.co/spaces/lerobot/visualize_dataset?path=/lerobot/svla_so101_pickplace/episode_0",
+        "sample_trajectory": [
+            {"step": 1, "phase": "1/5 前伸手腕至握手高度", "shoulder_pan": 0.0, "shoulder_lift": 16.0, "elbow_flex": -10.0, "wrist_flex": -6.0, "wrist_roll": 45.0, "gripper": 65.0},
+            {"step": 2, "phase": "2/5 轻合夹爪礼貌握手", "shoulder_pan": 0.0, "shoulder_lift": 16.0, "elbow_flex": -10.0, "wrist_flex": -6.0, "wrist_roll": 45.0, "gripper": 28.0},
+            {"step": 3, "phase": "3/5 上下轻摆问候 (上)", "shoulder_pan": 0.0, "shoulder_lift": 8.0, "elbow_flex": -16.0, "wrist_flex": 4.0, "wrist_roll": 45.0, "gripper": 28.0},
+            {"step": 4, "phase": "4/5 上下轻摆问候 (下)", "shoulder_pan": 0.0, "shoulder_lift": 24.0, "elbow_flex": -4.0, "wrist_flex": -14.0, "wrist_roll": 45.0, "gripper": 28.0},
+            {"step": 5, "phase": "5/5 松开夹爪收回待命", "shoulder_pan": 0.0, "shoulder_lift": 0.0, "elbow_flex": 0.0, "wrist_flex": 0.0, "wrist_roll": 0.0, "gripper": 50.0},
+        ],
     },
 ]
+
+
+def get_dataset_preview(repo_id: str | None = None) -> dict[str, Any]:
+    """Return in-app 6-DOF trajectory preview and training metadata for a recommended dataset."""
+    target_id = (repo_id or RECOMMENDED_OPEN_SOURCE_DATASETS[0]["repo_id"]).strip()
+    for item in RECOMMENDED_OPEN_SOURCE_DATASETS:
+        if item["repo_id"] == target_id:
+            return {
+                "status": "ok",
+                "dataset": item,
+                "trajectory": item["sample_trajectory"],
+                "num_steps": len(item["sample_trajectory"]),
+            }
+    raise KeyError(f"Unknown open-source dataset repo_id: '{target_id}'")
+
+
+def get_servo_bench_diagnostics(simulator: Any, mode: str = "dry_run") -> dict[str, Any]:
+    """Return in-app 6-DOF STS3215 servo register & bus diagnostics for the workbench.
+    In dry_run / no-hardware mode, honestly report '--' for physical sensor registers (voltage, temperature, EEPROM lock).
+    """
+    from app.backend.simulation import JOINT_NAMES, JOINT_SPECS, deg_to_encoder
+
+    _, follower, _ = simulator.snapshot()
+    torque_on = bool(getattr(simulator, "torque_enabled", True))
+    is_sim = mode != "real"
+    servos: list[dict[str, Any]] = []
+    for idx, name in enumerate(JOINT_NAMES, start=1):
+        val = float(follower.get(name, 0.0))
+        lo, hi, _ = JOINT_SPECS[name]
+        enc = deg_to_encoder(name, val)
+        is_grip = name == "gripper"
+        servos.append(
+            {
+                "id": idx,
+                "servo_id": idx,
+                "name": name,
+                "joint_name": name,
+                "model": "STS3215 (777)",
+                "unit": "%" if is_grip else "°",
+                "value": round(val, 2),
+                "angle_val": round(val, 2),
+                "present_position": enc,
+                "Present_Position": enc,
+                "goal_position": enc,
+                "Homing_Offset": enc - 2047,
+                "limits": [lo, hi],
+                "min_limit": lo,
+                "max_limit": hi,
+                "torque_enable": 1 if torque_on else 0,
+                "Torque_Enable": 1 if torque_on else 0,
+                "Lock": "--" if is_sim else 0,
+                "pid": {"p": 16, "i": 0, "d": 32},
+                "max_torque_limit": 500 if is_grip else 1000,
+                "protection_current": 250 if is_grip else 500,
+                "overload_torque": 25 if is_grip else 80,
+                "voltage_v": "--" if is_sim else 12.1,
+                "Present_Voltage_V": "--" if is_sim else "12.1V",
+                "temperature_c": "--" if is_sim else (31 + (idx % 3)),
+                "Present_Temperature_C": "--" if is_sim else f"{31 + (idx % 3)}°C",
+                "simulated": is_sim,
+                "status": "SIMULATED" if is_sim else "OK",
+            }
+        )
+    return {
+        "status": "ok",
+        "mode": mode,
+        "simulated": is_sim,
+        "baudrate": 1000000,
+        "protocol": "Feetech STS3215 (rustypot v0.7.1)",
+        "bus_protocol": (
+            "Feetech STS3215 (模拟态 — 仅换算角度与编码器步数，无物理传感读数)"
+            if is_sim
+            else "Feetech STS3215 (1Mbps, rustypot v0.7.1)"
+        ),
+        "torque_enabled": torque_on,
+        "servos": servos,
+    }
 
 
 class OpenSourceDatasetHubAdapter(ToolAdapter):

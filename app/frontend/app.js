@@ -1,48 +1,60 @@
-import { StickArmCanvas, renderStickTelemetryHtml, computeStickFK } from "/static/stick_sim.js";
-
-const JOINTS = [
-  { key: "shoulder_pan", label: "#1 底座旋转 (shoulder_pan)", min: -110, max: 110, unit: "°", def: 0 },
-  { key: "shoulder_lift", label: "#2 大臂俯仰 (shoulder_lift)", min: -100, max: 100, unit: "°", def: 0 },
-  { key: "elbow_flex", label: "#3 小臂肘弯 (elbow_flex)", min: -97, max: 97, unit: "°", def: 0 },
-  { key: "wrist_flex", label: "#4 手腕俯仰 (wrist_flex)", min: -95, max: 95, unit: "°", def: 0 },
-  { key: "wrist_roll", label: "#5 手腕滚转 (wrist_roll)", min: -157, max: 163, unit: "°", def: 0 },
-  { key: "gripper", label: "#6 末端夹爪 (gripper)", min: 0, max: 100, unit: "%", def: 20 },
-];
+import {
+  StickArmCanvas,
+  renderStickTelemetryHtml,
+  computeStickFK,
+  fmtZero,
+} from "/static/stick_sim.js?v=2026112304";
+import {
+  JOINTS,
+  formatJointReadout,
+  apiFetch as busApiFetch,
+  createStudioSocket,
+  StagePopupMutex,
+  getStoredTheme,
+  applyThemeToDocument,
+} from "/static/studio_bus.js?v=2026112304";
 
 const state = {
+  theme: getStoredTheme(),
   mode: "dry_run",
+  activeTab: "dashboard",
   activeWorkflow: "idle",
   lastCalStage: "idle",
-  linkedArms: false,
+  linkedArms: true,
   torqueEnabled: true,
   estopLatched: false,
+  stageViewMode: "dual", // "dual" | "follower" | "leader"
+  stageCollapsed: false,
+  userStageCollapsed: null, // null = auto (1..4 open, 5..7 collapsed); boolean = user override
+  popupActive: false,
+  activeSliderId: null,
+  sliderCooldownTs: {},
+  filledCollectConfig: null,
   leaderJoints: Object.fromEntries(JOINTS.map((j) => [j.key, j.def])),
   followerJoints: Object.fromEntries(JOINTS.map((j) => [j.key, j.def])),
   waypoints: [],
   vlaChunk: [],
+  overlayBadge: "",
   vlaAnimTimer: null,
   epReplayTimer: null,
+  pluginReplayTimer: null,
+  pluginsCache: [],
   localLogs: [],
-  ws: null,
-  wsRetryMs: 1000,
   pollTimer: null,
   camTimer: null,
+  toastTimer: null,
   jointSendTimer: null,
   pendingJoints: {},
   simSendTimers: { leader: null, follower: null },
   simPending: { leader: {}, follower: {} },
 };
 
-const stickViews = {
-  cal: null,
-  teleopLeader: null,
-  teleopFollower: null,
-  simLeader: null,
-  simFollower: null,
-  teach: null,
-  collect: null,
-  vla: null,
+const stageViews = {
+  leader: null,
+  follower: null,
 };
+
+let popupMutex = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -62,106 +74,308 @@ function renderLogs(backendLogs) {
 }
 
 async function apiFetch(url, options = {}) {
-  try {
-    const resp = await fetch(url, {
-      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-      ...options,
-    });
-    const text = await resp.text();
-    let data = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      data = { detail: text };
-    }
-    if (!resp.ok) {
-      const detail =
-        (data && data.detail && (typeof data.detail === "string" ? data.detail : data.detail.detail)) ||
-        data.detail ||
-        `HTTP ${resp.status}`;
-      appendLocalLog(`请求提示 (${resp.status}): ${detail}`);
-      return { ok: false, status: resp.status, data };
-    }
-    return { ok: true, status: resp.status, data };
-  } catch (err) {
-    appendLocalLog(`网络异常: ${err.message || err}`);
-    return { ok: false, status: 0, data: { detail: String(err) } };
+  return busApiFetch(url, options, appendLocalLog);
+}
+
+let _lastBoundaryToastTs = 0;
+
+function showAnomalyToast(message, { sticky = false, level = "danger", durationMs = 3600 } = {}) {
+  const strip = $("anomaly-toast-strip");
+  const textEl = $("anomaly-toast-text");
+  const dotEl = $("anomaly-toast-dot");
+  if (!strip || !textEl) return;
+  textEl.textContent = message;
+  strip.className = `anomaly-toast toast-${level}`;
+  if (dotEl) {
+    dotEl.className = `status-dot dot-${level === "ok" ? "ok" : level === "warn" ? "warn" : level === "info" ? "info" : "danger"}`;
+  }
+  strip.hidden = false;
+  if (state.toastTimer) {
+    clearTimeout(state.toastTimer);
+    state.toastTimer = null;
+  }
+  if (!sticky && !state.estopLatched) {
+    state.toastTimer = setTimeout(() => {
+      if (!state.estopLatched) strip.hidden = true;
+    }, durationMs);
   }
 }
 
-function setModeUI(mode) {
-  state.mode = mode;
-  const badge = $("mode-badge");
-  const banner = $("hardware-status-banner");
-  if (badge) {
-    if (mode === "real") {
-      badge.textContent = "REAL 硬件模式";
-      badge.className = "mode-badge mode-real";
-    } else {
-      badge.textContent = "DRY-RUN 模拟模式";
-      badge.className = "mode-badge mode-dry";
-    }
-  }
-  if (banner) {
-    banner.className = mode === "real" ? "hw-banner hw-real" : "hw-banner hw-dry";
+function showFeedbackToast(message, level = "info") {
+  if (state.estopLatched) return;
+  showAnomalyToast(message, { sticky: false, level, durationMs: 2400 });
+}
+
+function showBoundaryToast(message) {
+  const now = performance.now();
+  if (now - _lastBoundaryToastTs < 1500) return;
+  _lastBoundaryToastTs = now;
+  showFeedbackToast(message || "已触达 SO-101 物理工作空间边界", "warn");
+}
+
+function clearAnomalyToast() {
+  const strip = $("anomaly-toast-strip");
+  if (strip && !state.estopLatched) {
+    strip.hidden = true;
   }
 }
 
-function updateSafetyUI(safety) {
-  if (!safety) return;
-  state.torqueEnabled = Boolean(safety.torque_enabled);
-  state.estopLatched = Boolean(safety.estop_latched);
-
-  const tBadge = $("torque-badge");
-  if (tBadge) {
-    tBadge.textContent = state.torqueEnabled ? "⚡ 扭矩: 使能" : "💤 扭矩: 已释放";
-    tBadge.className = state.torqueEnabled ? "pill pill-ok" : "pill pill-warn";
-  }
-  const eBadge = $("estop-badge");
-  const btnReset = $("btn-global-reset");
-  if (eBadge) {
-    eBadge.textContent = state.estopLatched ? "🛑 急停已锁定 (ESTOP)" : "安全状态: 正常";
-    eBadge.className = state.estopLatched ? "pill pill-warn" : "pill pill-info";
-  }
-  if (btnReset) {
-    btnReset.hidden = !state.estopLatched;
-  }
+/* ==========================================================================
+   Global Single Persistent 3D Stage Dock, 4 Structural Resizers & Control Mutex
+   ========================================================================== */
+function refreshStageSizes() {
+  requestAnimationFrame(() => {
+    stageViews.leader?.refreshSize?.();
+    stageViews.follower?.refreshSize?.();
+  });
 }
 
-function updateConnectionBadge(conn) {
-  const badge = $("teleop-connection-badge");
-  if (!badge) return;
-  if (state.mode === "real" && conn && conn.hardware_ready) {
-    badge.textContent = `✓ 主从臂连接成功 (从臂 ${conn.follower_port} ← 主臂 ${conn.leader_port})`;
-    badge.className = "conn-badge conn-ok";
+function setStageViewMode(mode) {
+  state.stageViewMode = mode;
+  ["dual", "follower", "leader"].forEach((m) => {
+    const btn = $(`btn-stage-mode-${m}`);
+    if (btn) btn.classList.toggle("active", m === mode);
+  });
+  const slotL = $("stage-slot-leader");
+  const slotF = $("stage-slot-follower");
+  const armResizer = $("stage-arms-resizer");
+  if (slotL) {
+    slotL.hidden = mode === "follower";
+    if (mode !== "dual") slotL.style.flex = "1";
+  }
+  if (slotF) {
+    slotF.hidden = mode === "leader";
+    if (mode !== "dual") slotF.style.flex = "1";
+  }
+  if (armResizer) armResizer.hidden = mode !== "dual";
+  refreshStageSizes();
+}
+
+function syncArmControlMutexUI() {
+  const linked = Boolean(state.linkedArms);
+  const inCal = state.activeWorkflow === "calibrate";
+  const ikAllowed = Boolean($("chk-sim-ik-drag")?.checked ?? true) && !inCal;
+
+  const chk = $("chk-sim-linked");
+  const pill = $("sim-linked-pill");
+  const txt = $("sim-linked-text");
+  const teleopLinkBtn = $("btn-teleop-link-toggle");
+
+  if (chk) chk.checked = linked;
+  if (pill) pill.classList.toggle("active", linked);
+  if (txt) txt.textContent = linked ? "Link Leader-Follower: 开" : "Link Leader-Follower: 关";
+  if (teleopLinkBtn) {
+    teleopLinkBtn.classList.toggle("active", linked);
+    teleopLinkBtn.textContent = linked ? "主从联动: 开" : "主从联动: 关";
+  }
+
+  // Mutual exclusion: when Link Leader-Follower is ON, lock & grey out Follower manual controls + Follower IK ring
+  const fCard = $("sim-follower-card");
+  const fBadge = $("sim-follower-lock-badge");
+  const fHomeBtn = $("btn-sim-follower-home");
+  if (fCard) fCard.classList.toggle("card-locked", linked);
+  if (fBadge) fBadge.hidden = !linked;
+  if (fHomeBtn) fHomeBtn.disabled = linked;
+  document.querySelectorAll("#sim-follower-sliders .joint-slider").forEach((sl) => {
+    sl.disabled = linked;
+  });
+
+  const ikLabel = $("ik-target-arm-label");
+  if (ikLabel) {
+    ikLabel.textContent = linked
+      ? "主臂末端 IK 坐标 (联动从臂, mm)"
+      : "从臂末端 IK 坐标 (独立控制, mm)";
+  }
+
+  // Calibration is strictly joint-space (no red-ring IK on either arm)
+  if (inCal) {
+    stageViews.leader?.setIkEnabled(false);
+    stageViews.follower?.setIkEnabled(false);
+    stageViews.leader?.setState({ label: "Leader 主臂 (标定中)" });
+    stageViews.follower?.setState({ label: "Follower 从臂 (标定中)" });
+  } else if (linked) {
+    stageViews.leader?.setIkEnabled(ikAllowed);
+    stageViews.follower?.setIkEnabled(false);
+    stageViews.leader?.setState({ label: ikAllowed ? "Leader 主臂 (红圈IK · 联动)" : "Leader 主臂 (联动)" });
+    stageViews.follower?.setState({ label: "Follower 从臂 (跟随主臂)" });
   } else {
-    badge.textContent = "模拟演练模式（主从联动就绪）";
-    badge.className = "conn-badge conn-sim";
+    stageViews.leader?.setIkEnabled(false);
+    stageViews.follower?.setIkEnabled(ikAllowed);
+    stageViews.leader?.setState({ label: "Leader 主臂 (独立)" });
+    stageViews.follower?.setState({ label: ikAllowed ? "Follower 从臂 (红圈IK)" : "Follower 从臂 (独立)" });
   }
 }
 
-function initStickCanvases() {
-  stickViews.cal = new StickArmCanvas($("canvas-cal-stick"), {
-    role: "follower",
-    title: "标定中位比对 (虚影=官方前伸中位)",
-    accent: "#06b6d4",
-    showHomingRef: true,
-  });
-  stickViews.teleopLeader = new StickArmCanvas($("canvas-teleop-leader"), {
-    role: "leader",
-    title: "主臂 Leader (操控端)",
-    accent: "#3b82f6",
-  });
-  stickViews.teleopFollower = new StickArmCanvas($("canvas-teleop-follower"), {
-    role: "follower",
-    title: "从臂 Follower (跟随端)",
-    accent: "#06b6d4",
-  });
-  stickViews.simLeader = new StickArmCanvas($("canvas-sim-leader"), {
-    role: "leader",
-    title: "主臂 Leader 6-DOF (独立控制)",
-    accent: "#3b82f6",
-  });
+function updateTeleopButtonsUI() {
+  const running = state.activeWorkflow === "teleop";
+  const btnStart = $("btn-start-teleop");
+  const btnStop = $("btn-stop-teleop");
+  const camCard = $("teleop-cam-card");
+
+  if (btnStart) {
+    btnStart.disabled = running;
+    btnStart.classList.toggle("btn-teleop-live", running);
+    btnStart.textContent = running ? "遥操作运行中" : "启动遥操作";
+  }
+  if (btnStop) {
+    btnStop.disabled = !running;
+    btnStop.className = running ? "btn btn-xs btn-estop" : "btn btn-xs btn-secondary";
+  }
+  if (camCard) {
+    camCard.classList.toggle("teleop-running-card", running);
+  }
+}
+
+function initStructuralResizers() {
+  // Resizer 1: Global 3D Stage Dock Width (330px .. 520px)
+  const stageHandle = $("stage-resize-handle");
+  const dock = $("global-stage-dock");
+  if (stageHandle && dock) {
+    let dragging = false;
+    stageHandle.addEventListener("pointerdown", (ev) => {
+      dragging = true;
+      stageHandle.setPointerCapture(ev.pointerId);
+    });
+    stageHandle.addEventListener("pointermove", (ev) => {
+      if (!dragging) return;
+      const dockRect = dock.getBoundingClientRect();
+      const nextW = Math.max(330, Math.min(520, Math.round(ev.clientX - dockRect.left)));
+      document.documentElement.style.setProperty("--stage-dock-w", `${nextW}px`);
+      refreshStageSizes();
+    });
+    const end = () => { dragging = false; };
+    stageHandle.addEventListener("pointerup", end);
+    stageHandle.addEventListener("pointercancel", end);
+  }
+
+  // Resizer 2: Inside 3D Stage — Leader / Follower Vertical Split
+  const armResizer = $("stage-arms-resizer");
+  const stack = $("stage-stack");
+  const slotL = $("stage-slot-leader");
+  const slotF = $("stage-slot-follower");
+  if (armResizer && stack && slotL && slotF) {
+    let dragging = false;
+    armResizer.addEventListener("pointerdown", (ev) => {
+      dragging = true;
+      armResizer.classList.add("dragging");
+      armResizer.setPointerCapture(ev.pointerId);
+    });
+    armResizer.addEventListener("pointermove", (ev) => {
+      if (!dragging) return;
+      const rect = stack.getBoundingClientRect();
+      const usableH = Math.max(280, rect.height - 16);
+      const topH = Math.max(135, Math.min(usableH - 135, ev.clientY - rect.top - 8));
+      const ratio = topH / usableH;
+      slotL.style.flex = `${ratio.toFixed(3)} 1 0px`;
+      slotF.style.flex = `${(1 - ratio).toFixed(3)} 1 0px`;
+      refreshStageSizes();
+    });
+    const end = () => {
+      dragging = false;
+      armResizer.classList.remove("dragging");
+    };
+    armResizer.addEventListener("pointerup", end);
+    armResizer.addEventListener("pointercancel", end);
+  }
+
+  // Resizer 3: Tab 2 Teleop — Dual Cameras / Bottom Controls Vertical Split
+  const camResizer = $("teleop-cam-resizer");
+  if (camResizer) {
+    let dragging = false;
+    let startY = 0;
+    let startH = 168;
+    camResizer.addEventListener("pointerdown", (ev) => {
+      const firstFrame = document.querySelector("#teleop-cam-card .cam-frame");
+      if (!firstFrame) return;
+      dragging = true;
+      startY = ev.clientY;
+      startH = firstFrame.getBoundingClientRect().height || 168;
+      camResizer.classList.add("dragging");
+      camResizer.setPointerCapture(ev.pointerId);
+    });
+    camResizer.addEventListener("pointermove", (ev) => {
+      if (!dragging) return;
+      const nextH = Math.max(110, Math.min(420, Math.round(startH + (ev.clientY - startY))));
+      document.querySelectorAll("#teleop-cam-card .cam-frame").forEach((el) => {
+        el.style.height = `${nextH}px`;
+      });
+    });
+    const end = () => {
+      dragging = false;
+      camResizer.classList.remove("dragging");
+    };
+    camResizer.addEventListener("pointerup", end);
+    camResizer.addEventListener("pointercancel", end);
+  }
+
+  // Resizer 4: Bottom Console Drawer Top-Edge Height Resizer
+  const consoleHandle = $("console-resize-handle");
+  const logDock = $("log-dock");
+  if (consoleHandle && logDock) {
+    let dragging = false;
+    let startY = 0;
+    let startH = 175;
+    consoleHandle.addEventListener("pointerdown", (ev) => {
+      dragging = true;
+      startY = ev.clientY;
+      startH = logDock.getBoundingClientRect().height || 175;
+      consoleHandle.classList.add("dragging");
+      consoleHandle.setPointerCapture(ev.pointerId);
+    });
+    consoleHandle.addEventListener("pointermove", (ev) => {
+      if (!dragging) return;
+      const nextH = Math.max(110, Math.min(460, Math.round(startH + (startY - ev.clientY))));
+      logDock.style.height = `${nextH}px`;
+    });
+    const end = () => {
+      dragging = false;
+      consoleHandle.classList.remove("dragging");
+    };
+    consoleHandle.addEventListener("pointerup", end);
+    consoleHandle.addEventListener("pointercancel", end);
+  }
+}
+
+function applyStageVisibility(collapsed) {
+  state.stageCollapsed = Boolean(collapsed);
+  const shell = $("studio-shell");
+  const dock = $("global-stage-dock");
+  const popBar = $("stage-popout-bar");
+  const toggleBtn = $("btn-toggle-stage-dock");
+
+  if (shell) {
+    shell.classList.toggle("stage-popped-out", Boolean(state.popupActive));
+    shell.classList.toggle("stage-collapsed", Boolean(state.stageCollapsed || state.popupActive));
+  }
+
+  if (state.popupActive) {
+    if (dock) dock.classList.add("collapsed");
+    if (popBar) popBar.hidden = false;
+    stageViews.leader?.setPaused(true);
+    stageViews.follower?.setPaused(true);
+    if (toggleBtn) toggleBtn.textContent = "已在独立窗运行";
+    return;
+  }
+
+  if (popBar) popBar.hidden = true;
+  if (dock) dock.classList.toggle("collapsed", state.stageCollapsed);
+  stageViews.leader?.setPaused(state.stageCollapsed);
+  stageViews.follower?.setPaused(state.stageCollapsed);
+  if (toggleBtn) {
+    toggleBtn.textContent = state.stageCollapsed ? "展开 3D 舞台" : "收起 3D 舞台";
+  }
+  if (!state.stageCollapsed) {
+    refreshStageSizes();
+  }
+}
+
+function ensureStageVisibleForAction() {
+  if (!state.popupActive && state.stageCollapsed) {
+    applyStageVisibility(false);
+  }
+}
+
+function initGlobalStageDock() {
   let ikInFlight = false;
   let ikPendingReq = null;
   const drainIkQueue = async () => {
@@ -176,39 +390,93 @@ function initStickCanvases() {
       });
       if (res.ok && res.data) {
         updateJointGauges(res.data.leader_joints, res.data.follower_joints, true);
-        if ($("ik-x")) $("ik-x").value = String(req.x_mm);
-        if ($("ik-y")) $("ik-y").value = String(req.y_mm);
-        if ($("ik-z")) $("ik-z").value = String(req.z_mm);
+        const fkObj = req.arm === "leader" ? res.data.leader_fk : res.data.follower_fk;
+        const tcp = fkObj?.tcp_pose;
+        if (tcp) {
+          if ($("ik-x")) $("ik-x").value = String(Math.round(tcp.x_mm));
+          if ($("ik-y")) $("ik-y").value = String(Math.round(tcp.y_mm));
+          if ($("ik-z")) $("ik-z").value = String(Math.round(tcp.z_mm));
+        }
+        if (res.data.clamped && tcp) {
+          const activeView = req.arm === "leader" ? stageViews.leader : stageViews.follower;
+          activeView?.syncClampedDragAnchor(tcp);
+          showBoundaryToast(res.data.boundary_message);
+        }
+        if (isTeleopPanelVisible()) refreshCameraImagesOnce();
       }
     }
     ikInFlight = false;
   };
 
-  stickViews.simFollower = new StickArmCanvas($("canvas-sim-follower"), {
-    role: "follower",
-    title: "从臂 Follower 6-DOF (拖拽红圈=IK)",
-    accent: "#10b981",
+  stageViews.leader = new StickArmCanvas($("canvas-sim-leader"), {
+    role: "leader",
+    label: "Leader 主臂 (红圈IK · 联动)",
     enableIkDrag: true,
     onIkDrag: (req) => {
       ikPendingReq = req;
       drainIkQueue();
     },
   });
-  stickViews.teach = new StickArmCanvas($("canvas-teach-stick"), {
+
+  stageViews.follower = new StickArmCanvas($("canvas-sim-follower"), {
     role: "follower",
-    title: "示教与表演轨迹 6-DOF 火柴棍",
-    accent: "#06b6d4",
+    label: "Follower 从臂 (跟随主臂)",
+    enableIkDrag: false,
+    onIkDrag: (req) => {
+      ikPendingReq = req;
+      drainIkQueue();
+    },
   });
-  stickViews.collect = new StickArmCanvas($("canvas-collect-stick"), {
-    role: "follower",
-    title: "数据采集 / Episode 回放 6-DOF 火柴棍",
-    accent: "#10b981",
+
+  // View mode buttons (Dual / Follower / Leader)
+  document.querySelectorAll("[data-stage-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => setStageViewMode(btn.dataset.stageMode));
   });
-  stickViews.vla = new StickArmCanvas($("canvas-vla-stick"), {
-    role: "follower",
-    title: "VLA 5 步 Action Chunk 预测动画",
-    accent: "#a855f7",
+
+  // Camera Preset & Zoom Controls
+  document.querySelectorAll("[data-cam-view]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const view = btn.dataset.camView;
+      stageViews.leader?.setPresetView(view);
+      stageViews.follower?.setPresetView(view);
+    });
   });
+
+  $("btn-stage-zoom-in")?.addEventListener("click", () => {
+    stageViews.leader?.zoomBy(1.15);
+    stageViews.follower?.zoomBy(1.15);
+  });
+
+  $("btn-stage-zoom-out")?.addEventListener("click", () => {
+    stageViews.leader?.zoomBy(0.87);
+    stageViews.follower?.zoomBy(0.87);
+  });
+
+  initStructuralResizers();
+
+  // Initialize Web Locks + BroadcastChannel Pop-out Mutex & Theme Sync
+  popupMutex = new StagePopupMutex({
+    role: "host",
+    onStateChange: (active) => {
+      state.popupActive = active;
+      applyStageVisibility(state.stageCollapsed);
+      updateAllStickViews();
+    },
+    onThemeChange: (nextTheme) => {
+      updateThemeUI(nextTheme);
+    },
+  });
+}
+
+function updateThemeUI(theme) {
+  state.theme = applyThemeToDocument(theme);
+  const labelEl = $("theme-switch-label");
+  if (labelEl) {
+    labelEl.textContent = state.theme === "dark" ? "深色模式 · 切浅色" : "浅色模式 · 切深色";
+  }
+  stageViews.leader?.render?.();
+  stageViews.follower?.render?.();
+  refreshCameraImagesOnce();
 }
 
 function updateAllStickViews() {
@@ -216,64 +484,108 @@ function updateAllStickViews() {
   const f = state.followerJoints;
   const calTarget = $("calibrate-target")?.value || "follower";
   const calJoints = calTarget === "leader" ? l : f;
+  const isCalTab = state.activeTab === "dashboard";
+  const isReplayRunning = Boolean(state.epReplayTimer || state.pluginReplayTimer || state.vlaAnimTimer);
 
-  if (stickViews.cal) {
-    stickViews.cal.setState({ joints: calJoints, showHomingRef: true });
-    if ($("cal-stick-data")) {
-      $("cal-stick-data").innerHTML = renderStickTelemetryHtml(
-        calJoints,
-        `标定臂 (${calTarget}) 舵机角度与臂长`
-      );
-    }
-  }
-  if (stickViews.teleopLeader && !$("panel-teleop")?.hidden) {
-    stickViews.teleopLeader.setState({ joints: l });
-    if ($("teleop-leader-data")) {
-      $("teleop-leader-data").innerHTML = renderStickTelemetryHtml(l, "主臂 Leader 数据");
-    }
-  }
-  if (stickViews.teleopFollower && !$("panel-teleop")?.hidden) {
-    stickViews.teleopFollower.setState({ joints: f });
-    if ($("teleop-follower-data")) {
-      $("teleop-follower-data").innerHTML = renderStickTelemetryHtml(f, "从臂 Follower 数据");
-    }
-    const tcp = computeStickFK(f).tcp;
-    if ($("teleop-tcp-badge")) {
-      $("teleop-tcp-badge").textContent = `TCP: X=${tcp.x.toFixed(0)} Y=${tcp.y.toFixed(0)} Z=${tcp.z.toFixed(0)} mm | Pitch=${tcp.pitchDeg.toFixed(1)}°`;
-    }
-  }
-  if (stickViews.simLeader && !$("panel-sim")?.hidden) {
-    stickViews.simLeader.setState({ joints: l });
-    if ($("sim-leader-data")) {
-      $("sim-leader-data").innerHTML = renderStickTelemetryHtml(l, "主臂 Leader 完整数据");
-    }
-  }
-  if (stickViews.simFollower && !$("panel-sim")?.hidden) {
-    stickViews.simFollower.setState({ joints: f });
-    if ($("sim-follower-data")) {
-      $("sim-follower-data").innerHTML = renderStickTelemetryHtml(f, "从臂 Follower 完整数据");
-    }
-  }
-  if (stickViews.teach && !$("panel-teaching")?.hidden) {
-    stickViews.teach.setState({ joints: f, waypoints: state.waypoints });
-    if ($("teach-stick-data")) {
-      $("teach-stick-data").innerHTML = renderStickTelemetryHtml(f, "示教实时关节与臂长数据");
-    }
-  }
-  if (stickViews.collect && !$("panel-collect")?.hidden) {
-    stickViews.collect.setState({
-      joints: f,
-      recActive: state.activeWorkflow === "collect",
+  if (stageViews.leader && !state.popupActive && !state.stageCollapsed) {
+    stageViews.leader.setState({
+      joints: l,
+      showHomingRef: isCalTab && calTarget === "leader",
+      overlayBadge: state.overlayBadge,
     });
-    if ($("collect-stick-data")) {
-      $("collect-stick-data").innerHTML = renderStickTelemetryHtml(f, "采集状态 (observation.state) 数据");
+  }
+
+  if (stageViews.follower && !state.popupActive && !state.stageCollapsed && !isReplayRunning) {
+    stageViews.follower.setState({
+      joints: f,
+      waypoints: state.waypoints,
+      vlaChunk: state.vlaChunk,
+      overlayBadge: state.overlayBadge,
+      recActive: state.activeWorkflow === "collect",
+      showHomingRef: isCalTab && calTarget === "follower",
+    });
+  }
+
+  const tcp = computeStickFK(f).tcp;
+  if ($("teleop-tcp-badge")) {
+    $("teleop-tcp-badge").textContent = `TCP: X=${fmtZero(tcp.x)} Y=${fmtZero(tcp.y)} Z=${fmtZero(tcp.z)} mm`;
+  }
+
+  if ($("cal-stick-data")) {
+    $("cal-stick-data").innerHTML = renderStickTelemetryHtml(
+      isCalTab ? calJoints : f,
+      isCalTab ? `标定臂 (${calTarget})` : "从臂 6-DOF"
+    );
+  }
+  if ($("teach-stick-data") && state.activeTab === "teaching") {
+    $("teach-stick-data").innerHTML = renderStickTelemetryHtml(f, "示教臂实时姿态");
+  }
+  if ($("collect-stick-data") && state.activeTab === "collect" && !state.epReplayTimer) {
+    $("collect-stick-data").innerHTML = renderStickTelemetryHtml(f, "采集帧 (observation.state)");
+  }
+  if ($("plugin-stick-data") && state.activeTab === "plugins" && !state.pluginReplayTimer) {
+    $("plugin-stick-data").innerHTML = renderStickTelemetryHtml(f, "工作台 6-DOF 姿态");
+  }
+  if ($("vla-stick-data") && state.activeTab === "vla" && !state.vlaAnimTimer) {
+    $("vla-stick-data").innerHTML = renderStickTelemetryHtml(f, "VLA 预测姿态");
+  }
+}
+
+/* ==========================================================================
+   Mode, Safety & Hardware Probe Rendering
+   ========================================================================== */
+function setModeUI(mode) {
+  state.mode = mode;
+  const badge = $("mode-badge");
+  if (badge) {
+    badge.textContent = mode === "real" ? "MODE: REAL" : "MODE: DRY-RUN";
+    badge.className = "sb-item";
+  }
+}
+
+function updateSafetyUI(safety) {
+  if (!safety) return;
+  state.torqueEnabled = Boolean(safety.torque_enabled);
+  state.estopLatched = Boolean(safety.estop_latched);
+
+  const tBadge = $("torque-badge");
+  if (tBadge) {
+    tBadge.innerHTML = state.torqueEnabled
+      ? '<span class="status-dot dot-ok"></span>扭矩: 已使能'
+      : '<span class="status-dot dot-warn"></span>扭矩: 已释放';
+  }
+  const btnTorque = $("btn-toggle-torque");
+  if (btnTorque) {
+    btnTorque.textContent = state.torqueEnabled ? "点击卸力" : "点击上力";
+  }
+
+  const eBadge = $("estop-badge");
+  const btnReset = $("btn-global-reset");
+  if (eBadge) {
+    if (state.estopLatched) {
+      eBadge.innerHTML = '<span class="status-dot dot-danger"></span>SAFETY: ESTOP LATCHED';
+      eBadge.className = "sb-item sb-item-alert";
+      showAnomalyToast("急停 (E-STOP) 已触发锁定，所有关节驱动已切断！点击顶栏「解除急停」恢复。", { sticky: true });
+    } else {
+      eBadge.innerHTML = '<span class="status-dot dot-ok"></span>SAFETY: NORMAL';
+      eBadge.className = "sb-item";
+      clearAnomalyToast();
     }
   }
-  if (stickViews.vla && !$("panel-vla")?.hidden) {
-    stickViews.vla.setState({ joints: f, vlaChunk: state.vlaChunk });
-    if ($("vla-stick-data")) {
-      $("vla-stick-data").innerHTML = renderStickTelemetryHtml(f, "VLA 预测关节与臂长数据");
-    }
+  if (btnReset) {
+    btnReset.hidden = !state.estopLatched;
+  }
+}
+
+function updateConnectionBadge(conn) {
+  const badge = $("teleop-connection-badge");
+  if (!badge) return;
+  if (state.mode === "real" && conn && conn.hardware_ready) {
+    badge.textContent = `真机已连接 (${conn.follower_port} <- ${conn.leader_port})`;
+    badge.className = "status-tag tag-ok";
+  } else {
+    badge.textContent = "模拟演练模式（主从联动就绪）";
+    badge.className = "status-tag tag-warn";
   }
 }
 
@@ -289,13 +601,19 @@ function renderHardwareProbe(probe) {
   const meta = $("hw-banner-meta");
   const chips = $("hw-missing-chips");
   const guidance = $("hw-guidance-list");
+  const sbHw = $("hardware-status-banner");
 
   const candPorts = (probe.serial_ports || []).filter((p) => p.is_robot_candidate);
   const cams = probe.cameras || [];
+  if (sbHw) {
+    sbHw.textContent = `HW: ${candPorts.length} Ports / ${cams.length} Cam`;
+  }
   if (title) {
-    title.textContent = probe.hardware_ready
-      ? "SO-101 硬件已就绪（支持真实控制与模拟演练）"
-      : "未检测到双臂 SO-101 硬件 — 已自动降级至 DRY-RUN 模拟模式";
+    title.textContent = probe.dual_arm_ready
+      ? "SO-101 双臂硬件已就绪（支持真实控制与模拟演练）"
+      : probe.hardware_ready
+        ? "SO-101 单臂硬件已就绪（真机模式可用，双臂遥操作需接入第 2 条串口）"
+        : "未检测到 SO-101 硬件 — 已自动降级至 DRY-RUN 模拟模式";
   }
   if (meta) {
     const cap = probe.os_capabilities || {};
@@ -333,12 +651,9 @@ function renderHardwareProbe(probe) {
   if (camsBox) {
     camsBox.innerHTML = cams.length
       ? cams
-          .map(
-            (c) =>
-              `<div class="kv-item">[${c.id}] ${c.name} (${c.width}x${c.height} ${c.backend})</div>`
-          )
+          .map((c) => `<div class="kv-item">[${c.id}] ${c.name} (${c.width}x${c.height} ${c.backend})</div>`)
           .join("")
-      : '<div class="kv-item">未检测到物理相机（已启用合成 2D HUD）</div>';
+      : '<div class="kv-item">未检测到物理相机（已启用合成 2D 视图）</div>';
   }
 
   const capsBox = $("capabilities-list");
@@ -409,8 +724,7 @@ function renderDeviceSelectors(probe) {
 
   const statusEl = $("device-config-status");
   if (statusEl) {
-    const autoNote = sel.auto_matched ? "（已自动匹配当前探测到的设备）" : "";
-    statusEl.textContent = `当前配置: 从臂=${sel.follower_port || "-"} | 主臂=${sel.leader_port || "-"} | 前置相机=${sel.front_camera_id || "none"} | 腕部相机=${sel.wrist_camera_id || "none"} ${autoNote}`;
+    statusEl.textContent = `当前配置: 从臂=${sel.follower_port || "-"} | 主臂=${sel.leader_port || "-"} | 前置=${sel.front_camera_id || "none"} | 腕部=${sel.wrist_camera_id || "none"}`;
   }
 }
 
@@ -418,11 +732,11 @@ function renderCalibrationFileBadges(calStatus) {
   const box = $("calibration-file-badges");
   if (!box || !calStatus) return;
   const fChip = calStatus.follower_calibrated
-    ? '<span class="chip chip-ok">从臂标定文件: 已就绪</span>'
-    : '<span class="chip chip-warn">从臂标定文件: 未标定</span>';
+    ? '<span class="chip chip-ok">从臂标定: 已就绪</span>'
+    : '<span class="chip chip-warn">从臂标定: 未标定</span>';
   const lChip = calStatus.leader_calibrated
-    ? '<span class="chip chip-ok">主臂标定文件: 已就绪</span>'
-    : '<span class="chip chip-warn">主臂标定文件: 未标定</span>';
+    ? '<span class="chip chip-ok">主臂标定: 已就绪</span>'
+    : '<span class="chip chip-warn">主臂标定: 未标定</span>';
   box.innerHTML = fChip + lChip;
 }
 
@@ -456,6 +770,13 @@ function renderCalibrationState(cal) {
     return;
   }
 
+  const btnAutoHome = $("btn-cal-auto-home");
+  const btnAutoSweep = $("btn-cal-auto-sweep");
+  const calSlidersBox = $("cal-sim-sliders-box");
+  const isDryCalActive = Boolean(
+    cal.active && cal.mode === "dry_run" && (stage === "waiting_middle" || stage === "recording_range")
+  );
+
   panel.hidden = false;
   if (promptEl) promptEl.textContent = cal.prompt || `标定阶段: ${stage}`;
   if (btnEnter) {
@@ -465,6 +786,22 @@ function renderCalibrationState(cal) {
   if (btnRecal) {
     btnRecal.hidden = !(cal.active && cal.allow_recalibrate);
     btnRecal.disabled = !cal.waiting_for_input;
+  }
+  if (btnAutoHome) btnAutoHome.hidden = !(isDryCalActive && stage === "waiting_middle");
+  if (btnAutoSweep) btnAutoSweep.hidden = !(isDryCalActive && stage === "recording_range");
+  if (calSlidersBox) calSlidersBox.hidden = !isDryCalActive;
+  if (isDryCalActive) {
+    const calJoints = cal.target === "leader" ? state.leaderJoints : state.followerJoints;
+    for (const j of JOINTS) {
+      const sId = `cal-slider-${j.key}`;
+      const val = Number(calJoints?.[j.key] ?? j.def);
+      if (!isSliderLocked(sId)) {
+        const sEl = $(sId);
+        const vEl = $(`cal-val-${j.key}`);
+        if (sEl) sEl.value = String(val);
+        if (vEl) vEl.textContent = formatJointReadout(j.key, val, j.unit);
+      }
+    }
   }
 
   const rows = cal.live_table || [];
@@ -487,67 +824,120 @@ function renderCalibrationState(cal) {
   }
 }
 
+/* ==========================================================================
+   6-DOF Tabular-Nums Sliders with Anti-Jitter Drag Lock
+   ========================================================================== */
 function buildSlidersHtml(prefix) {
   return JOINTS.map((j) => {
-    const pct = ((j.def - j.min) / (j.max - j.min)) * 100;
     return `
       <div class="joint-row">
-        <div class="joint-head">
-          <span>${j.label}</span>
-          <span class="joint-values" id="${prefix}-val-${j.key}">${j.def}${j.unit}</span>
-        </div>
-        <input
-          class="joint-slider"
-          type="range"
-          min="${j.min}"
-          max="${j.max}"
-          step="1"
-          value="${j.def}"
-          data-joint="${j.key}"
-          id="${prefix}-slider-${j.key}"
-        />
-        <div class="gauge-bar-track">
-          <div class="gauge-bar-fill" id="${prefix}-bar-${j.key}" style="width:${pct}%"></div>
+        <div class="joint-row-main">
+          <span class="joint-label" title="${j.title || j.label}">${j.label}</span>
+          <input
+            class="joint-slider"
+            type="range"
+            min="${j.min}"
+            max="${j.max}"
+            step="1"
+            value="${j.def}"
+            data-joint="${j.key}"
+            id="${prefix}-slider-${j.key}"
+          />
+          <span class="joint-values" id="${prefix}-val-${j.key}">${formatJointReadout(j.key, j.def, j.unit)}</span>
         </div>
       </div>
     `;
   }).join("");
 }
 
+function bindSliderDragLock(slider) {
+  slider.addEventListener("pointerdown", () => {
+    state.activeSliderId = slider.id;
+    state.sliderCooldownTs[slider.id] = performance.now() + 300;
+  });
+}
+
+window.addEventListener("pointerup", () => {
+  if (state.activeSliderId) {
+    state.sliderCooldownTs[state.activeSliderId] = performance.now() + 260;
+    state.activeSliderId = null;
+  }
+});
+
+function isSliderLocked(sliderId) {
+  if (state.activeSliderId === sliderId) return true;
+  const until = state.sliderCooldownTs[sliderId] || 0;
+  return performance.now() < until;
+}
+
 function initJointSliders() {
-  // 1. Teleop sliders
   const teleopBox = $("joints-container");
   if (teleopBox) {
     teleopBox.innerHTML = buildSlidersHtml("teleop");
     teleopBox.querySelectorAll(".joint-slider").forEach((slider) => {
+      bindSliderDragLock(slider);
       slider.addEventListener("input", (ev) => {
         const key = ev.target.dataset.joint;
         const val = Number(ev.target.value);
+        state.sliderCooldownTs[slider.id] = performance.now() + 280;
         state.leaderJoints[key] = val;
         state.pendingJoints[key] = val;
+        const jMeta = JOINTS.find((x) => x.key === key);
+        const valEl = $(`teleop-val-${key}`);
+        if (valEl && jMeta) valEl.textContent = formatJointReadout(key, val, jMeta.unit);
         updateAllStickViews();
         if (!state.jointSendTimer) {
-          state.jointSendTimer = setTimeout(flushPendingJoints, 55);
+          state.jointSendTimer = setTimeout(flushPendingJoints, 45);
         }
       });
     });
   }
 
-  // 2. Independent Simulation page sliders (Leader & Follower separately)
   for (const arm of ["leader", "follower"]) {
     const box = $(`sim-${arm}-sliders`);
     if (!box) continue;
     box.innerHTML = buildSlidersHtml(`sim-${arm}`);
     box.querySelectorAll(".joint-slider").forEach((slider) => {
+      bindSliderDragLock(slider);
       slider.addEventListener("input", (ev) => {
+        if (arm === "follower" && state.linkedArms) return;
         const key = ev.target.dataset.joint;
         const val = Number(ev.target.value);
+        state.sliderCooldownTs[slider.id] = performance.now() + 280;
         if (arm === "leader") state.leaderJoints[key] = val;
         else state.followerJoints[key] = val;
         state.simPending[arm][key] = val;
+        const jMeta = JOINTS.find((x) => x.key === key);
+        const valEl = $(`sim-${arm}-val-${key}`);
+        if (valEl && jMeta) valEl.textContent = formatJointReadout(key, val, jMeta.unit);
         updateAllStickViews();
         if (!state.simSendTimers[arm]) {
-          state.simSendTimers[arm] = setTimeout(() => flushSimJoints(arm), 55);
+          state.simSendTimers[arm] = setTimeout(() => flushSimJoints(arm), 45);
+        }
+      });
+    });
+  }
+
+  // Calibration Joint-Space Temporary Sliders (dry_run only)
+  const calBox = $("cal-joints-container");
+  if (calBox) {
+    calBox.innerHTML = buildSlidersHtml("cal");
+    calBox.querySelectorAll(".joint-slider").forEach((slider) => {
+      bindSliderDragLock(slider);
+      slider.addEventListener("input", (ev) => {
+        const key = ev.target.dataset.joint;
+        const val = Number(ev.target.value);
+        const calTarget = $("calibrate-target")?.value || "follower";
+        state.sliderCooldownTs[slider.id] = performance.now() + 280;
+        if (calTarget === "leader") state.leaderJoints[key] = val;
+        else state.followerJoints[key] = val;
+        state.simPending[calTarget][key] = val;
+        const jMeta = JOINTS.find((x) => x.key === key);
+        const valEl = $(`cal-val-${key}`);
+        if (valEl && jMeta) valEl.textContent = formatJointReadout(key, val, jMeta.unit);
+        updateAllStickViews();
+        if (!state.simSendTimers[calTarget]) {
+          state.simSendTimers[calTarget] = setTimeout(() => flushSimJoints(calTarget), 40);
         }
       });
     });
@@ -565,6 +955,7 @@ async function flushPendingJoints() {
   });
   if (res.ok && res.data) {
     updateJointGauges(res.data.leader_joints, res.data.follower_joints, false);
+    if (isTeleopPanelVisible()) refreshCameraImagesOnce();
   }
 }
 
@@ -592,31 +983,37 @@ function updateJointGauges(leader, follower, syncSliders = false) {
     const lv = Number(leader[j.key] ?? j.def);
     const fv = Number(follower[j.key] ?? j.def);
 
-    // Teleop panel
-    const tVal = $(`teleop-val-${j.key}`);
-    if (tVal) tVal.textContent = `L:${lv.toFixed(1)}${j.unit} / F:${fv.toFixed(1)}${j.unit}`;
-    const tBar = $(`teleop-bar-${j.key}`);
-    if (tBar) {
-      const pct = Math.max(0, Math.min(100, ((fv - j.min) / (j.max - j.min)) * 100));
-      tBar.style.width = `${pct.toFixed(1)}%`;
-    }
-    if (syncSliders) {
-      const sl = $(`teleop-slider-${j.key}`);
-      if (sl && document.activeElement !== sl) sl.value = String(lv);
+    const tSliderId = `teleop-slider-${j.key}`;
+    if (!isSliderLocked(tSliderId)) {
+      const tVal = $(`teleop-val-${j.key}`);
+      if (tVal) tVal.textContent = formatJointReadout(j.key, fv, j.unit);
+      if (syncSliders) {
+        const sl = $(tSliderId);
+        if (sl) sl.value = String(lv);
+      }
     }
 
-    // Independent Simulation sliders
     for (const [arm, val] of [["leader", lv], ["follower", fv]]) {
-      const vEl = $(`sim-${arm}-val-${j.key}`);
-      if (vEl) vEl.textContent = `${val.toFixed(1)}${j.unit}`;
-      const bEl = $(`sim-${arm}-bar-${j.key}`);
-      if (bEl) {
-        const pct = Math.max(0, Math.min(100, ((val - j.min) / (j.max - j.min)) * 100));
-        bEl.style.width = `${pct.toFixed(1)}%`;
+      const sId = `sim-${arm}-slider-${j.key}`;
+      if (!isSliderLocked(sId)) {
+        const vEl = $(`sim-${arm}-val-${j.key}`);
+        if (vEl) vEl.textContent = formatJointReadout(j.key, val, j.unit);
+        if (syncSliders) {
+          const sEl = $(sId);
+          if (sEl) sEl.value = String(val);
+        }
       }
+    }
+
+    const calTarget = $("calibrate-target")?.value || "follower";
+    const calVal = calTarget === "leader" ? lv : fv;
+    const calId = `cal-slider-${j.key}`;
+    if (!isSliderLocked(calId)) {
+      const cValEl = $(`cal-val-${j.key}`);
+      if (cValEl) cValEl.textContent = formatJointReadout(j.key, calVal, j.unit);
       if (syncSliders) {
-        const sEl = $(`sim-${arm}-slider-${j.key}`);
-        if (sEl && document.activeElement !== sEl) sEl.value = String(val);
+        const cEl = $(calId);
+        if (cEl) cEl.value = String(calVal);
       }
     }
   }
@@ -628,26 +1025,35 @@ function isTeleopPanelVisible() {
   return Boolean(panel && !panel.hidden);
 }
 
-function refreshCameraImagesOnce() {
-  const ts = Date.now();
+let _activeCamStreamTheme = null;
+
+function refreshCameraImagesOnce(forceRestart = false) {
   const front = $("camera-preview-front");
   const wrist = $("camera-preview-wrist");
-  if (front) front.src = `/api/cameras/front/frame?t=${ts}`;
-  if (wrist) wrist.src = `/api/cameras/wrist/frame?t=${ts}`;
+  if (!front && !wrist) return;
+
+  if (!isTeleopPanelVisible()) {
+    if (_activeCamStreamTheme !== null) {
+      _activeCamStreamTheme = null;
+      if (front) front.removeAttribute("src");
+      if (wrist) wrist.removeAttribute("src");
+    }
+    return;
+  }
+
+  const theme = state.theme || "light";
+  if (!forceRestart && _activeCamStreamTheme === theme) {
+    return; // Already streaming live MJPEG for this theme
+  }
+  _activeCamStreamTheme = theme;
+  const ts = Date.now();
+  if (front) front.src = `/api/cameras/front/stream?theme=${theme}&t=${ts}`;
+  if (wrist) wrist.src = `/api/cameras/wrist/stream?theme=${theme}&t=${ts}`;
 }
 
 function scheduleCameraLoop() {
-  if (state.camTimer) return;
-  if (!isTeleopPanelVisible()) return;
-  const intervalMs = state.mode === "real" ? 1200 : 450;
-  const tick = () => {
-    state.camTimer = null;
-    if (state.activeWorkflow === "teleop" && isTeleopPanelVisible()) {
-      refreshCameraImagesOnce();
-      state.camTimer = setTimeout(tick, intervalMs);
-    }
-  };
-  state.camTimer = setTimeout(tick, intervalMs);
+  // Real-time MJPEG stream handles continuous 25 FPS updates natively
+  refreshCameraImagesOnce(false);
 }
 
 function applyWorkflowStatus(statusObj) {
@@ -656,13 +1062,13 @@ function applyWorkflowStatus(statusObj) {
   state.activeWorkflow = wf;
   const wfPill = $("workflow-pill");
   if (wfPill) {
-    wfPill.textContent = `状态: ${wf}`;
-    wfPill.className = wf === "idle" ? "pill pill-info" : "pill pill-ok";
+    wfPill.textContent = `WORKFLOW: ${String(wf).toUpperCase()}`;
+    wfPill.className = "sb-item";
   }
   if (statusObj.mode) setModeUI(statusObj.mode);
   const colProg = $("collect-progress-text");
   if (colProg) {
-    colProg.textContent = `当前进度: ${statusObj.current_episode || 0} / ${statusObj.target_episodes || 0} 回合 (步数: ${statusObj.current_step || 0})`;
+    colProg.textContent = `进度: ${statusObj.current_episode || 0} / ${statusObj.target_episodes || 0} 回合 (步数: ${statusObj.current_step || 0})`;
   }
   if (Array.isArray(statusObj.logs)) renderLogs(statusObj.logs);
   if (statusObj.calibration) renderCalibrationState(statusObj.calibration);
@@ -671,6 +1077,14 @@ function applyWorkflowStatus(statusObj) {
 }
 
 function validateCollectSpecUI() {
+  if (state.filledCollectConfig) {
+    if ($("collect-dataset") && !$("collect-dataset").value) {
+      $("collect-dataset").value = state.filledCollectConfig.datasetName;
+    }
+    if ($("collect-task") && !$("collect-task").value) {
+      $("collect-task").value = state.filledCollectConfig.taskPrompt;
+    }
+  }
   const ds = ($("collect-dataset")?.value || "").trim();
   const task = ($("collect-task")?.value || "").trim();
   const fps = Number($("collect-fps")?.value || 30);
@@ -685,11 +1099,11 @@ function validateCollectSpecUI() {
   if (fps !== 30) issues.push("建议保持 30 FPS");
 
   if (issues.length === 0) {
-    badge.textContent = "规范校验: ✓ 符合团队标准";
-    badge.className = "pill pill-ok";
+    badge.textContent = "规范校验: 符合标准";
+    badge.className = "status-tag tag-ok";
   } else {
     badge.textContent = `规范提示: ${issues.join("；")}`;
-    badge.className = "pill pill-warn";
+    badge.className = "status-tag tag-warn";
   }
 }
 
@@ -701,7 +1115,7 @@ async function refreshWaypoints() {
   state.waypoints = list;
   updateAllStickViews();
   if (!list.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无示教轨迹点，请点击「记录示教点」。</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无示教轨迹点。</td></tr>';
     return;
   }
   tbody.innerHTML = list
@@ -724,6 +1138,7 @@ async function replayEpisodeOnStick(dataset, episodeIndex) {
     clearInterval(state.epReplayTimer);
     state.epReplayTimer = null;
   }
+  ensureStageVisibleForAction();
   const res = await apiFetch(`/api/workflows/collect/episodes/${encodeURIComponent(dataset)}/${episodeIndex}`);
   if (!res.ok || !Array.isArray(res.data?.frames) || res.data.frames.length === 0) {
     appendLocalLog("该 Episode 暂无可回放帧数据。");
@@ -731,12 +1146,13 @@ async function replayEpisodeOnStick(dataset, episodeIndex) {
   }
   const frames = res.data.frames;
   let idx = 0;
-  appendLocalLog(`开始用火柴棍回放 ${dataset} #${episodeIndex} (${frames.length} 帧)...`);
+  appendLocalLog(`开始回放 ${dataset} #${episodeIndex} (${frames.length} 帧)...`);
   state.epReplayTimer = setInterval(() => {
     if (idx >= frames.length) {
       clearInterval(state.epReplayTimer);
       state.epReplayTimer = null;
-      if (stickViews.collect) stickViews.collect.setState({ overlayBadge: "" });
+      state.overlayBadge = "";
+      updateAllStickViews();
       return;
     }
     const f = frames[idx];
@@ -746,16 +1162,15 @@ async function replayEpisodeOnStick(dataset, episodeIndex) {
       if (i < st.length) jObj[jm.key] = Number(st[i]);
     });
     state.followerJoints = { ...state.followerJoints, ...jObj };
-    if (stickViews.collect) {
-      stickViews.collect.setState({
-        joints: state.followerJoints,
-        overlayBadge: `▶ 回放 #${episodeIndex} (${idx + 1}/${frames.length})`,
-      });
-    }
+    state.overlayBadge = `回放 #${episodeIndex} (${idx + 1}/${frames.length})`;
+    stageViews.follower?.setState({
+      joints: state.followerJoints,
+      overlayBadge: state.overlayBadge,
+    });
     if ($("collect-stick-data")) {
       $("collect-stick-data").innerHTML = renderStickTelemetryHtml(
         state.followerJoints,
-        `回放 ${dataset} #${episodeIndex} 帧 ${idx + 1}/${frames.length}`
+        `回放 ${dataset} #${episodeIndex} (${idx + 1}/${frames.length})`
       );
     }
     idx += 1;
@@ -791,100 +1206,357 @@ async function refreshEpisodes() {
   });
 }
 
+/* ==========================================================================
+   Tab 6: Cleanly Decoupled Open-Source Datasets & Honest External Tools
+   ========================================================================== */
+function stopPluginReplayTimer() {
+  if (state.pluginReplayTimer) {
+    clearInterval(state.pluginReplayTimer);
+    state.pluginReplayTimer = null;
+  }
+  state.overlayBadge = "";
+  const stageBadge = $("plugin-stage-badge");
+  if (stageBadge) {
+    stageBadge.textContent = "就绪";
+    stageBadge.className = "status-tag tag-mono";
+  }
+  updateAllStickViews();
+}
+
+function fillDatasetIntoConfigs(repoId, taskPrompt) {
+  const rawSlug = String(repoId || "").split("/").pop() || "so101_dataset";
+  const cleanName = rawSlug.replace(/[^a-zA-Z0-9_]/g, "_").replace(/^eval_/, "train_");
+  const prompt = taskPrompt || "Open the drawer, put the block inside, then close the drawer";
+
+  state.filledCollectConfig = { datasetName: cleanName, taskPrompt: prompt };
+  if ($("collect-dataset")) $("collect-dataset").value = cleanName;
+  if ($("collect-task")) $("collect-task").value = prompt;
+  if ($("vla-prompt")) $("vla-prompt").value = prompt;
+  validateCollectSpecUI();
+
+  appendLocalLog(`已将开源数据集 [${repoId}] 填入采集与 VLA 配置 (${cleanName})`);
+  const out = $("plugin-workbench-output");
+  if (out) {
+    out.innerHTML = `
+      <div class="card-head-inline">
+        <strong>已同步至「5. 数据采集」与「7. VLA 云端训练」配置</strong>
+        <span class="chip chip-ok">dataset_name=${cleanName}</span>
+      </div>
+      <div class="muted">英文指令 (single_task): <code>${prompt}</code></div>
+    `;
+  }
+}
+
+async function playDatasetTrajectoryOnPluginStage(repoId) {
+  stopPluginReplayTimer();
+  ensureStageVisibleForAction();
+  const url = repoId
+    ? `/api/plugins/open_source_datasets/preview?repo_id=${encodeURIComponent(repoId)}`
+    : "/api/plugins/open_source_datasets/preview";
+  const res = await apiFetch(url);
+  if (!res.ok || !res.data?.dataset) {
+    appendLocalLog(`开源数据集预览加载失败: ${repoId || "default"}`);
+    return;
+  }
+
+  const ds = res.data.dataset;
+  const traj =
+    Array.isArray(ds.sample_trajectory) && ds.sample_trajectory.length > 0
+      ? ds.sample_trajectory
+      : [{ phase: "1. 初始姿态", shoulder_pan: 0, shoulder_lift: 0, elbow_flex: 0, wrist_flex: 0, wrist_roll: 0, gripper: 20 }];
+
+  const stageBadge = $("plugin-stage-badge");
+  if (stageBadge) {
+    stageBadge.textContent = `正在演练: ${ds.repo_id}`;
+    stageBadge.className = "status-tag tag-ok";
+  }
+
+  const interpFrames = [];
+  const subSteps = 6;
+  for (let i = 0; i < traj.length; i++) {
+    const cur = traj[i];
+    const next = traj[(i + 1) % traj.length];
+    for (let s = 0; s < subSteps; s++) {
+      const alpha = s / subSteps;
+      const joints = {};
+      for (const j of JOINTS) {
+        const a = Number(cur[j.key] ?? j.def);
+        const b = Number(next[j.key] ?? a);
+        joints[j.key] = Number((a + (b - a) * alpha).toFixed(1));
+      }
+      interpFrames.push({
+        phaseIndex: i,
+        phaseLabel: cur.phase || `阶段 ${i + 1}`,
+        joints,
+      });
+    }
+  }
+
+  const renderWorkbenchCard = (activePhaseIdx, currentJoints) => {
+    const out = $("plugin-workbench-output");
+    if (!out) return;
+    const phaseChips = traj
+      .map((step, idx) => {
+        const cls = idx === activePhaseIdx ? "chip chip-ok" : "chip";
+        return `<span class="${cls}">${step.phase || `Step ${idx + 1}`}</span>`;
+      })
+      .join("");
+    const activePhase = traj[activePhaseIdx] || traj[0];
+    const tcp = computeStickFK(currentJoints).tcp;
+
+    out.innerHTML = `
+      <div class="card-head-inline">
+        <div class="btn-group">
+          <strong>${ds.repo_id}</strong>
+          <span class="chip chip-ok">${ds.format}</span>
+          <span class="chip">${ds.stats}</span>
+        </div>
+        <div class="btn-group">
+          <button type="button" class="btn btn-xs btn-primary" id="btn-wb-fill-active">填入采集与 VLA 配置</button>
+          <a class="btn btn-xs btn-secondary" href="${ds.visualizer_url}" target="_blank" rel="noopener">官方在线可视化</a>
+          <a class="btn btn-xs btn-secondary" href="${ds.hf_url}" target="_blank" rel="noopener">HF 仓库</a>
+        </div>
+      </div>
+      <div class="muted">任务: <strong>${ds.task}</strong> | 英文指令: <code>${ds.recommended_task_prompt || ds.task}</code></div>
+      <div class="chip-row mt-6">${phaseChips}</div>
+      <div class="kv-item mt-6">
+        当前阶段: <strong>${activePhase.phase || "-"}</strong> |
+        末端 TCP: <code>X=${fmtZero(tcp.x, 1)} Y=${fmtZero(tcp.y, 1)} Z=${fmtZero(tcp.z, 1)} mm</code> |
+        夹爪: <code>${Number(currentJoints.gripper ?? 20).toFixed(0)}%</code>
+      </div>
+    `;
+    $("btn-wb-fill-active")?.addEventListener("click", () => {
+      fillDatasetIntoConfigs(ds.repo_id, ds.recommended_task_prompt || ds.task);
+    });
+  };
+
+  let frameIdx = 0;
+  const applyFrame = () => {
+    const frame = interpFrames[frameIdx];
+    state.followerJoints = { ...state.followerJoints, ...frame.joints };
+    state.overlayBadge = frame.phaseLabel;
+    stageViews.follower?.setState({
+      joints: frame.joints,
+      waypoints: traj.map((t, idx) => ({ index: idx, label: t.phase || `P${idx + 1}`, joints: t })),
+      overlayBadge: frame.phaseLabel,
+    });
+    // Also sync to backend simulator when on Step 0 of each phase so /sim-viewport popup moves in sync
+    if (frameIdx % 3 === 0) {
+      apiFetch("/api/sim/joints", {
+        method: "POST",
+        body: JSON.stringify({ arm: "follower", joints: frame.joints }),
+      });
+    }
+    if ($("plugin-stick-data")) {
+      $("plugin-stick-data").innerHTML = renderStickTelemetryHtml(
+        frame.joints,
+        `${ds.task} — ${frame.phaseLabel}`
+      );
+    }
+    renderWorkbenchCard(frame.phaseIndex, frame.joints);
+  };
+
+  applyFrame();
+  appendLocalLog(`已在 3D 舞台启动开源数据集轨迹演练: ${ds.repo_id}`);
+
+  state.pluginReplayTimer = setInterval(() => {
+    if ($("panel-plugins")?.hidden) return;
+    frameIdx = (frameIdx + 1) % interpFrames.length;
+    applyFrame();
+  }, 180);
+}
+
+async function showServoDiagnosticsOnPluginStage() {
+  stopPluginReplayTimer();
+  const res = await apiFetch("/api/plugins/feetech_servo_bench/diagnostics");
+  if (!res.ok || !res.data) {
+    appendLocalLog("飞特舵机总线诊断获取失败。");
+    return;
+  }
+  const diag = res.data;
+  const servos = diag.servos || [];
+  const isSim = Boolean(diag.simulated);
+
+  const stageBadge = $("plugin-stage-badge");
+  if (stageBadge) {
+    stageBadge.textContent = isSim ? "飞特总线诊断 (模拟态)" : "飞特总线诊断 (真机在线)";
+    stageBadge.className = isSim ? "status-tag tag-warn" : "status-tag tag-ok";
+  }
+
+  if ($("plugin-stick-data")) {
+    $("plugin-stick-data").innerHTML = renderStickTelemetryHtml(
+      state.followerJoints,
+      "飞特 STS3215 6 轴当前角度与编码器换算"
+    );
+  }
+
+  const out = $("plugin-workbench-output");
+  if (out) {
+    const rowsHtml = servos
+      .map(
+        (s) => `
+        <tr>
+          <td class="joint-values">#${s.servo_id}</td>
+          <td class="joint-values"><strong>${s.joint_name}</strong></td>
+          <td class="joint-values">${s.angle_val}${s.unit} <span class="muted">[${s.min_limit}..${s.max_limit}]</span></td>
+          <td class="joint-values"><strong>${s.Present_Position}</strong> / 4095</td>
+          <td class="joint-values">${s.Homing_Offset}</td>
+          <td class="joint-values">${s.Present_Voltage_V}</td>
+          <td class="joint-values">${s.Present_Temperature_C}</td>
+          <td><span class="chip ${isSim ? "chip-warn" : "chip-ok"}">${isSim ? "模拟态 (Lock=--)" : `Lock=${s.Lock} / Torque=${s.Torque_Enable}`}</span></td>
+        </tr>`
+      )
+      .join("");
+
+    out.innerHTML = `
+      <div class="card-head-inline">
+        <div class="btn-group">
+          <strong>飞特 STS3215 6 轴总线寄存器诊断</strong>
+          <span class="chip ${isSim ? "chip-warn" : "chip-ok"}">${diag.bus_protocol}</span>
+        </div>
+        <button type="button" class="btn btn-xs btn-secondary" id="btn-wb-refresh-servo">刷新寄存器快照</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>关节名称</th>
+              <th>当前值 / URDF 限位</th>
+              <th>编码器步数 (Present_Position)</th>
+              <th>Homing_Offset</th>
+              <th>总线电压</th>
+              <th>内部温度</th>
+              <th>EEPROM 锁与状态</th>
+            </tr>
+          </thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>
+    `;
+    $("btn-wb-refresh-servo")?.addEventListener("click", showServoDiagnosticsOnPluginStage);
+  }
+  appendLocalLog("已加载飞特 STS3215 6 轴寄存器诊断表。");
+}
+
 async function refreshPlugins() {
   const res = await apiFetch("/api/plugins");
   const container = $("plugin-list");
+  const dsTbody = $("open-datasets-tbody");
   if (!res.ok || !container) return;
   const plugins = res.data.plugins || [];
+  state.pluginsCache = plugins;
+
+  // 1. Render Open-Source Datasets into dedicated Section A table (#open-datasets-tbody)
+  const dsPlugin = plugins.find((p) => p.id === "open_source_datasets");
+  const datasets = dsPlugin?.datasets || [];
+  if (dsTbody) {
+    dsTbody.innerHTML = datasets
+      .map(
+        (ds) => `
+        <tr>
+          <td class="joint-values" style="word-break:break-all;"><code>${ds.repo_id}</code></td>
+          <td>${ds.task}</td>
+          <td>${ds.stats}</td>
+          <td><span class="chip">${ds.format}</span></td>
+          <td>
+            <div class="btn-group">
+              <button type="button" class="btn btn-xs btn-primary btn-dataset-replay" data-repo="${ds.repo_id}">3D 演练</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-dataset-fill" data-repo="${ds.repo_id}" data-prompt="${ds.recommended_task_prompt || ds.task}">填入配置</button>
+              <a class="btn btn-xs btn-secondary" href="${ds.visualizer_url}" target="_blank" rel="noopener">HF 在线检视</a>
+            </div>
+          </td>
+        </tr>`
+      )
+      .join("");
+
+    dsTbody.querySelectorAll(".btn-dataset-replay").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        playDatasetTrajectoryOnPluginStage(btn.dataset.repo);
+      });
+    });
+
+    dsTbody.querySelectorAll(".btn-dataset-fill").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        fillDatasetIntoConfigs(btn.dataset.repo, btn.dataset.prompt);
+      });
+    });
+  }
+
+  // 2. Render External CLI Tool Adapters into Section B (#plugin-list) with honest availability & disabled launch when missing deps
   container.innerHTML = plugins
     .map((p) => {
-      const availBadge = p.available
-        ? '<span class="chip chip-ok">可用</span>'
-        : '<span class="chip chip-warn">依赖未就绪</span>';
-      const osBadge = p.os_supported
-        ? '<span class="chip chip-ok">OS 支持</span>'
-        : '<span class="chip chip-warn">需 Ubuntu/云端</span>';
-      const statusBadge =
-        p.status === "running"
-          ? `<span class="chip chip-ok">运行中 (PID ${p.pid})</span>`
-          : `<span class="chip">${p.status}</span>`;
-      const hint = p.install_hint ? `<p class="muted mt-12">${p.install_hint}</p>` : "";
-      let datasetsHtml = "";
-      if (Array.isArray(p.datasets) && p.datasets.length > 0) {
-        const rows = p.datasets
-          .map(
-            (ds) => `
-            <tr>
-              <td class="joint-values" style="word-break:break-all;"><code>${ds.repo_id}</code></td>
-              <td>${ds.task}</td>
-              <td>${ds.stats}</td>
-              <td><span class="chip">${ds.format}</span></td>
-              <td>${ds.stars}</td>
-              <td>
-                <div class="btn-group">
-                  <a class="btn btn-xs btn-secondary" href="${ds.hf_url}" target="_blank" rel="noopener">HF 页面</a>
-                  <a class="btn btn-xs btn-secondary" href="${ds.visualizer_url}" target="_blank" rel="noopener">在线可视化</a>
-                  <button type="button" class="btn btn-xs btn-primary btn-dataset-viz" data-plugin="${p.id}" data-repo="${ds.repo_id}">本地检视</button>
-                </div>
-              </td>
-            </tr>`
-          )
-          .join("");
-        datasetsHtml = `
-          <div class="table-wrap mt-12">
-            <table>
-              <thead>
-                <tr>
-                  <th>数据集 (repo_id)</th>
-                  <th>任务</th>
-                  <th>数据量</th>
-                  <th>格式</th>
-                  <th>推荐</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>${rows}</tbody>
-            </table>
-          </div>`;
+      const canLaunch = Boolean(p.available && p.os_supported);
+      const isCatalog = p.id === "open_source_datasets";
+      let statusChip = "";
+      if (p.status === "running") {
+        statusChip = `<span class="chip chip-ok">运行中 (PID ${p.pid})</span>`;
+      } else if (isCatalog) {
+        statusChip = `<span class="chip chip-ok">内置目录 (${datasets.length} 个数据集)</span>`;
+      } else if (!p.os_supported) {
+        statusChip = '<span class="chip chip-warn">仅限 Ubuntu / 云端 Linux</span>';
+      } else if (!p.available) {
+        statusChip = '<span class="chip chip-warn">未安装可选依赖</span>';
+      } else {
+        statusChip = '<span class="chip chip-ok">可启动</span>';
       }
-      const spanStyle = datasetsHtml ? ' style="grid-column: 1 / -1;"' : "";
+
+      const hint = p.install_hint ? `<div class="muted mt-6">${p.install_hint}</div>` : "";
+      let actionBtns = "";
+      if (isCatalog) {
+        actionBtns = `<button type="button" class="btn btn-xs btn-secondary btn-plugin-workbench" data-id="${p.id}">在上方演练中心回放</button>`;
+      } else if (p.id === "feetech_servo_bench") {
+        actionBtns = `
+          <button type="button" class="btn btn-xs btn-secondary btn-plugin-workbench" data-id="${p.id}">内置寄存器诊断</button>
+          <button type="button" class="btn btn-xs btn-primary btn-plugin-launch" data-id="${p.id}" ${canLaunch ? "" : 'disabled title="缺少可选外部依赖"'}>${canLaunch ? "启动外部 MotorLab" : "未安装外部进程"}</button>
+          ${p.status === "running" ? `<button type="button" class="btn btn-xs btn-danger btn-plugin-stop" data-id="${p.id}">停止</button>` : ""}
+        `;
+      } else {
+        actionBtns = `
+          <button type="button" class="btn btn-xs btn-primary btn-plugin-launch" data-id="${p.id}" ${canLaunch ? "" : 'disabled title="当前环境未安装该可选依赖或不受此 OS 支持"'}>${
+            !p.os_supported ? "仅支持 Linux" : canLaunch ? "启动外部进程" : "缺少可选依赖"
+          }</button>
+          ${p.status === "running" ? `<button type="button" class="btn btn-xs btn-danger btn-plugin-stop" data-id="${p.id}">停止</button>` : ""}
+        `;
+      }
+
       return `
-        <div class="card" data-plugin-id="${p.id}"${spanStyle}>
-          <h3>${p.name}</h3>
-          <div class="chip-row">${availBadge}${osBadge}${statusBadge}</div>
-          <p class="muted mt-12">${p.description}</p>
-          ${hint}
-          ${datasetsHtml}
-          <div class="btn-group mt-12">
-            <button type="button" class="btn btn-primary btn-plugin-launch" data-id="${p.id}">启动插件</button>
-            <button type="button" class="btn btn-danger btn-plugin-stop" data-id="${p.id}">停止</button>
+        <div class="card" data-plugin-id="${p.id}">
+          <div class="card-head-inline">
+            <h3>${p.name}</h3>
+            <div class="chip-row">${statusChip}</div>
           </div>
+          <div class="muted">${p.description}</div>
+          ${hint}
+          <div class="btn-group mt-8">${actionBtns}</div>
         </div>
       `;
     })
     .join("");
 
-  container.querySelectorAll(".btn-dataset-viz").forEach((btn) => {
+  container.querySelectorAll(".btn-plugin-workbench").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const id = btn.dataset.plugin;
-      const repo_id = btn.dataset.repo;
-      const r = await apiFetch(`/api/plugins/${id}/launch`, {
-        method: "POST",
-        body: JSON.stringify({ args: { repo_id, episode_index: 0 } }),
-      });
-      if (r.ok) appendLocalLog(`已启动本地可视化检视数据集: ${repo_id}`);
-      await refreshPlugins();
+      if (btn.dataset.id === "feetech_servo_bench") {
+        await showServoDiagnosticsOnPluginStage();
+      } else {
+        await playDatasetTrajectoryOnPluginStage();
+      }
     });
   });
 
   container.querySelectorAll(".btn-plugin-launch").forEach((btn) => {
     btn.addEventListener("click", async () => {
+      if (btn.disabled) return;
       const id = btn.dataset.id;
       const r = await apiFetch(`/api/plugins/${id}/launch`, {
         method: "POST",
         body: JSON.stringify({ args: {} }),
       });
-      if (r.ok) appendLocalLog(`插件 ${id} 启动成功。`);
+      if (r.ok) {
+        appendLocalLog(`外部插件进程 ${id} 启动成功。`);
+      } else {
+        showAnomalyToast(r.detail || `插件 ${id} 启动失败`);
+      }
       await refreshPlugins();
     });
   });
@@ -906,8 +1578,8 @@ async function loadVLAConfigs() {
   if (noticeEl) {
     noticeEl.innerHTML = `
       <h3>${notice.title || "pi0.7 状态说明"}</h3>
-      <p><strong>论文</strong>: ${notice.paper || "arXiv:2604.15483v2"} | <strong>权重状态</strong>: ${notice.status || "闭源未公开"}</p>
-      <p class="muted">${notice.recommendation || ""}</p>
+      <p class="mt-6"><strong>论文</strong>: ${notice.paper || "arXiv:2604.15483v2"} | <strong>状态</strong>: ${notice.status || "未公开权重"}</p>
+      <p class="muted mt-6">${notice.recommendation || ""}</p>
     `;
   }
   const grid = $("vla-configs-grid");
@@ -918,12 +1590,12 @@ async function loadVLAConfigs() {
         (c) => `
         <div class="card">
           <h3>${c.title}</h3>
-          <div class="chip-row">
+          <div class="chip-row mt-6">
             <span class="chip">${c.path}</span>
             <span class="chip chip-ok">显存: ${c.vram}</span>
           </div>
-          <p class="muted mt-12">适用平台: ${c.platform}</p>
-          <pre class="code-box mt-12">${c.command}</pre>
+          <p class="muted mt-6">平台: ${c.platform}</p>
+          <pre class="code-box mt-6">${c.command}</pre>
         </div>
       `
       )
@@ -931,29 +1603,55 @@ async function loadVLAConfigs() {
   }
 }
 
+/* ==========================================================================
+   Navigation Tabs & Stage Collapse Memory (1..4 Expanded / 5..7 Collapsed Default)
+   ========================================================================== */
 function initTabs() {
   const buttons = document.querySelectorAll(".tab-btn");
   const panels = document.querySelectorAll(".tab-panel");
+  const titleEl = $("active-module-title");
+  const defaultExpandedTabs = new Set(["dashboard", "teleop", "sim", "teaching"]);
+
   buttons.forEach((btn) => {
     btn.addEventListener("click", () => {
       const target = btn.dataset.tab;
+      state.activeTab = target;
       buttons.forEach((b) => {
         const active = b === btn;
         b.classList.toggle("active", active);
         b.setAttribute("aria-selected", active ? "true" : "false");
       });
+      if (titleEl && btn.dataset.title) {
+        titleEl.textContent = btn.dataset.title;
+      }
       panels.forEach((p) => {
         p.hidden = p.id !== `panel-${target}`;
       });
-      if (target === "teleop") refreshCameraImagesOnce();
+
+      // Respect user manual stage collapse override; otherwise apply 1..4 open / 5..7 collapsed default
+      if (state.userStageCollapsed === null) {
+        applyStageVisibility(!defaultExpandedTabs.has(target));
+      }
+
+      // Restore protected cross-tab filled config if present
+      if (state.filledCollectConfig) {
+        if ($("collect-dataset")) $("collect-dataset").value = state.filledCollectConfig.datasetName;
+        if ($("collect-task")) $("collect-task").value = state.filledCollectConfig.taskPrompt;
+        if ($("vla-prompt")) $("vla-prompt").value = state.filledCollectConfig.taskPrompt;
+      }
+
+      refreshCameraImagesOnce(false);
       if (target === "teaching") refreshWaypoints();
       if (target === "collect") {
         validateCollectSpecUI();
         refreshEpisodes();
       }
-      if (target === "plugins") refreshPlugins();
+      if (target === "plugins") {
+        refreshPlugins();
+      }
       if (target === "vla") loadVLAConfigs();
       updateAllStickViews();
+      refreshStageSizes();
     });
   });
 }
@@ -973,77 +1671,167 @@ function stopPollingFallback() {
   }
 }
 
-function connectWebSocket() {
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const url = `${proto}//${location.host}/ws/telemetry`;
+function connectTelemetryBus() {
   const pill = $("ws-pill");
-  try {
-    const ws = new WebSocket(url);
-    state.ws = ws;
-
-    ws.onopen = () => {
-      state.wsRetryMs = 1000;
+  createStudioSocket({
+    onOpen: () => {
       stopPollingFallback();
       if (pill) {
-        pill.textContent = "WS 实时连接";
-        pill.className = "pill pill-ok";
+        pill.innerHTML = '<span class="status-dot dot-ok"></span>WS Connected';
+        pill.className = "sb-item";
       }
-    };
-
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.mode) setModeUI(msg.mode);
-        const wf = msg.active_workflow || "idle";
-        state.activeWorkflow = wf;
-        const wfPill = $("workflow-pill");
-        if (wfPill) {
-          wfPill.textContent = `状态: ${wf}`;
-          wfPill.className = wf === "idle" ? "pill pill-info" : "pill pill-ok";
-        }
-        if (msg.safety) updateSafetyUI(msg.safety);
-        if (msg.connection_status) updateConnectionBadge(msg.connection_status);
-        const isDraggingIk = Boolean(stickViews.simFollower?.isDraggingIk?.());
-        const shouldSyncSliders =
-          !isDraggingIk &&
-          (wf === "teaching_replay" ||
-            wf === "demo_routine" ||
-            msg.safety?.sync_direction === "real_to_sim");
-        if (!isDraggingIk) {
-          updateJointGauges(msg.leader_joints, msg.follower_joints, shouldSyncSliders);
-        }
-        if (msg.workflow_status) {
-          const colProg = $("collect-progress-text");
-          if (colProg) {
-            colProg.textContent = `当前进度: ${msg.workflow_status.current_episode || 0} / ${msg.workflow_status.target_episodes || 0} 回合 (步数: ${msg.workflow_status.current_step || 0})`;
-          }
-        }
-        if (Array.isArray(msg.log_tail)) renderLogs(msg.log_tail);
-        if (msg.calibration) renderCalibrationState(msg.calibration);
-        if (wf !== "idle") scheduleCameraLoop();
-      } catch {
-        // Ignore malformed frame
-      }
-    };
-
-    ws.onclose = () => {
+      clearAnomalyToast();
+    },
+    onClose: () => {
       if (pill) {
-        pill.textContent = "HTTP 轮询兜底";
-        pill.className = "pill pill-warn";
+        pill.innerHTML = '<span class="status-dot dot-warn"></span>WS Fallback';
+        pill.className = "sb-item sb-item-warn";
       }
       startPollingFallback();
-      const delay = state.wsRetryMs;
-      state.wsRetryMs = Math.min(10000, state.wsRetryMs * 2);
-      setTimeout(connectWebSocket, delay);
-    };
-    ws.onerror = () => {};
-  } catch {
-    startPollingFallback();
-  }
+    },
+    onOverlay: (ov) => {
+      if (Array.isArray(ov.waypoints)) state.waypoints = ov.waypoints;
+      if (Array.isArray(ov.vla_chunk)) state.vlaChunk = ov.vla_chunk;
+      if (ov.overlay_badge !== undefined) state.overlayBadge = ov.overlay_badge || "";
+      updateAllStickViews();
+    },
+    onTelemetry: (msg) => {
+      if (msg.mode) setModeUI(msg.mode);
+      const prevWf = state.activeWorkflow;
+      const wf = msg.active_workflow || "idle";
+      state.activeWorkflow = wf;
+      if (prevWf === "collect" && wf === "idle") {
+        refreshEpisodes();
+      }
+      if (prevWf !== wf) {
+        updateTeleopButtonsUI();
+        syncArmControlMutexUI();
+      }
+      const wfPill = $("workflow-pill");
+      if (wfPill) {
+        wfPill.textContent = `WORKFLOW: ${String(wf).toUpperCase()}`;
+        wfPill.className = "sb-item";
+      }
+      if (typeof msg.linked_arms === "boolean" && msg.linked_arms !== state.linkedArms) {
+        state.linkedArms = msg.linked_arms;
+        syncArmControlMutexUI();
+      }
+      if (msg.safety) updateSafetyUI(msg.safety);
+      if (msg.connection_status) updateConnectionBadge(msg.connection_status);
+
+      const isDraggingIk = Boolean(
+        stageViews.leader?.isDraggingIk?.() || stageViews.follower?.isDraggingIk?.()
+      );
+      const shouldSyncSliders =
+        !isDraggingIk &&
+        (wf === "teaching_replay" ||
+          wf === "demo_routine" ||
+          wf === "collect" ||
+          wf === "calibrate" ||
+          (wf === "teleop" && msg.mode === "real") ||
+          msg.safety?.sync_direction === "real_to_sim" ||
+          msg.safety?.sync_direction === "teleop_bidirectional");
+      if (!isDraggingIk) {
+        updateJointGauges(msg.leader_joints, msg.follower_joints, shouldSyncSliders);
+      }
+      if (msg.workflow_status) {
+        const colProg = $("collect-progress-text");
+        if (colProg) {
+          colProg.textContent = `进度: ${msg.workflow_status.current_episode || 0} / ${msg.workflow_status.target_episodes || 0} 回合 (步数: ${msg.workflow_status.current_step || 0})`;
+        }
+      }
+      if (Array.isArray(msg.log_tail)) renderLogs(msg.log_tail);
+      if (msg.calibration) renderCalibrationState(msg.calibration);
+      if (wf !== "idle") scheduleCameraLoop();
+    },
+  });
 }
 
 function bindActions() {
-  // Global safety bar
+  // Left Sidebar Collapse
+  $("btn-toggle-sidebar")?.addEventListener("click", () => {
+    const shell = $("studio-shell");
+    if (!shell) return;
+    shell.classList.toggle("sidebar-collapsed");
+    setTimeout(refreshStageSizes, 160);
+  });
+
+  // Bottom-Left Sidebar Light / Dark Theme Switcher (Synchronized with /sim-viewport)
+  $("btn-toggle-theme")?.addEventListener("click", () => {
+    const nextTheme = state.theme === "dark" ? "light" : "dark";
+    if (popupMutex) {
+      popupMutex.broadcastTheme(nextTheme);
+    } else {
+      updateThemeUI(nextTheme);
+    }
+  });
+
+  // Global 3D Stage Dock Manual Collapse/Expand (with User Memory)
+  $("btn-toggle-stage-dock")?.addEventListener("click", () => {
+    if (state.popupActive) {
+      popupMutex?.openPopupWindow();
+      return;
+    }
+    const nextCollapsed = !state.stageCollapsed;
+    state.userStageCollapsed = nextCollapsed;
+    applyStageVisibility(nextCollapsed);
+  });
+
+  // Pop-out Standalone Virtual Hardware Window (/sim-viewport)
+  $("btn-popout-stage")?.addEventListener("click", () => {
+    popupMutex?.openPopupWindow();
+  });
+
+  $("btn-recall-stage")?.addEventListener("click", () => {
+    popupMutex?.recallPopupWindow();
+  });
+
+  // Toast Dismiss
+  $("btn-dismiss-toast")?.addEventListener("click", () => {
+    const strip = $("anomaly-toast-strip");
+    if (strip) strip.hidden = true;
+  });
+
+  // Hardware Guidance Toggle
+  $("btn-toggle-hw-guidance")?.addEventListener("click", () => {
+    const list = $("hw-guidance-list");
+    const btn = $("btn-toggle-hw-guidance");
+    if (!list) return;
+    list.hidden = !list.hidden;
+    if (btn) btn.textContent = list.hidden ? "展开提示" : "收起提示";
+  });
+
+  // Floating Console Drawer
+  const toggleLogDrawer = (forceOpen) => {
+    const dock = $("log-dock");
+    const btn = $("btn-toggle-log-dock");
+    if (!dock) return;
+    const expanded =
+      typeof forceOpen === "boolean"
+        ? (dock.classList.toggle("expanded", forceOpen), forceOpen)
+        : dock.classList.toggle("expanded");
+    if (btn) btn.textContent = expanded ? "Console ▼" : "Console ▲";
+  };
+
+  $("btn-toggle-log-dock")?.addEventListener("click", () => toggleLogDrawer());
+  $("btn-close-log-dock")?.addEventListener("click", () => toggleLogDrawer(false));
+
+  // Plugin & Open-Source Dataset Workbench Actions
+  $("btn-plugin-demo-drawer")?.addEventListener("click", () => {
+    playDatasetTrajectoryOnPluginStage(
+      "huanianxia/b601rs_open_the_drawer_put_the_block_inside_then_close_the_drawer_20261116_001"
+    );
+  });
+
+  $("btn-stop-dataset-replay")?.addEventListener("click", () => {
+    stopPluginReplayTimer();
+  });
+
+  $("btn-plugin-servo-diag")?.addEventListener("click", () => {
+    showServoDiagnosticsOnPluginStage();
+  });
+
+  // Global Safety Controls
   $("btn-global-estop")?.addEventListener("click", async () => {
     const res = await apiFetch("/api/safety/estop", {
       method: "POST",
@@ -1062,7 +1850,14 @@ function bindActions() {
       method: "POST",
       body: JSON.stringify({ enabled: !state.torqueEnabled }),
     });
-    if (res.ok) updateSafetyUI(res.data);
+    if (res.ok && res.data) {
+      updateSafetyUI(res.data);
+      if (res.data.message) {
+        showFeedbackToast(res.data.message, res.data.hardware_applied || state.mode !== "real" ? "ok" : "warn");
+      }
+    } else if (res.detail) {
+      showFeedbackToast(res.detail, "warn");
+    }
   });
 
   $("btn-quick-rest")?.addEventListener("click", async () => {
@@ -1080,9 +1875,13 @@ function bindActions() {
     });
     if (res.ok) {
       setModeUI(res.data.mode);
-      appendLocalLog(`模式已切换为 ${res.data.mode}`);
+      clearAnomalyToast();
+      appendLocalLog(`模式已切换为 ${res.data.mode} (请求模式: ${mode})`);
     } else {
       ev.target.value = state.mode;
+      showAnomalyToast(
+        res.data?.detail || "未检测到双臂 SO-101 硬件，无法切入 REAL 真机模式（已保持 DRY-RUN 仿真）。"
+      );
     }
   });
 
@@ -1126,7 +1925,7 @@ function bindActions() {
       renderHardwareProbe(res.data);
       refreshCameraImagesOnce();
       if ($("device-config-status")) {
-        $("device-config-status").textContent = "已应用并保存到 .env！";
+        $("device-config-status").textContent = "已应用并保存到 .env";
       }
       appendLocalLog("已保存主从臂及摄像头配置到 .env。");
     } else if ($("device-config-status")) {
@@ -1148,10 +1947,11 @@ function bindActions() {
     [fCam.value, wCam.value] = [wCam.value, fCam.value];
   });
 
-  // Calibration controls
+  // Calibration Controls
   $("calibrate-target")?.addEventListener("change", () => updateAllStickViews());
 
   $("btn-start-calibrate")?.addEventListener("click", async () => {
+    ensureStageVisibleForAction();
     const target = $("calibrate-target")?.value || "follower";
     const port =
       target === "follower"
@@ -1201,7 +2001,7 @@ function bindActions() {
       method: "POST",
       body: JSON.stringify({ target: "home" }),
     });
-    if (r.ok) appendLocalLog("已保存当前姿态至 software/upright_pose.json");
+    if (r.ok) appendLocalLog("已保存当前姿态至 upright_pose.json");
   });
 
   $("btn-save-rest-pose")?.addEventListener("click", async () => {
@@ -1209,11 +2009,60 @@ function bindActions() {
       method: "POST",
       body: JSON.stringify({ target: "rest" }),
     });
-    if (r.ok) appendLocalLog("已保存当前姿态至 software/rest_pose.json");
+    if (r.ok) appendLocalLog("已保存当前姿态至 rest_pose.json");
   });
 
-  // Teleop & WASD
+  $("btn-cal-auto-home")?.addEventListener("click", async () => {
+    const calTarget = $("calibrate-target")?.value || "follower";
+    const home = Object.fromEntries(JOINTS.map((j) => [j.key, j.def]));
+    const res = await apiFetch("/api/sim/joints", {
+      method: "POST",
+      body: JSON.stringify({ arm: calTarget, joints: home }),
+    });
+    if (res.ok && res.data) {
+      updateJointGauges(res.data.leader_joints, res.data.follower_joints, true);
+      showFeedbackToast("已自动对齐官方 URDF 中位 (0°)", "ok");
+    }
+  });
+
+  $("btn-cal-auto-sweep")?.addEventListener("click", async () => {
+    const res = await apiFetch("/api/workflows/calibrate/input", {
+      method: "POST",
+      body: JSON.stringify({ value: "sweep" }),
+    });
+    if (res.ok) {
+      showFeedbackToast("正在自动扫查 6 轴限位范围...", "info");
+    }
+  });
+
+  async function toggleLinkedArms(nextLinked) {
+    const res = await apiFetch("/api/sim/linked", {
+      method: "POST",
+      body: JSON.stringify({ linked: Boolean(nextLinked) }),
+    });
+    if (res.ok && res.data) {
+      state.linkedArms = Boolean(res.data.linked_arms);
+      syncArmControlMutexUI();
+      showFeedbackToast(
+        state.linkedArms
+          ? "主从联动已开启：请操控主臂，从臂滑块与红圈已互斥锁定"
+          : "主从联动已断开：主臂与从臂现可独立控制",
+        state.linkedArms ? "ok" : "info"
+      );
+    }
+  }
+
+  $("chk-sim-linked")?.addEventListener("change", (ev) => {
+    toggleLinkedArms(ev.target.checked);
+  });
+
+  $("btn-teleop-link-toggle")?.addEventListener("click", () => {
+    toggleLinkedArms(!state.linkedArms);
+  });
+
+  // Teleop & WASD + Q/E
   $("btn-start-teleop")?.addEventListener("click", async () => {
+    ensureStageVisibleForAction();
     const fps = Number($("teleop-fps")?.value || 60);
     const res = await apiFetch("/api/workflows/teleop/start", {
       method: "POST",
@@ -1221,13 +2070,20 @@ function bindActions() {
     });
     if (res.ok) {
       state.activeWorkflow = "teleop";
+      state.linkedArms = true;
+      updateTeleopButtonsUI();
+      syncArmControlMutexUI();
       scheduleCameraLoop();
+      showFeedbackToast(`遥操作已启动 (${fps} FPS · 主从联动)`, "ok");
     }
   });
 
   $("btn-stop-teleop")?.addEventListener("click", async () => {
     await apiFetch("/api/workflows/teleop/stop", { method: "POST" });
     state.activeWorkflow = "idle";
+    updateTeleopButtonsUI();
+    syncArmControlMutexUI();
+    showFeedbackToast("遥操作已停止", "info");
   });
 
   $("btn-reset-joints")?.addEventListener("click", async () => {
@@ -1239,6 +2095,7 @@ function bindActions() {
     if (res.ok) {
       updateJointGauges(res.data.leader_joints, res.data.follower_joints, true);
       refreshCameraImagesOnce();
+      showFeedbackToast("主从双臂已归中位", "info");
     }
   });
 
@@ -1255,15 +2112,25 @@ function bindActions() {
           res.data.follower_joints,
           true
         );
+        if (res.data.clamped) showBoundaryToast(res.data.boundary_message);
+        if (isTeleopPanelVisible()) refreshCameraImagesOnce();
       }
     });
   });
 
   document.addEventListener("keydown", async (ev) => {
     if (!$("chk-wasd-enable")?.checked) return;
-    if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName || "")) return;
+    const activeEl = document.activeElement;
+    if (
+      activeEl &&
+      (["INPUT", "TEXTAREA", "SELECT"].includes(activeEl.tagName) || activeEl.isContentEditable)
+    ) {
+      return;
+    }
     const k = ev.key.toLowerCase();
-    if (!["w", "a", "s", "d", "r", "f", "j", "k", "u", "i", "c", "v", "m", " "].includes(k)) return;
+    if (!["w", "a", "s", "d", "q", "e", "r", "f", "j", "k", "u", "i", "c", "v", "m", " "].includes(k)) {
+      return;
+    }
     ev.preventDefault();
     const res = await apiFetch("/api/workflows/control/key", {
       method: "POST",
@@ -1275,10 +2142,12 @@ function bindActions() {
         res.data.follower_joints,
         true
       );
+      if (res.data.clamped) showBoundaryToast(res.data.boundary_message);
+      if (isTeleopPanelVisible()) refreshCameraImagesOnce();
     }
   });
 
-  // Dedicated Simulation page controls
+  // Simulation Page Controls
   $("btn-apply-sync-mode")?.addEventListener("click", async () => {
     const direction = $("sim-sync-direction")?.value || "off";
     const safety_confirmed = Boolean($("chk-sim-safety")?.checked);
@@ -1288,27 +2157,38 @@ function bindActions() {
     });
     const el = $("sim-sync-status");
     if (res.ok && el) {
-      el.textContent = `当前同步状态: ${res.data.direction} ${res.data.note || ""}`;
+      el.textContent = `同步: ${res.data.direction} ${res.data.note || ""}`;
+      showFeedbackToast(`真机同步模式已切换为: ${res.data.direction}`, "ok");
     } else if (el) {
-      el.textContent = `同步切换失败: ${res.data?.detail || "请检查安全确认与硬件连接"}`;
+      el.textContent = `切换失败: ${res.data?.detail || "请检查安全确认与硬件连接"}`;
+      showFeedbackToast(res.data?.detail || "同步切换失败", "warn");
     }
   });
 
-  $("chk-sim-ik-drag")?.addEventListener("change", (ev) => {
-    if (stickViews.simFollower) stickViews.simFollower.setIkEnabled(ev.target.checked);
+  $("chk-sim-ik-drag")?.addEventListener("change", () => {
+    syncArmControlMutexUI();
+    showFeedbackToast(
+      $("chk-sim-ik-drag")?.checked ? "已启用 3D 红圈 IK 拖拽" : "已关闭 3D 红圈 IK 拖拽",
+      "info"
+    );
   });
 
   $("btn-apply-ik")?.addEventListener("click", async () => {
+    ensureStageVisibleForAction();
     const x_mm = Number($("ik-x")?.value || 391);
     const y_mm = Number($("ik-y")?.value || 0);
     const z_mm = Number($("ik-z")?.value || 226);
     const gripper = Number($("ik-grip")?.value || 20);
+    const targetArm = state.linkedArms ? "leader" : "follower";
     const res = await apiFetch("/api/sim/ik", {
       method: "POST",
-      body: JSON.stringify({ arm: "follower", x_mm, y_mm, z_mm, gripper }),
+      body: JSON.stringify({ arm: targetArm, x_mm, y_mm, z_mm, gripper }),
     });
     if (res.ok && res.data) {
       updateJointGauges(res.data.leader_joints, res.data.follower_joints, true);
+      showFeedbackToast(`IK 逆解完成 (${targetArm})`, "ok");
+    } else {
+      showFeedbackToast(res.detail || "目标坐标超出物理工作空间", "warn");
     }
   });
 
@@ -1331,16 +2211,37 @@ function bindActions() {
   });
 
   // Teaching, Presets & Demo Routines
+  $("btn-teach-freedrag")?.addEventListener("click", async () => {
+    ensureStageVisibleForAction();
+    const res = await apiFetch("/api/safety/torque", {
+      method: "POST",
+      body: JSON.stringify({ enabled: false }),
+    });
+    if (res.ok && res.data) {
+      updateSafetyUI(res.data);
+      showFeedbackToast(
+        res.data.message || "已卸力并开启真机→3D实时同步，请手掰机械臂并点击记录示教点",
+        "ok"
+      );
+    } else if (res.detail) {
+      showFeedbackToast(res.detail, "warn");
+    }
+  });
+
   $("btn-teach-waypoint")?.addEventListener("click", async () => {
     const label = $("waypoint-label")?.value || "";
     const res = await apiFetch("/api/workflows/teaching/record_waypoint", {
       method: "POST",
       body: JSON.stringify({ label: label || null }),
     });
-    if (res.ok) await refreshWaypoints();
+    if (res.ok) {
+      await refreshWaypoints();
+      showFeedbackToast(`已记录示教点 #${res.data?.count || ""}`, "ok");
+    }
   });
 
   $("btn-replay-waypoints")?.addEventListener("click", async () => {
+    ensureStageVisibleForAction();
     const res = await apiFetch("/api/workflows/teaching/replay", {
       method: "POST",
       body: JSON.stringify({ speed: 1.5, loop: false }),
@@ -1357,6 +2258,7 @@ function bindActions() {
 
   document.querySelectorAll(".btn-preset").forEach((btn) => {
     btn.addEventListener("click", async () => {
+      ensureStageVisibleForAction();
       await apiFetch("/api/workflows/teaching/pose", {
         method: "POST",
         body: JSON.stringify({ pose: btn.dataset.pose, duration_s: 1.2 }),
@@ -1366,6 +2268,7 @@ function bindActions() {
 
   document.querySelectorAll(".btn-routine").forEach((btn) => {
     btn.addEventListener("click", async () => {
+      ensureStageVisibleForAction();
       await apiFetch("/api/workflows/teaching/routine", {
         method: "POST",
         body: JSON.stringify({ routine: btn.dataset.routine }),
@@ -1373,12 +2276,19 @@ function bindActions() {
     });
   });
 
-  // Data Collection & Spec Validator
+  // Data Collection
   for (const id of ["collect-dataset", "collect-task", "collect-fps"]) {
-    $(id)?.addEventListener("input", validateCollectSpecUI);
+    $(id)?.addEventListener("input", () => {
+      state.filledCollectConfig = {
+        datasetName: $("collect-dataset")?.value || "",
+        taskPrompt: $("collect-task")?.value || "",
+      };
+      validateCollectSpecUI();
+    });
   }
 
   $("btn-start-collect")?.addEventListener("click", async () => {
+    ensureStageVisibleForAction();
     const dataset_name = $("collect-dataset")?.value || "yyzmiao_pick_cube_demo";
     const single_task = $("collect-task")?.value || "Pick up the red cube and place it into the tray";
     const num_episodes = Number($("collect-episodes")?.value || 2);
@@ -1403,8 +2313,9 @@ function bindActions() {
   $("btn-refresh-episodes")?.addEventListener("click", refreshEpisodes);
   $("btn-refresh-plugins")?.addEventListener("click", refreshPlugins);
 
-  // VLA Preview + Stick Animation
+  // VLA 5-Step Prediction
   $("btn-vla-preview")?.addEventListener("click", async () => {
+    ensureStageVisibleForAction();
     const endpoint = $("vla-endpoint")?.value || "ws://127.0.0.1:8000";
     const policy_name = $("vla-policy-name")?.value || "pi05_so101_custom";
     const task_prompt = $("vla-prompt")?.value || "Pick up the cube";
@@ -1424,13 +2335,13 @@ function bindActions() {
         state.vlaAnimTimer = setInterval(() => {
           if ($("panel-vla")?.hidden) return;
           const j = chunk[stepIdx % chunk.length];
-          if (stickViews.vla) {
-            stickViews.vla.setState({
-              joints: j,
-              vlaChunk: chunk,
-              overlayBadge: `预测步 ${j.step}/${chunk.length}`,
-            });
-          }
+          state.followerJoints = { ...state.followerJoints, ...j };
+          state.overlayBadge = `预测步 ${j.step}/${chunk.length}`;
+          stageViews.follower?.setState({
+            joints: j,
+            vlaChunk: chunk,
+            overlayBadge: state.overlayBadge,
+          });
           if ($("vla-stick-data")) {
             $("vla-stick-data").innerHTML = renderStickTelemetryHtml(j, `VLA 预测第 ${j.step} 步`);
           }
@@ -1447,10 +2358,13 @@ function bindActions() {
 }
 
 async function bootstrap() {
+  updateThemeUI(state.theme);
+  initGlobalStageDock();
   initTabs();
-  initStickCanvases();
   initJointSliders();
   bindActions();
+  syncArmControlMutexUI();
+  updateTeleopButtonsUI();
   validateCollectSpecUI();
 
   const [probeRes, statusRes] = await Promise.all([
@@ -1467,7 +2381,7 @@ async function bootstrap() {
 
   updateAllStickViews();
   refreshCameraImagesOnce();
-  connectWebSocket();
+  connectTelemetryBus();
 }
 
 document.addEventListener("DOMContentLoaded", bootstrap);

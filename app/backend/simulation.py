@@ -195,6 +195,97 @@ def compute_fk_details(joints: dict[str, float]) -> dict[str, Any]:
     }
 
 
+def _finalize_ik_result(
+    solved_rad: dict[str, float],
+    current_joints: dict[str, float],
+    target_grip: float,
+    max_step: float = 24.0,
+) -> dict[str, float]:
+    # Scale joint deltas proportionally if any single joint exceeds max_step
+    # so the TCP stays on the continuous IK path instead of distorting downward.
+    deltas: dict[str, float] = {}
+    max_abs_delta = 0.0
+    for k in JOINT_NAMES[:4]:
+        lo, hi, _ = JOINT_SPECS[k]
+        deg_val = max(lo, min(hi, math.degrees(float(solved_rad[k]))))
+        cur_val = float(current_joints.get(k, 0.0))
+        d = deg_val - cur_val
+        deltas[k] = d
+        if abs(d) > max_abs_delta:
+            max_abs_delta = abs(d)
+
+    scale = (max_step / max_abs_delta) if max_abs_delta > max_step else 1.0
+    result: dict[str, float] = {}
+    for k in JOINT_NAMES[:4]:
+        lo, hi, _ = JOINT_SPECS[k]
+        cur_val = float(current_joints.get(k, 0.0))
+        result[k] = round(max(lo, min(hi, cur_val + deltas[k] * scale)), 2)
+
+    # 纯 XYZ 位置 IK 严格锁定 #5 wrist_roll，禁止利用 7.9mm 偏心乱转腕部
+    lo_r, hi_r, _ = JOINT_SPECS["wrist_roll"]
+    result["wrist_roll"] = round(max(lo_r, min(hi_r, float(current_joints.get("wrist_roll", 0.0)))), 2)
+    result["gripper"] = round(target_grip, 2)
+    return result
+
+
+def solve_ik_target_with_status(
+    *,
+    x_mm: float,
+    y_mm: float,
+    z_mm: float,
+    current_joints: dict[str, float],
+    pitch_deg: float | None = None,
+    gripper: float | None = None,
+    clamp_to_workspace: bool = False,
+    lock_pitch: bool = True,
+) -> tuple[dict[str, float], bool, str]:
+    """Solve 5-DOF+Gripper SO-101 IK (locking #5 wrist_roll); optionally clamp to URDF workspace boundary."""
+    cur_fk = compute_fk_details(current_joints)
+    target_pitch_rad: float | None
+    if not lock_pitch:
+        target_pitch_rad = None
+    elif pitch_deg is not None:
+        target_pitch_rad = math.radians(pitch_deg)
+    else:
+        target_pitch_rad = math.radians(cur_fk["tcp_pose"]["pitch_deg"])
+    target_roll_rad = math.radians(float(current_joints.get("wrist_roll", 0.0)))
+    target_grip = (
+        max(0.0, min(100.0, float(gripper)))
+        if gripper is not None
+        else float(current_joints.get("gripper", 20.0))
+    )
+
+    if _KINEMATICS_SOLVER is None:
+        raise RuntimeError("SO101Kinematics solver unavailable.")
+
+    cur_rad = {k: math.radians(float(current_joints.get(k, 0.0))) for k in JOINT_NAMES[:5]}
+    if clamp_to_workspace:
+        solved_rad, clamped, msg = _KINEMATICS_SOLVER.inverse_kinematics_clamped(
+            target_xyz=(x_mm / 1000.0, y_mm / 1000.0, z_mm / 1000.0),
+            current_joint_positions=cur_rad,
+            desired_pitch_rad=target_pitch_rad,
+            preserve_wrist_roll=target_roll_rad,
+            preserve_gripper=target_grip,
+            orientation_weight=0.0 if not lock_pitch else None,
+        )
+        return _finalize_ik_result(solved_rad, current_joints, target_grip), clamped, msg
+
+    ok, solved_rad, err_msg = _KINEMATICS_SOLVER.inverse_kinematics(
+        target_xyz=(x_mm / 1000.0, y_mm / 1000.0, z_mm / 1000.0),
+        current_joint_positions=cur_rad,
+        desired_pitch_rad=target_pitch_rad,
+        preserve_wrist_roll=target_roll_rad,
+        preserve_gripper=target_grip,
+        orientation_weight=0.0 if not lock_pitch else None,
+    )
+    if not ok or solved_rad is None:
+        raise ValueError(
+            err_msg
+            or f"目标点 ({x_mm:.1f}, {y_mm:.1f}, {z_mm:.1f}) mm 超出 SO-101 物理工作空间范围。"
+        )
+    return _finalize_ik_result(solved_rad, current_joints, target_grip), False, err_msg
+
+
 def solve_ik_target(
     *,
     x_mm: float,
@@ -204,49 +295,17 @@ def solve_ik_target(
     pitch_deg: float | None = None,
     gripper: float | None = None,
 ) -> dict[str, float]:
-    """Solve 6-DOF SO-101 IK using aguiya's verified SO101Kinematics (mm -> degrees)."""
-    cur_fk = compute_fk_details(current_joints)
-    target_pitch_rad = (
-        math.radians(pitch_deg)
-        if pitch_deg is not None
-        else math.radians(cur_fk["tcp_pose"]["pitch_deg"])
+    """Solve strict SO-101 IK using verified SO101Kinematics (mm -> degrees)."""
+    solved, _, _ = solve_ik_target_with_status(
+        x_mm=x_mm,
+        y_mm=y_mm,
+        z_mm=z_mm,
+        current_joints=current_joints,
+        pitch_deg=pitch_deg,
+        gripper=gripper,
+        clamp_to_workspace=False,
     )
-    target_roll_rad = math.radians(float(current_joints.get("wrist_roll", 0.0)))
-    target_grip = (
-        max(0.0, min(100.0, float(gripper)))
-        if gripper is not None
-        else float(current_joints.get("gripper", 20.0))
-    )
-
-    if _KINEMATICS_SOLVER is not None:
-        ok, solved_rad, err_msg = _KINEMATICS_SOLVER.inverse_kinematics(
-            target_xyz=(x_mm / 1000.0, y_mm / 1000.0, z_mm / 1000.0),
-            current_joint_positions={
-                k: math.radians(float(current_joints.get(k, 0.0))) for k in JOINT_NAMES[:5]
-            },
-            desired_pitch_rad=target_pitch_rad,
-            preserve_wrist_roll=target_roll_rad,
-            preserve_gripper=target_grip,
-        )
-        if not ok or solved_rad is None:
-            raise ValueError(
-                err_msg
-                or f"目标点 ({x_mm:.1f}, {y_mm:.1f}, {z_mm:.1f}) mm 超出 SO-101 物理工作空间范围。"
-            )
-        result: dict[str, float] = {}
-        max_step = 24.0
-        for k in JOINT_NAMES[:5]:
-            lo, hi, _ = JOINT_SPECS[k]
-            deg_val = max(lo, min(hi, math.degrees(float(solved_rad[k]))))
-            cur_val = float(current_joints.get(k, 0.0))
-            delta = deg_val - cur_val
-            if abs(delta) > max_step:
-                deg_val = cur_val + math.copysign(max_step, delta)
-            result[k] = round(max(lo, min(hi, deg_val)), 2)
-        result["gripper"] = round(target_grip, 2)
-        return result
-
-    raise RuntimeError("SO101Kinematics solver unavailable.")
+    return solved
 
 
 class Arm101Simulator:
@@ -346,28 +405,31 @@ class Arm101Simulator:
             elif k in ("c", "v"):
                 delta = 8.0 * (1.0 if k == "c" else -1.0)
                 cur["gripper"] = max(0.0, min(100.0, round(cur["gripper"] + delta, 2)))
-            elif k in ("w", "s", "r", "f"):
+            elif k in ("w", "s", "q", "e", "r", "f"):
                 yaw_rad = math.atan2(float(tcp["y_mm"]), float(tcp["x_mm"]))
                 r_now = float(tcp["r_mm"])
                 z_now = float(tcp["z_mm"])
                 if k == "w":
                     r_tgt, z_tgt = r_now + step_mm, z_now
                 elif k == "s":
-                    r_tgt, z_tgt = max(80.0, r_now - step_mm), z_now
-                elif k == "r":
+                    r_tgt, z_tgt = max(65.0, r_now - step_mm), z_now
+                elif k in ("q", "r"):
                     r_tgt, z_tgt = r_now, z_now + step_mm
                 else:
-                    r_tgt, z_tgt = r_now, max(30.0, z_now - step_mm)
+                    r_tgt, z_tgt = r_now, max(20.0, z_now - step_mm)
 
                 x_tgt = r_tgt * math.cos(yaw_rad)
                 y_tgt = r_tgt * math.sin(yaw_rad)
-                cur = solve_ik_target(
+                is_vertical = k in ("q", "e", "r", "f")
+                cur, clamped, boundary_msg = solve_ik_target_with_status(
                     x_mm=x_tgt,
                     y_mm=y_tgt,
                     z_mm=z_tgt,
                     current_joints=cur,
-                    pitch_deg=tcp["pitch_deg"],
+                    pitch_deg=None if is_vertical else tcp["pitch_deg"],
                     gripper=cur["gripper"],
+                    clamp_to_workspace=True,
+                    lock_pitch=not is_vertical,
                 )
             else:
                 raise ValueError(f"Unsupported control key '{key}'.")
@@ -378,6 +440,8 @@ class Arm101Simulator:
             self.step_count += 1
             return {
                 "action": f"key:{k}",
+                "clamped": bool(locals().get("clamped", False)),
+                "boundary_message": str(locals().get("boundary_msg", "")) if locals().get("clamped", False) else "",
                 "follower_joints": dict(self.follower_joints),
                 "leader_joints": dict(self.leader_joints),
                 "fk": compute_fk_details(self.follower_joints),
@@ -405,6 +469,7 @@ class Arm101Simulator:
         *,
         mode: str = "dry_run",
         active_workflow: str = "idle",
+        theme: str = "light",
         width: int = 640,
         height: int = 480,
     ) -> bytes:
@@ -414,22 +479,37 @@ class Arm101Simulator:
             count = self._frame_counters.get(cam_id, 0) + 1
             self._frame_counters[cam_id] = count
 
-        img = Image.new("RGB", (width, height), color=(15, 23, 42))
+        is_dark = theme == "dark"
+        bg_col = (15, 20, 28) if is_dark else (248, 249, 250)
+        grid_col = (36, 44, 58) if is_dark else (231, 233, 238)
+        top_bg = (24, 30, 42) if is_dark else (241, 243, 245)
+        border_col = (46, 56, 74) if is_dark else (218, 222, 228)
+        text_col = (241, 245, 249) if is_dark else (39, 39, 42)
+        hud_bg = (22, 27, 36) if is_dark else (255, 255, 255)
+        jaw_col = (226, 232, 240) if is_dark else (24, 24, 27)
+
+        img = Image.new("RGB", (width, height), color=bg_col)
         draw = ImageDraw.Draw(img)
 
         for x in range(0, width, 40):
-            draw.line([(x, 44), (x, height)], fill=(30, 41, 59), width=1)
+            draw.line([(x, 44), (x, height)], fill=grid_col, width=1)
         for y in range(44, height, 40):
-            draw.line([(0, y), (width, y)], fill=(30, 41, 59), width=1)
+            draw.line([(0, y), (width, y)], fill=grid_col, width=1)
 
-        draw.rectangle([(0, 0), (width, 44)], fill=(30, 41, 59))
-        badge_color = (245, 158, 11) if mode == "dry_run" else (16, 185, 129)
-        draw.rectangle([(12, 10), (132, 34)], fill=badge_color)
-        draw.text((20, 16), f"MODE: {mode.upper()}", fill=(15, 23, 42))
+        draw.rectangle([(0, 0), (width, 44)], fill=top_bg)
+        draw.line([(0, 44), (width, 44)], fill=border_col, width=1)
+        if is_dark:
+            badge_color = (78, 53, 12) if mode == "dry_run" else (20, 74, 42)
+            badge_text_color = (253, 224, 71) if mode == "dry_run" else (134, 239, 172)
+        else:
+            badge_color = (251, 243, 219) if mode == "dry_run" else (237, 243, 236)
+            badge_text_color = (143, 94, 0) if mode == "dry_run" else (40, 90, 44)
+        draw.rectangle([(12, 10), (132, 34)], fill=badge_color, outline=border_col)
+        draw.text((20, 16), f"MODE: {mode.upper()}", fill=badge_text_color)
         draw.text(
             (148, 16),
             f"ARM101 CAM:{cam_id.upper()} | WF:{active_workflow.upper()} | #{count}",
-            fill=(226, 232, 240),
+            fill=text_col,
         )
 
         pan = math.radians(joints["shoulder_pan"])
@@ -442,18 +522,19 @@ class Arm101Simulator:
         if cam_id == "wrist":
             cx = int(width * 0.5 + math.sin(pan) * 90)
             cy = int(height * 0.54 + math.sin(wrist) * 45)
-            draw.rectangle([(cx - 28, cy - 28), (cx + 28, cy + 28)], outline=(6, 182, 212), width=3)
-            draw.text((cx - 22, cy - 8), "CUBE", fill=(6, 182, 212))
+            cube_col = (56, 189, 248) if is_dark else (37, 99, 235)
+            draw.rectangle([(cx - 28, cy - 28), (cx + 28, cy + 28)], outline=cube_col, width=3)
+            draw.text((cx - 18, cy - 6), "CUBE", fill=cube_col)
             jaw_gap = 18 + int(grip_pct * 55)
             dx, dy = math.cos(roll), math.sin(roll)
             nx, ny = -dy, dx
             for sign in (-1, 1):
                 px = int(width * 0.5 + nx * jaw_gap * sign)
                 py = int(height * 0.56 + ny * jaw_gap * sign)
-                draw.rectangle([(px - 10, py - 24), (px + 10, py + 24)], fill=(248, 250, 252))
+                draw.rectangle([(px - 10, py - 24), (px + 10, py + 24)], fill=jaw_col)
         else:
             bx, by = int(width * 0.36 + math.sin(pan) * 40), int(height * 0.78)
-            draw.rectangle([(bx - 42, by), (bx + 42, by + 22)], fill=(71, 85, 105))
+            draw.rectangle([(bx - 42, by), (bx + 42, by + 22)], fill=(100, 116, 139))
 
             l1, l2, l3 = 115.0, 105.0, 60.0
             a1 = lift
@@ -463,12 +544,12 @@ class Arm101Simulator:
             a3 = a2 + wrist
             x3, y3 = x2 + l3 * math.cos(a3), y2 + l3 * math.sin(a3)
 
-            draw.line([(bx, by), (x1, y1)], fill=(6, 182, 212), width=10)
-            draw.line([(x1, y1), (x2, y2)], fill=(56, 189, 248), width=8)
-            draw.line([(x2, y2), (x3, y3)], fill=(16, 185, 129), width=6)
+            draw.line([(bx, by), (x1, y1)], fill=(37, 99, 235), width=10)
+            draw.line([(x1, y1), (x2, y2)], fill=(2, 132, 199), width=8)
+            draw.line([(x2, y2), (x3, y3)], fill=(14, 165, 233), width=6)
 
-            for jx, jy, r in ((bx, by, 9), (x1, y1, 8), (x2, y2, 7), (x3, y3, 6)):
-                draw.ellipse([(jx - r, jy - r), (jx + r, jy + r)], fill=(245, 158, 11))
+            for jx, jy, r in ((bx, by, 8), (x1, y1, 7), (x2, y2, 6), (x3, y3, 5)):
+                draw.ellipse([(jx - r, jy - r), (jx + r, jy + r)], fill=hud_bg, outline=jaw_col)
 
             jaw_open = 6 + grip_pct * 22
             px_perp, py_perp = -math.sin(a3), math.cos(a3)
@@ -477,26 +558,26 @@ class Arm101Simulator:
                 gy0 = y3 + py_perp * jaw_open * sign
                 gx1 = gx0 + 20 * math.cos(a3)
                 gy1 = gy0 + 20 * math.sin(a3)
-                draw.line([(gx0, gy0), (gx1, gy1)], fill=(248, 250, 252), width=4)
+                draw.line([(gx0, gy0), (gx1, gy1)], fill=jaw_col, width=4)
 
-        draw.rectangle([(12, height - 102), (332, height - 12)], fill=(15, 23, 42), outline=(51, 65, 85))
+        draw.rectangle([(12, height - 102), (332, height - 12)], fill=hud_bg, outline=border_col)
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         draw.text(
             (22, height - 94),
             f"pan:{joints['shoulder_pan']:6.1f}  lift:{joints['shoulder_lift']:6.1f}",
-            fill=(226, 232, 240),
+            fill=text_col,
         )
         draw.text(
             (22, height - 74),
             f"elb:{joints['elbow_flex']:6.1f}  wflx:{joints['wrist_flex']:6.1f}",
-            fill=(226, 232, 240),
+            fill=text_col,
         )
         draw.text(
             (22, height - 54),
             f"wrol:{joints['wrist_roll']:5.1f}  grip:{joints['gripper']:5.1f}%",
-            fill=(226, 232, 240),
+            fill=text_col,
         )
-        draw.text((22, height - 32), f"step:{self.step_count} | {ts}", fill=(148, 163, 184))
+        draw.text((22, height - 32), f"step:{self.step_count} | {ts}", fill=(100, 116, 139))
 
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)

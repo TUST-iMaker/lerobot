@@ -566,8 +566,9 @@ class SO101Kinematics:
         best_q: np.ndarray | None = None
         best_err = float("inf")
 
-        # 1. 若可用, 优先尝试官方 RobotKinematics (placo)
-        if self._placo_solver is not None:
+        # 1. 若可用且为全 6D 姿态目标, 优先尝试官方 RobotKinematics (placo)
+        #    注意: 纯 XYZ 位置 IK (desired_ee_pose is None) 必须锁定 #5 wrist_roll, 防止解算器利用 7.9mm 偏心乱转腕部
+        if self._placo_solver is not None and desired_ee_pose is not None:
             try:
                 q_seed_deg = np.rad2deg(q_init)
                 q_sol_deg = np.asarray(
@@ -700,6 +701,74 @@ class SO101Kinematics:
             joint_targets["wrist_roll"] = clamped_roll / self.config.sign_wrist_roll
         joint_targets["gripper"] = float(preserve_gripper)
         return True, joint_targets, "逆运动学 URDF 求解成功"
+
+    def inverse_kinematics_clamped(
+        self,
+        target_xyz: tuple[float, float, float],
+        current_joint_positions: dict[str, float] | None = None,
+        desired_pitch_rad: float | None = None,
+        preserve_wrist_roll: float = 0.0,
+        preserve_gripper: float = 0.0,
+        orientation_weight: float | None = None,
+    ) -> tuple[dict[str, float], bool, str]:
+        """纯 XYZ 位置逆解 (锁定 #5 wrist_roll): 超出物理工作空间时自动钳制到最近可达边界."""
+        ok, joints, msg = self.inverse_kinematics(
+            target_xyz=target_xyz,
+            current_joint_positions=current_joint_positions,
+            desired_pitch_rad=desired_pitch_rad,
+            preserve_wrist_roll=preserve_wrist_roll,
+            preserve_gripper=preserve_gripper,
+            desired_ee_pose=None,
+            orientation_weight=orientation_weight,
+        )
+        if ok and joints is not None:
+            return joints, False, msg
+
+        # 超出物理工作空间: 锁定 wrist_roll, 沿最优接近路径投影到 URDF 可达边界
+        x, y, z = float(target_xyz[0]), float(target_xyz[1]), float(target_xyz[2])
+        target_vec = np.array([x, y, z], dtype=np.float64)
+        q_seed = (
+            self._extract_q_rad(current_joint_positions, unit=JointUnit.RADIAN)
+            if current_joint_positions is not None
+            else np.zeros(len(self.config.joint_names), dtype=np.float64)
+        )
+        roll_idx = 4
+        lo_r, hi_r = self._numpy_solver.lower_bounds[roll_idx], self._numpy_solver.upper_bounds[roll_idx]
+        locked_roll = max(lo_r, min(hi_r, float(preserve_wrist_roll) * self.config.sign_wrist_roll))
+        q_seed[roll_idx] = locked_roll
+        active_4 = np.array([True, True, True, True, False], dtype=bool)
+
+        best_q, best_err = self._numpy_solver.inverse_kinematics_dls(
+            target_xyz=target_vec,
+            q_init=q_seed,
+            pos_w=self.config.position_weight,
+            ori_w=0.0,
+            max_iters=self.config.ik_max_iters,
+            damping=max(self.config.ik_damping, 5e-3),
+            active_mask=active_4,
+        )
+        pan_g = -math.atan2(y, x) if math.hypot(x, y) >= 1e-4 else float(q_seed[0])
+        pan_seed = np.array([pan_g, 0.0, 0.0, 0.0, locked_roll], dtype=np.float64)
+        q_try, err_try = self._numpy_solver.inverse_kinematics_dls(
+            target_xyz=target_vec,
+            q_init=pan_seed,
+            pos_w=self.config.position_weight,
+            ori_w=0.0,
+            max_iters=self.config.ik_max_iters,
+            damping=max(self.config.ik_damping, 5e-3),
+            active_mask=active_4,
+        )
+        if err_try < best_err:
+            best_q, best_err = q_try, err_try
+
+        joint_targets = self._apply_inverse_signs(best_q)
+        joint_targets["wrist_roll"] = locked_roll / self.config.sign_wrist_roll
+        joint_targets["gripper"] = float(preserve_gripper)
+        return (
+            joint_targets,
+            True,
+            f"已触达 SO-101 物理工作空间边界 (截断误差 {best_err * 1000.0:.1f}mm)",
+        )
 
 
 def solve_horizontal_planar_reach(

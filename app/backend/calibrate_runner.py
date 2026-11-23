@@ -13,6 +13,7 @@ handling so that `lerobot-calibrate`:
 from __future__ import annotations
 
 import builtins
+import os
 import queue
 import signal
 import sys
@@ -115,16 +116,25 @@ def install_calibration_safety_hooks() -> None:
 
 
 def main() -> int:
+    print("[CAL_STAGE] starting", flush=True)
     stdin_queue: queue.Queue[str | None] = queue.Queue()
 
     def _reader() -> None:
+        # Read raw fd 0 via os.read() instead of sys.stdin.readline() to avoid
+        # Windows CRT / Python TextIOWrapper lock deadlocks during lerobot imports.
+        buf = b""
         try:
             while True:
-                line = sys.stdin.readline()
-                if line == "":
+                chunk = os.read(0, 4096)
+                if not chunk:
+                    if buf:
+                        stdin_queue.put(buf.decode("utf-8", errors="replace"))
                     stdin_queue.put(None)
                     break
-                stdin_queue.put(line)
+                buf += chunk
+                while b"\n" in buf:
+                    raw_line, buf = buf.split(b"\n", 1)
+                    stdin_queue.put(raw_line.decode("utf-8", errors="replace") + "\n")
         except Exception:
             stdin_queue.put(None)
 
@@ -140,11 +150,12 @@ def main() -> int:
             except Exception:
                 pass
 
-    threading.Thread(target=_reader, name="cal-stdin-reader", daemon=True).start()
+    # Import lerobot BEFORE starting the stdin reader thread to prevent Windows import/stdio deadlocks
     install_piped_stdin_shims(stdin_queue)
     install_calibration_safety_hooks()
-
     from lerobot.scripts.lerobot_calibrate import main as lerobot_calibrate_main
+
+    threading.Thread(target=_reader, name="cal-stdin-reader", daemon=True).start()
 
     try:
         lerobot_calibrate_main()
