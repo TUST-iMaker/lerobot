@@ -293,11 +293,16 @@ class SO101RealBridge:
                 self.direction == "teleop_bidirectional"
                 and self.simulator.linked_arms
                 and not self.simulator.estop_latched
+                and self.simulator.torque_enabled
             ):
-                if leader_delta > 1.5:
-                    self._ui_override_until = 0.0  # Human moved real leader -> reclaim immediately
-                if now >= self._ui_override_until:
-                    self._submit_follower_deg_unlocked(api, l_deg)
+                from core.data_types import SystemState
+
+                cur_state = getattr(getattr(api, "state_machine", None), "current_state", None)
+                if cur_state not in (SystemState.IDLE, SystemState.ESTOP_LATCHED, SystemState.ERROR, SystemState.DISCONNECTED):
+                    if leader_delta > 1.5:
+                        self._ui_override_until = 0.0  # Human moved real leader -> reclaim immediately
+                    if now >= self._ui_override_until:
+                        self._submit_follower_deg_unlocked(api, l_deg)
 
         obs = api.get_observation()
         f_state = getattr(obs, "joint_state", None) if obs is not None else None
@@ -370,9 +375,16 @@ class SO101RealBridge:
     def reset_estop(self) -> None:
         with self._lock:
             api = self._api
+            direction = self.direction
         if api is not None:
             try:
                 api.request_reset()
+                if direction in ("sim_to_real", "teleop_bidirectional"):
+                    from core.data_types import ControlSource
+
+                    api.claim_control(ControlSource.UI)
+                with self._lock:
+                    self.last_error = None
             except Exception as exc:
                 with self._lock:
                     self.last_error = str(exc)

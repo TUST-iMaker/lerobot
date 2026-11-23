@@ -110,6 +110,20 @@ class ReplayRequest(BaseModel):
     loop: bool = False
 
 
+class LinearTeachStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(default="demo_linear_01", min_length=1, max_length=64)
+    duration_s: float = Field(default=30.0, ge=2.0, le=300.0)
+    fps: int = Field(default=30, ge=10, le=60)
+
+
+class LinearReplayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=64)
+    episode: int = Field(default=0, ge=0)
+    fps: int = Field(default=30, ge=10, le=60)
+
+
 class CollectStartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     dataset_name: str = Field(default="arm101_dryrun_demo", min_length=1, max_length=80)
@@ -531,6 +545,39 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     @fastapi_app.post("/api/workflows/teaching/clear")
     async def teaching_clear() -> dict[str, Any]:
         return await _rt().workflows.clear_waypoints()
+
+    @fastapi_app.get("/api/workflows/teaching/linear/list")
+    async def teaching_linear_list() -> dict[str, Any]:
+        return _rt().workflows.list_linear_trajectories()
+
+    @fastapi_app.post("/api/workflows/teaching/linear/start")
+    async def teaching_linear_start(
+        req: LinearTeachStartRequest | None = None,
+    ) -> dict[str, Any]:
+        body = req or LinearTeachStartRequest()
+        try:
+            return await _rt().workflows.start_linear_teach(
+                name=body.name, duration_s=body.duration_s, fps=body.fps
+            )
+        except WorkflowConflictError as exc:
+            raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
+
+    @fastapi_app.post("/api/workflows/teaching/linear/stop")
+    async def teaching_linear_stop() -> dict[str, Any]:
+        return await _rt().workflows.stop_linear_teach()
+
+    @fastapi_app.post("/api/workflows/teaching/linear/replay")
+    async def teaching_linear_replay(req: LinearReplayRequest) -> dict[str, Any]:
+        try:
+            return await _rt().workflows.replay_linear_teach(
+                name=req.name, episode=req.episode, fps=req.fps
+            )
+        except WorkflowConflictError as exc:
+            raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
+
+    @fastapi_app.post("/api/workflows/teaching/linear/replay/stop")
+    async def teaching_linear_replay_stop() -> dict[str, Any]:
+        return await _rt().workflows.stop_linear_replay()
 
     @fastapi_app.post("/api/workflows/collect/start")
     async def collect_start(req: CollectStartRequest | None = None) -> dict[str, Any]:

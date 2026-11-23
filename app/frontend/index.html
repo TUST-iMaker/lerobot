@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Arm101 Studio — SO-ARM101 Robotics Workbench</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http%3A//www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%2318181b'/%3E%3Cpath d='M5 19h14M8 19v-4l4-6 4 3 3-5' fill='none' stroke='%23ffffff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='12' cy='9' r='1.8' fill='%23ffffff'/%3E%3Ccircle cx='19' cy='7' r='1.8' fill='%23ffffff'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/styles.css?v=2026112304" />
+  <link rel="stylesheet" href="/static/styles.css?v=2026112305" />
 </head>
 <body>
   <div class="studio-shell" id="studio-shell">
@@ -77,6 +77,10 @@
       <header class="topbar" aria-label="Global Command Bar">
         <div class="topbar-left">
           <h1 id="active-module-title" class="module-heading">1. 总览与标定</h1>
+          <span id="readiness-pill" data-testid="readiness-pill" class="readiness-pill pill-ready" title="当前操控就绪状态">
+            <span class="status-dot dot-ok" id="readiness-pill-dot"></span>
+            <span id="readiness-pill-text">仿真就绪</span>
+          </span>
           <span class="v-divider" aria-hidden="true"></span>
           <button type="button" class="btn btn-xs btn-secondary" data-testid="btn-toggle-stage-dock" id="btn-toggle-stage-dock" title="折叠或展开常驻 3D 机械臂舞台">
             收起 3D 舞台
@@ -191,6 +195,21 @@
                 </div>
               </div>
               <ul id="hw-guidance-list" class="guidance-list" hidden></ul>
+            </div>
+
+            <div class="card readiness-card" id="readiness-card" data-testid="readiness-card">
+              <div class="hw-strip-row">
+                <div class="hw-strip-info">
+                  <div class="readiness-title-row">
+                    <span class="status-dot dot-ok" id="readiness-card-dot"></span>
+                    <strong id="readiness-card-title">系统已准备就绪 · 仿真可直接操控</strong>
+                  </div>
+                  <span id="readiness-card-desc" class="muted">拖动左侧 3D 红圈、右侧滑块或使用键盘 WASD/QE 即可立即控臂。</span>
+                </div>
+                <div class="btn-group">
+                  <button type="button" class="btn btn-xs btn-primary" data-testid="btn-readiness-action" id="btn-readiness-action">前往 3. 仿真控臂</button>
+                </div>
+              </div>
             </div>
 
             <div class="cockpit-split">
@@ -438,6 +457,27 @@
               <div id="teach-stick-data" class="telemetry-strip-wrap"></div>
             </div>
 
+            <div class="card" id="linear-teach-card" data-testid="linear-teach-card">
+              <div class="panel-header">
+                <h3>连续轨迹示教与线性回放 (官方 lerobot-record / lerobot-replay)</h3>
+                <div class="btn-group">
+                  <input id="linear-teach-name" type="text" value="demo_linear_01" placeholder="轨迹名称" style="width:130px" />
+                  <input id="linear-teach-duration" type="number" value="30" min="2" max="300" title="最大录制秒数" style="width:64px" />
+                  <button type="button" class="btn btn-xs btn-primary" data-testid="btn-linear-teach-start" id="btn-linear-teach-start">开始连续示教</button>
+                  <button type="button" class="btn btn-xs btn-danger" data-testid="btn-linear-teach-stop" id="btn-linear-teach-stop">停止并保存</button>
+                </div>
+              </div>
+              <div class="status-row" style="margin-top:6px;gap:8px;flex-wrap:wrap">
+                <select id="linear-traj-select" data-testid="linear-traj-select" aria-label="选择已录制连续轨迹" style="min-width:220px">
+                  <option value="">暂无已录制连续轨迹</option>
+                </select>
+                <button type="button" class="btn btn-xs btn-primary" data-testid="btn-linear-replay-start" id="btn-linear-replay-start">线性回放选中轨迹</button>
+                <button type="button" class="btn btn-xs btn-secondary" data-testid="btn-linear-replay-stop" id="btn-linear-replay-stop">停止回放</button>
+                <button type="button" class="btn btn-xs btn-secondary" id="btn-linear-refresh">刷新列表</button>
+                <span id="linear-teach-status" class="mono-meta">就绪：点击「开始连续示教」主臂带从臂做动作，结束后可一键线性回放。</span>
+              </div>
+            </div>
+
             <div class="card flex-card">
               <div class="panel-header">
                 <h3>关键帧示教航点队列</h3>
@@ -661,6 +701,6 @@
     </aside>
   </div>
 
-  <script type="module" src="/static/app.js?v=2026112304"></script>
+  <script type="module" src="/static/app.js?v=2026112305"></script>
 </body>
 </html>
