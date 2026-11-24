@@ -124,6 +124,17 @@ class LinearReplayRequest(BaseModel):
     fps: int = Field(default=30, ge=10, le=60)
 
 
+class CollectEpisodeActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["next", "rerecord", "stop"]
+
+
+class CollectEpisodeDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    dataset_name: str = Field(min_length=1, max_length=100)
+    episode_index: int = Field(ge=0)
+
+
 class CollectStartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     dataset_name: str = Field(default="arm101_dryrun_demo", min_length=1, max_length=80)
@@ -131,8 +142,8 @@ class CollectStartRequest(BaseModel):
     single_task: str = Field(default="Pick and place cube", min_length=1, max_length=240)
     task: str | None = None
     num_episodes: int = Field(default=2, ge=1, le=200)
-    episode_time_s: float = Field(default=5.0, gt=0.1, le=600.0)
-    reset_time_s: float = Field(default=1.0, ge=0.0, le=120.0)
+    episode_time_s: float = Field(default=30.0, ge=0.0, le=600.0)
+    reset_time_s: float = Field(default=3.0, ge=0.0, le=120.0)
     fps: int = Field(default=30, ge=1, le=120)
     push_to_hub: bool = False
 
@@ -480,11 +491,24 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     @fastapi_app.post("/api/mode")
     async def set_mode(req: ModeRequest) -> JSONResponse:
         rt = _rt()
+        prev_mode = rt.hardware.active_mode
         ok, payload = await asyncio.to_thread(rt.hardware.set_mode, req.mode)
         if not ok:
             rt.workflows.log(f"Mode switch to '{req.mode}' rejected: hardware not ready.")
             return JSONResponse(status_code=409, content=payload)
-        rt.workflows.log(f"Operating mode set to '{payload['mode']}' (requested='{req.mode}').")
+        new_mode = payload.get("mode", rt.hardware.active_mode)
+        if prev_mode != new_mode:
+            await rt.workflows._ensure_idle()
+            if new_mode == "dry_run":
+                await asyncio.to_thread(
+                    rt.workflows.bridge.disconnect,
+                    return_to_rest=False,
+                    keep_torque=False,
+                )
+                rt.workflows.release_cameras()
+            elif new_mode == "real":
+                await rt.workflows.resume_real_monitor_if_idle()
+        rt.workflows.log(f"Operating mode set to '{new_mode}' (requested='{req.mode}').")
         return JSONResponse(status_code=200, content=payload)
 
     # ------------------------------------------------------------------
@@ -624,6 +648,13 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     async def collect_stop() -> dict[str, Any]:
         return await _rt().workflows.stop_collect()
 
+    @fastapi_app.post("/api/workflows/collect/episode_action")
+    async def collect_episode_action(req: CollectEpisodeActionRequest) -> dict[str, Any]:
+        try:
+            return _rt().workflows.collect_episode_action(req.action)
+        except WorkflowConflictError as exc:
+            raise HTTPException(status_code=409, detail={"detail": exc.detail, "code": exc.code})
+
     @fastapi_app.get("/api/workflows/collect/episodes")
     async def collect_episodes() -> dict[str, Any]:
         return _rt().workflows.list_episodes()
@@ -636,6 +667,29 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
+
+    @fastapi_app.post("/api/workflows/collect/episodes/delete")
+    async def collect_episode_delete(req: CollectEpisodeDeleteRequest) -> dict[str, Any]:
+        try:
+            return _rt().workflows.delete_episode(req.dataset_name, req.episode_index)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @fastapi_app.get("/api/workflows/collect/video/{dataset_name}/{cam_key}/{episode_index}")
+    async def collect_episode_video(
+        dataset_name: str, cam_key: str, episode_index: int
+    ) -> FileResponse:
+        try:
+            mp4_path = _rt().workflows.get_episode_video_path(
+                dataset_name, cam_key, episode_index
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return FileResponse(path=str(mp4_path), media_type="video/mp4")
 
     # ------------------------------------------------------------------
     # Safety Kernel, Independent Dual-Arm Sim, IK & aguiya Presets
@@ -805,6 +859,14 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     ) -> JSONResponse:
         body = req or PluginLaunchRequest()
         rt = _rt()
+        hw_exclusive = plugin_id in ("feetech_servo_bench", "lerobot_studio")
+        if hw_exclusive and rt.hardware.active_mode == "real":
+            await asyncio.to_thread(
+                rt.workflows.bridge.disconnect,
+                return_to_rest=False,
+                keep_torque=False,
+            )
+            rt.workflows.log(f"Released serial ports for external plugin '{plugin_id}'.")
         try:
             res = rt.plugins.launch(plugin_id, body.args)
             rt.workflows.log(f"Launched plugin '{plugin_id}' (pid={res.get('pid')}).")
@@ -829,6 +891,20 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
         try:
             res = rt.plugins.stop(plugin_id)
             rt.workflows.log(f"Stopped plugin '{plugin_id}'.")
+            if (
+                plugin_id in ("feetech_servo_bench", "lerobot_studio")
+                and rt.hardware.active_mode == "real"
+                and rt.workflows.active_workflow == "idle"
+            ):
+                try:
+                    await asyncio.to_thread(
+                        rt.workflows.bridge.set_sync_mode,
+                        "real_to_sim",
+                        is_real_mode=True,
+                        safety_confirmed=False,
+                    )
+                except Exception:
+                    pass
             return res
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
