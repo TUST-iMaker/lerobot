@@ -113,6 +113,10 @@
 
           <span class="v-divider" aria-hidden="true"></span>
 
+          <button type="button" class="btn btn-xs btn-secondary" data-testid="btn-topbar-teleop" id="btn-topbar-teleop" title="全局一键启停主从双向遥操作">
+            遥操作: 关
+          </button>
+
           <div class="torque-capsule" role="group" aria-label="Torque Control">
             <span id="torque-badge" class="torque-status-text">
               <span class="status-dot dot-ok"></span>扭矩: 已使能
@@ -426,7 +430,7 @@
                   <select id="sim-sync-direction" data-testid="sim-sync-direction" aria-label="Sync Direction">
                     <option value="off">Pure Sim (纯仿真)</option>
                     <option value="real_to_sim">Real → Sim (只读真机)</option>
-                    <option value="sim_to_real">Sim → Real (驱动从臂)</option>
+                    <option value="sim_to_real">Sim → Real (电脑驱动真机)</option>
                   </select>
                 </label>
                 <label class="inline-field">
@@ -863,6 +867,6 @@
     </div>
   </div>
 
-  <script type="module" src="/static/app.js?v=2026112403"></script>
+  <script type="module" src="/static/app.js?v=2026112405"></script>
 </body>
 </html>
