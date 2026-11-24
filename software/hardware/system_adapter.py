@@ -120,6 +120,24 @@ class RobotSystemAdapter:
         with self._bus_lock:
             return self.follower.send_action(action)
 
+    def disable_leader_torque(self) -> bool:
+        """释放主臂舵机扭矩."""
+        if not self.leader or not self.leader.is_connected:
+            return False
+        with self._bus_lock:
+            if hasattr(self.leader, "disable_torque"):
+                return bool(self.leader.disable_torque())
+            return False
+
+    def send_leader_target_deg(self, targets_deg: dict[str, float]) -> bool:
+        """向主臂直接下发角度目标 (Tab 3 解除联动独立控主臂时使用)."""
+        if not self.leader or not self.leader.is_connected:
+            return False
+        with self._bus_lock:
+            if hasattr(self.leader, "send_target_deg"):
+                return bool(self.leader.send_target_deg(targets_deg))
+            return False
+
     def stop_motion(self) -> None:
         """急停/原位保持: 锁定从臂当前位置并保持力矩."""
         self.follower.stop_motion()

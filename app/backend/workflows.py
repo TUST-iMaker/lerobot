@@ -2404,9 +2404,9 @@ class WorkflowManager:
             if arm in ("follower", "both") or (arm == "leader" and self.simulator.linked_arms):
                 real_dispatched = self.bridge.send_follower_target_deg(follower)
             if arm == "leader" and not self.simulator.linked_arms:
-                real_dispatched = self.bridge.send_leader_target_deg(leader)
+                real_dispatched = self.bridge.send_leader_target_deg(validated)
             elif arm == "both" and not self.simulator.linked_arms:
-                real_dispatched = self.bridge.send_leader_target_deg(leader) or real_dispatched
+                real_dispatched = self.bridge.send_leader_target_deg(validated) or real_dispatched
         return {
             "status": "ok",
             "arm": arm,

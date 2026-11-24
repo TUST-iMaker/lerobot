@@ -1178,6 +1178,13 @@ async function flushSimJoints(arm) {
   });
   if (res.ok && res.data) {
     updateJointGauges(res.data.leader_joints, res.data.follower_joints, false);
+    if (state.mode === "real" && res.data.real_dispatched === false && !state.torqueEnabled) {
+      const now = performance.now();
+      if (!state._lastTorqueWarnTs || now - state._lastTorqueWarnTs > 4000) {
+        state._lastTorqueWarnTs = now;
+        showFeedbackToast("当前真机已卸力（仅动 3D 仿真），点顶栏「点击上力」即可驱动真机主/从臂", "warn");
+      }
+    }
   }
 }
 
