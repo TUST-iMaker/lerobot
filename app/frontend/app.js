@@ -237,6 +237,11 @@ function updateTeleopButtonsUI() {
     btnStop.disabled = !running;
     btnStop.className = running ? "btn btn-xs btn-estop" : "btn btn-xs btn-secondary";
   }
+  const btnTopTeleop = $("btn-topbar-teleop");
+  if (btnTopTeleop) {
+    btnTopTeleop.classList.toggle("btn-teleop-live", running);
+    btnTopTeleop.textContent = running ? "遥操作: 开" : "遥操作: 关";
+  }
   if (camCard) {
     camCard.classList.toggle("teleop-running-card", running);
   }
@@ -733,6 +738,8 @@ function updateSafetyUI(safety) {
   state.estopLatched = Boolean(safety.estop_latched);
   if (safety.sync_direction !== undefined) {
     state.syncDirection = safety.sync_direction || "off";
+    const syncSt = $("sim-sync-status");
+    if (syncSt) syncSt.textContent = `同步: ${state.syncDirection}`;
   }
 
   const tBadge = $("torque-badge");
@@ -2581,6 +2588,32 @@ function bindActions() {
       document.querySelector('.tab-btn[data-tab="dashboard"]')?.click();
     } else {
       document.querySelector('.tab-btn[data-tab="sim"]')?.click();
+    }
+  });
+
+  $("btn-topbar-teleop")?.addEventListener("click", async () => {
+    if (state.activeWorkflow === "teleop") {
+      const res = await apiFetch("/api/workflows/teleop/stop", { method: "POST" });
+      if (res.ok) {
+        state.activeWorkflow = "idle";
+        updateTeleopButtonsUI();
+        showFeedbackToast("已停止遥操作（从臂已卸力，3D 监听保持在线）", "info");
+      } else {
+        showAnomalyToast(res.error || "停止遥操作失败");
+      }
+      return;
+    }
+    const fps = Number($("teleop-fps")?.value || 60);
+    const res = await apiFetch("/api/workflows/teleop/start", {
+      method: "POST",
+      body: JSON.stringify({ fps, display_data: false, use_cameras: false }),
+    });
+    if (res.ok) {
+      state.activeWorkflow = "teleop";
+      updateTeleopButtonsUI();
+      showFeedbackToast("全局遥操作已开启：手掰主臂即可驱动从臂", "ok");
+    } else {
+      showAnomalyToast(res.error || res.data?.detail || "启动遥操作失败");
     }
   });
 

@@ -1060,7 +1060,8 @@ td.joint-values {
 
 .cam-frame {
   width: 100%;
-  height: 168px;
+  height: 260px;
+  min-height: 160px;
   background: var(--bg-viewport);
   border: 1px solid var(--border-subtle);
   border-radius: 4px;
@@ -1068,13 +1069,17 @@ td.joint-values {
   display: flex;
   align-items: center;
   justify-content: center;
+  position: relative;
 }
 
 .cam-frame img {
   display: block;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
+  transform-origin: center center;
+  user-select: none;
+  -webkit-user-drag: none;
 }
 
 .dpad-center-wrap {
@@ -1157,24 +1162,37 @@ td.joint-values {
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
 }
 
 .ik-coord-bar label {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 12.5px;
+  font-weight: 600;
   color: var(--text-secondary);
 }
 
 .ik-coord-bar input[type="number"] {
-  width: 60px;
-  height: 24px;
-  padding: 0 6px;
+  width: 82px;
+  height: 30px;
+  padding: 0 8px;
+  font-size: 13px;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+}
+
+.ik-coord-bar select {
+  height: 30px;
+  font-size: 12.5px;
+}
+
+.ik-coord-bar .btn {
+  height: 30px;
+  padding: 0 14px;
+  font-size: 12.5px;
 }
 
 /* ==========================================================================
