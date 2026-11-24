@@ -1828,6 +1828,37 @@ th {
   display: none;
 }
 
+/* Official URDF Middle-Pose ASCII Reference Block */
+.cal-ascii-ref {
+  margin: 10px 0 6px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-viewport);
+}
+
+.cal-ascii-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.cal-ascii-art {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.38;
+  color: var(--text-primary);
+  overflow-x: auto;
+  white-space: pre;
+}
+
 .readiness-card {
   padding: 9px 12px;
   margin-bottom: 10px;
@@ -2003,4 +2034,278 @@ html[data-theme="dark"] .anomaly-toast.toast-ok {
 html[data-theme="dark"] .anomaly-toast.toast-warn {
   border-color: rgba(245, 158, 11, 0.4);
   border-left-color: var(--status-warn);
+}
+
+/* Tab 5 Collect Horizontal Split & Episode Inspector */
+.collect-split-wrap {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  flex: 1 1 0;
+  min-height: 280px;
+  min-width: 0;
+}
+
+.split-resizer-v {
+  width: 9px;
+  flex: 0 0 9px;
+  cursor: col-resize;
+  position: relative;
+  user-select: none;
+}
+
+.split-resizer-v::after {
+  content: "";
+  position: absolute;
+  top: 22%;
+  bottom: 22%;
+  left: 4px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--border-subtle);
+  transition: background 120ms ease;
+}
+
+.split-resizer-v:hover::after,
+.split-resizer-v.dragging::after {
+  background: var(--accent-blue);
+}
+
+.ep-row-clickable {
+  cursor: pointer;
+}
+
+.ep-row-clickable:hover td {
+  background: var(--bg-hover);
+}
+
+.ep-row-selected td {
+  background: var(--bg-active);
+}
+
+.ep-cell-nowrap {
+  white-space: nowrap;
+}
+
+.ep-cell-task {
+  max-width: 120px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ep-inspector-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+}
+
+.ep-inspector-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.ep-waveform-wrap {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  background: var(--bg-viewport);
+  padding: 4px;
+}
+
+.ep-waveform-canvas {
+  display: block;
+  width: 100%;
+  height: 175px;
+}
+
+.ep-video-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 6px;
+}
+
+.ep-video-grid video {
+  width: 100%;
+  max-height: 140px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--border-subtle);
+  background: #000;
+}
+
+.workflow-guide-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-viewport);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.workflow-guide-bar strong {
+  color: var(--text-primary);
+}
+
+.vla-dataset-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.vla-dataset-bar select,
+.vla-dataset-bar input {
+  height: 28px;
+  font-size: 12px;
+}
+
+/* Tab 5 Form 6-col & Permanent 1:1 Dual Camera Strip */
+.form-grid-6 {
+  display: grid;
+  grid-template-columns: minmax(110px, 1.3fr) minmax(140px, 2fr) minmax(56px, 0.6fr) minmax(96px, 0.9fr) minmax(68px, 0.7fr) minmax(56px, 0.6fr);
+  gap: 8px;
+  align-items: end;
+}
+
+.form-grid-6 label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  min-width: 0;
+}
+
+.form-grid-6 input {
+  width: 100%;
+  min-width: 0;
+}
+
+.collect-cameras-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  height: 230px;
+  min-height: 150px;
+  max-height: 620px;
+  flex-shrink: 0;
+}
+
+.collect-cam-card {
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.collect-cam-card h4 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.collect-cam-frame {
+  margin-top: 6px;
+  flex: 1 1 0;
+  width: 100%;
+  min-height: 0;
+  background: var(--bg-viewport);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  position: relative;
+}
+
+.collect-cam-frame img,
+.cam-lightbox-viewport img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  transform-origin: center center;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.cam-caption-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.cam-zoom-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.cam-zoom-tools .btn-xs {
+  padding: 1px 6px;
+  min-width: 24px;
+  font-size: 11px;
+}
+
+.cam-zoom-viewport {
+  overflow: hidden;
+  cursor: zoom-in;
+}
+
+.cam-zoom-viewport.is-zoomed {
+  cursor: grab;
+}
+
+.cam-zoom-viewport.is-zoomed:active {
+  cursor: grabbing;
+}
+
+.cam-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(15, 23, 42, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.cam-lightbox[hidden] {
+  display: none;
+}
+
+.cam-lightbox-panel {
+  width: min(92vw, 1180px);
+  height: min(88vh, 840px);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-panel);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+}
+
+.cam-lightbox-viewport {
+  flex: 1 1 0;
+  min-height: 0;
+  background: #0B1120;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
