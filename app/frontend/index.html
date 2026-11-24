@@ -227,9 +227,9 @@
               </div>
             </div>
 
-            <div class="cockpit-split">
+            <div class="resizable-row-wrap" id="dashboard-split-wrap">
               <!-- Left Card: Zero Calibration Controls -->
-              <div class="card flex-card">
+              <div class="card flex-card" id="dashboard-left-card" style="flex:1 1 58%;min-width:300px">
                 <div class="panel-header">
                   <h3>零点标定与官方 URDF 中位对齐</h3>
                   <div class="btn-group">
@@ -301,8 +301,10 @@
                 </div>
               </div>
 
+              <div class="split-resizer-v" id="dashboard-split-resizer" title="拖拽调整标定卡与设备映射卡的左右宽度"></div>
+
               <!-- Right Card: .env Device Mapping -->
-              <div class="card flex-card">
+              <div class="card flex-card" id="dashboard-right-card" style="flex:1 1 42%;min-width:260px">
                 <div class="panel-header">
                   <h3>主从臂与双相机映射 (.env)</h3>
                   <div class="btn-group">
@@ -387,8 +389,8 @@
 
             <div class="split-resizer-h" id="teleop-cam-resizer" data-testid="teleop-cam-resizer" title="拖拽调整双路摄像头与下方操控区高度"></div>
 
-            <div class="cockpit-split">
-              <div class="card flex-card sliders-card">
+            <div class="resizable-row-wrap" id="teleop-bottom-wrap">
+              <div class="card flex-card sliders-card" id="teleop-sliders-card" style="flex:1 1 58%;min-width:280px">
                 <div class="panel-header">
                   <h3>从臂 5-DOF + 夹爪关节直推滑块</h3>
                   <span class="mono-meta">角度 | 编码器</span>
@@ -396,7 +398,9 @@
                 <div id="joints-container" class="joints-list"></div>
               </div>
 
-              <div class="card flex-card wasd-card">
+              <div class="split-resizer-v" id="teleop-bottom-resizer" title="拖拽调整滑块区与 WASD 键盘区的左右宽度"></div>
+
+              <div class="card flex-card wasd-card" id="teleop-wasd-card" style="flex:1 1 42%;min-width:240px">
                 <div class="panel-header">
                   <h3>WASD + Q/E 空间键控</h3>
                   <label class="inline-field">
@@ -433,9 +437,9 @@
                     <option value="sim_to_real">Sim → Real (电脑驱动真机)</option>
                   </select>
                 </label>
-                <label class="inline-field">
-                  <input id="chk-sim-safety" type="checkbox" />
-                  <span>确认桌面安全</span>
+                <label class="inline-field" title="防误触保护：确认机械臂活动半径内桌面无水杯或障碍物后再通电驱动真机">
+                  <input id="chk-sim-safety" type="checkbox" checked />
+                  <span>确认桌面无障碍</span>
                 </label>
                 <button type="button" class="btn btn-xs btn-primary" data-testid="btn-apply-sync-mode" id="btn-apply-sync-mode">Apply Sync</button>
                 <span id="sim-sync-status" class="mono-meta">同步: off</span>
@@ -452,23 +456,52 @@
               </div>
             </div>
 
-            <div class="card ik-bar-card">
-              <div class="ik-coord-bar">
-                <strong id="ik-target-arm-label">末端 XYZ 坐标 IK (mm)</strong>
-                <select id="sim-ik-arm-select" aria-label="IK Target Arm" style="width:92px">
-                  <option value="follower">从臂</option>
-                  <option value="leader">主臂</option>
-                </select>
-                <label><span>X</span><input id="ik-x" type="number" value="391" step="5" /></label>
-                <label><span>Y</span><input id="ik-y" type="number" value="0" step="5" /></label>
-                <label><span>Z</span><input id="ik-z" type="number" value="226" step="5" /></label>
-                <label><span>Grip%</span><input id="ik-grip" type="number" value="20" min="0" max="100" step="5" /></label>
-                <button type="button" class="btn btn-xs btn-primary" data-testid="btn-apply-ik" id="btn-apply-ik">Run IK</button>
+            <div class="card ik-bar-card" id="sim-ik-card">
+              <div class="panel-header">
+                <div class="btn-group">
+                  <h3 id="ik-target-arm-label">主臂末端 IK 坐标 (联动从臂, mm)</h3>
+                  <select id="sim-ik-arm-select" aria-label="IK Target Arm" style="width:96px">
+                    <option value="follower">从臂</option>
+                    <option value="leader">主臂</option>
+                  </select>
+                </div>
+                <div class="btn-group">
+                  <span class="mono-meta">拖动滑块实时逆解 · 或输入坐标点 Run IK</span>
+                  <button type="button" class="btn btn-xs btn-primary" data-testid="btn-apply-ik" id="btn-apply-ik">Run IK</button>
+                </div>
+              </div>
+              <div class="ik-sliders-grid">
+                <div class="ik-slider-row">
+                  <span class="ik-axis-tag">X 前后</span>
+                  <input type="range" class="joint-slider ik-live-slider" id="ik-slider-x" data-axis="x" min="80" max="420" step="1" value="391" />
+                  <input id="ik-x" type="number" value="391" step="5" />
+                  <span class="mono-meta">mm</span>
+                </div>
+                <div class="ik-slider-row">
+                  <span class="ik-axis-tag">Y 左右</span>
+                  <input type="range" class="joint-slider ik-live-slider" id="ik-slider-y" data-axis="y" min="-260" max="260" step="1" value="0" />
+                  <input id="ik-y" type="number" value="0" step="5" />
+                  <span class="mono-meta">mm</span>
+                </div>
+                <div class="ik-slider-row">
+                  <span class="ik-axis-tag">Z 高低</span>
+                  <input type="range" class="joint-slider ik-live-slider" id="ik-slider-z" data-axis="z" min="10" max="420" step="1" value="226" />
+                  <input id="ik-z" type="number" value="226" step="5" />
+                  <span class="mono-meta">mm</span>
+                </div>
+                <div class="ik-slider-row">
+                  <span class="ik-axis-tag">Grip 夹爪</span>
+                  <input type="range" class="joint-slider ik-live-slider" id="ik-slider-grip" data-axis="grip" min="0" max="100" step="1" value="20" />
+                  <input id="ik-grip" type="number" value="20" min="0" max="100" step="5" />
+                  <span class="mono-meta">%</span>
+                </div>
               </div>
             </div>
 
-            <div class="cockpit-split-equal sim-sliders-grid">
-              <div class="card flex-card sliders-card">
+            <div class="split-resizer-h" id="sim-ik-resizer" data-testid="sim-ik-resizer" title="拖拽上下调整末端 IK 坐标区与下方关节滑块区的高度"></div>
+
+            <div class="resizable-row-wrap sim-sliders-grid" id="sim-arms-wrap">
+              <div class="card flex-card sliders-card" id="sim-leader-card" style="flex:1 1 50%;min-width:260px">
                 <div class="panel-header">
                   <h3>Leader Arm (主臂 5-DOF + 夹爪)</h3>
                   <button type="button" class="btn btn-xs btn-secondary" id="btn-sim-leader-home">归中位</button>
@@ -476,7 +509,9 @@
                 <div id="sim-leader-sliders" class="joints-list"></div>
               </div>
 
-              <div class="card flex-card sliders-card" id="sim-follower-card">
+              <div class="split-resizer-v" id="sim-arms-resizer" title="拖拽调整主臂与从臂滑块卡的左右宽度"></div>
+
+              <div class="card flex-card sliders-card" id="sim-follower-card" style="flex:1 1 50%;min-width:260px">
                 <div class="panel-header">
                   <div class="btn-group">
                     <h3>Follower Arm (从臂 5-DOF + 夹爪)</h3>
@@ -596,7 +631,7 @@
                 </label>
                 <label>
                   <span>单回合时长(s, 0=不限)</span>
-                  <input id="collect-ep-time" type="number" min="0" max="600" value="30" />
+                  <input id="collect-ep-time" type="number" min="0" max="600" value="0" />
                 </label>
                 <label>
                   <span>复位间隔(s)</span>
@@ -704,7 +739,7 @@
               <span>3. 需要高级工具时点下方「启动」（启动真机插件会自动让出串口，停止后自动恢复）</span>
             </div>
             <!-- Section A: Open-Source Dataset Library & 3D Trajectory Player -->
-            <div class="card">
+            <div class="card" id="plugins-top-card">
               <div class="panel-header">
                 <div class="btn-group">
                   <h3 id="plugin-stage-title">B601-RS &amp; LeRobot 开源数据集演练中心</h3>
@@ -738,6 +773,8 @@
                 </table>
               </div>
             </div>
+
+            <div class="split-resizer-h" id="plugins-split-resizer" title="拖拽上下调整开源数据集区与外部工具区的高度"></div>
 
             <!-- Section B: External CLI Tool Adapters (Honest Availability & Disabled Launch when Missing Deps) -->
             <div class="card flex-card">
@@ -867,6 +904,6 @@
     </div>
   </div>
 
-  <script type="module" src="/static/app.js?v=2026112406"></script>
+  <script type="module" src="/static/app.js?v=2026112407"></script>
 </body>
 </html>

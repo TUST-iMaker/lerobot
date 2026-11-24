@@ -2054,6 +2054,51 @@ html[data-theme="dark"] .anomaly-toast.toast-warn {
   border-left-color: var(--status-warn);
 }
 
+/* Reusable Horizontal Flex Split + Spacious IK Sliders Grid */
+.resizable-row-wrap {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  flex: 1 1 0;
+  min-height: 220px;
+  min-width: 0;
+}
+
+#sim-ik-card {
+  flex-shrink: 0;
+  min-height: 120px;
+}
+
+.ik-sliders-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 14px;
+  margin-top: 8px;
+}
+
+.ik-slider-row {
+  display: grid;
+  grid-template-columns: 64px minmax(80px, 1fr) 74px 26px;
+  align-items: center;
+  gap: 8px;
+}
+
+.ik-axis-tag {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.ik-slider-row input[type="number"] {
+  width: 74px;
+  height: 28px;
+  padding: 0 6px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Tab 5 Collect Horizontal Split & Episode Inspector */
 .collect-split-wrap {
   display: flex;

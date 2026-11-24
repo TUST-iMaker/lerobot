@@ -1231,6 +1231,37 @@ function updateJointGauges(leader, follower, syncSliders = false) {
       }
     }
   }
+  // Sync Tab 3 live IK sliders & inputs when user is not actively dragging/editing them
+  (() => {
+    const activeTag = document.activeElement?.id || "";
+    if (activeTag.startsWith("ik-")) return;
+    if (
+      isSliderLocked("ik-slider-x") ||
+      isSliderLocked("ik-slider-y") ||
+      isSliderLocked("ik-slider-z") ||
+      isSliderLocked("ik-slider-grip")
+    ) {
+      return;
+    }
+    const targetArm = state.linkedArms ? "leader" : ($("sim-ik-arm-select")?.value || "follower");
+    const jSrc = targetArm === "leader" ? state.leaderJoints : state.followerJoints;
+    const fk = computeStickFK(jSrc);
+    if (fk?.tcp) {
+      const rx = Math.round(fk.tcp.x);
+      const ry = Math.round(fk.tcp.y);
+      const rz = Math.round(fk.tcp.z);
+      const rg = Math.round(Number(jSrc?.gripper ?? 20));
+      if ($("ik-x")) $("ik-x").value = String(rx);
+      if ($("ik-y")) $("ik-y").value = String(ry);
+      if ($("ik-z")) $("ik-z").value = String(rz);
+      if ($("ik-grip")) $("ik-grip").value = String(rg);
+      if ($("ik-slider-x")) $("ik-slider-x").value = String(rx);
+      if ($("ik-slider-y")) $("ik-slider-y").value = String(ry);
+      if ($("ik-slider-z")) $("ik-slider-z").value = String(rz);
+      if ($("ik-slider-grip")) $("ik-slider-grip").value = String(rg);
+    }
+  })();
+
   updateAllStickViews();
 }
 
@@ -3168,7 +3199,7 @@ function bindActions() {
     ensureStageVisibleForAction();
     const single_task = ($("collect-task")?.value || "").trim() || "Pick up the red cube and place it into the tray";
     const num_episodes = Number($("collect-episodes")?.value || 5);
-    const episode_time_s = Number($("collect-ep-time")?.value ?? 30);
+    const episode_time_s = Number($("collect-ep-time")?.value ?? 0);
     const reset_time_s = Number($("collect-reset-time")?.value ?? 3);
     const fps = Number($("collect-fps")?.value || 30);
     state.liveCollectFrames = [];
@@ -3401,6 +3432,118 @@ function bindActions() {
       vp.addEventListener("pointerup", endPan);
       vp.addEventListener("pointercancel", endPan);
     });
+  })();
+
+  // Live Draggable XYZ + Gripper IK Sliders in Tab 3 (#sim-ik-card)
+  (() => {
+    let ikDragTimer = null;
+    const flushLiveIk = async () => {
+      ikDragTimer = null;
+      const x_mm = Number($("ik-x")?.value || 391);
+      const y_mm = Number($("ik-y")?.value || 0);
+      const z_mm = Number($("ik-z")?.value || 226);
+      const gripper = Number($("ik-grip")?.value || 20);
+      const targetArm = state.linkedArms ? "leader" : ($("sim-ik-arm-select")?.value || "follower");
+      const res = await apiFetch("/api/sim/ik", {
+        method: "POST",
+        body: JSON.stringify({ arm: targetArm, x_mm, y_mm, z_mm, gripper, clamp_to_workspace: true }),
+      });
+      if (res.ok && res.data) {
+        updateJointGauges(res.data.leader_joints, res.data.follower_joints, true);
+        if (state.mode === "real" && res.data.real_dispatched === false && !state.torqueEnabled) {
+          const now = performance.now();
+          if (!state._lastTorqueWarnTs || now - state._lastTorqueWarnTs > 4000) {
+            state._lastTorqueWarnTs = now;
+            showFeedbackToast("当前真机已卸力（仅动 3D 仿真），点顶栏「点击上力」即可驱动真机主/从臂", "warn");
+          }
+        }
+      }
+    };
+
+    document.querySelectorAll(".ik-live-slider").forEach((slider) => {
+      bindSliderDragLock(slider);
+      slider.addEventListener("input", () => {
+        state.sliderCooldownTs[slider.id] = performance.now() + 350;
+        const axis = slider.dataset.axis;
+        const numInput = $(`ik-${axis}`);
+        if (numInput) numInput.value = slider.value;
+        if (!ikDragTimer) {
+          ikDragTimer = setTimeout(flushLiveIk, 45);
+        }
+      });
+    });
+
+    ["x", "y", "z", "grip"].forEach((axis) => {
+      $(`ik-${axis}`)?.addEventListener("input", (ev) => {
+        const sl = $(`ik-slider-${axis}`);
+        if (sl) sl.value = ev.target.value;
+      });
+    });
+  })();
+
+  // Reusable Panel Split Resizers Across All Tabs (Col & Row)
+  (() => {
+    const bindColSplit = (resizerId, wrapId, leftId, rightId, minPct = 26, maxPct = 74) => {
+      const resizer = $(resizerId);
+      const wrap = $(wrapId);
+      const leftEl = $(leftId);
+      const rightEl = $(rightId);
+      if (!resizer || !wrap || !leftEl || !rightEl) return;
+      let dragging = false;
+      resizer.addEventListener("pointerdown", (ev) => {
+        dragging = true;
+        resizer.classList.add("dragging");
+        resizer.setPointerCapture?.(ev.pointerId);
+        ev.preventDefault();
+      });
+      window.addEventListener("pointermove", (ev) => {
+        if (!dragging) return;
+        const rect = wrap.getBoundingClientRect();
+        if (rect.width < 360) return;
+        const pct = Math.max(minPct, Math.min(maxPct, ((ev.clientX - rect.left) / rect.width) * 100));
+        leftEl.style.flex = `0 0 ${pct.toFixed(1)}%`;
+        rightEl.style.flex = "1 1 0%";
+      });
+      window.addEventListener("pointerup", () => {
+        if (!dragging) return;
+        dragging = false;
+        resizer.classList.remove("dragging");
+      });
+    };
+
+    const bindRowHeightSplit = (resizerId, topId, minH = 110, maxH = 540) => {
+      const resizer = $(resizerId);
+      const topEl = $(topId);
+      if (!resizer || !topEl) return;
+      let dragging = false;
+      let startY = 0;
+      let startH = 0;
+      resizer.addEventListener("pointerdown", (ev) => {
+        dragging = true;
+        startY = ev.clientY;
+        startH = topEl.getBoundingClientRect().height || minH;
+        resizer.classList.add("dragging");
+        resizer.setPointerCapture?.(ev.pointerId);
+        ev.preventDefault();
+      });
+      window.addEventListener("pointermove", (ev) => {
+        if (!dragging) return;
+        const nextH = Math.max(minH, Math.min(maxH, startH + (ev.clientY - startY)));
+        topEl.style.height = `${Math.round(nextH)}px`;
+        topEl.style.flex = `0 0 ${Math.round(nextH)}px`;
+      });
+      window.addEventListener("pointerup", () => {
+        if (!dragging) return;
+        dragging = false;
+        resizer.classList.remove("dragging");
+      });
+    };
+
+    bindColSplit("dashboard-split-resizer", "dashboard-split-wrap", "dashboard-left-card", "dashboard-right-card");
+    bindColSplit("teleop-bottom-resizer", "teleop-bottom-wrap", "teleop-sliders-card", "teleop-wasd-card");
+    bindColSplit("sim-arms-resizer", "sim-arms-wrap", "sim-leader-card", "sim-follower-card");
+    bindRowHeightSplit("sim-ik-resizer", "sim-ik-card", 115, 360);
+    bindRowHeightSplit("plugins-split-resizer", "plugins-top-card", 180, 620);
   })();
 
   // Tab 5 Horizontal Split Resizer (#collect-split-resizer)
