@@ -1,0 +1,56 @@
+# SO-ARM101 (arm101) Windows Teleoperation & Robot Profile
+# Schema: lerobot v0.7.1 TeleoperateConfig (src/lerobot/scripts/lerobot_teleoperate.py)
+# Usage:
+#   1. Copy to configs/robots/arm101_win.yaml (gitignored if personalized) and set COM ports.
+#   2. Discover ports: .\scripts\windows\find_ports.ps1  or  lerobot-find-port
+#   3. Discover cameras: lerobot-find-cameras opencv
+#   4. Teleoperate: lerobot-teleoperate --config_path=configs/robots/arm101_win.yaml
+#   Note: lerobot-calibrate accepts ONLY --robot.* OR --teleop.* (not both in one config).
+
+robot:
+  type: so101_follower
+  port: COM3  # Replace with follower USB-serial COM port from find_ports.ps1
+  id: arm101_follower_01
+  calibration_dir: data/calibration/robots/so_follower
+  disable_torque_on_disconnect: true
+  # max_relative_target: 10.0  # Uncomment to clamp per-step motion for safety
+  use_degrees: true
+  position_p_coefficient: 16
+  position_i_coefficient: 0
+  position_d_coefficient: 32
+  num_read_retries: 2
+  cameras:
+    front:
+      type: opencv
+      index_or_path: 0
+      width: 640
+      height: 480
+      fps: 30
+      color_mode: rgb
+      rotation: 0
+      warmup_s: 1
+      # fourcc: MJPG   # Optional 4-char FOURCC for higher FPS over USB
+      # backend: 700   # OpenCV Cv2Backends: 0=ANY, 700=DSHOW (recommended on Windows), 1400=MSMF
+    wrist:
+      type: opencv
+      index_or_path: 1
+      width: 640
+      height: 480
+      fps: 30
+      color_mode: rgb
+      rotation: 0
+      warmup_s: 1
+
+teleop:
+  type: so101_leader
+  port: COM4  # Replace with leader USB-serial COM port from find_ports.ps1
+  id: arm101_leader_01
+  calibration_dir: data/calibration/teleoperators/so_leader
+  use_degrees: true
+  num_read_retries: 2
+
+fps: 60
+teleop_time_s: null
+display_data: true
+display_mode: rerun  # "rerun" or "foxglove"
+display_compressed_images: false

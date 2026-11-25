@@ -1,0 +1,51 @@
+# ACT Policy Training Config for SO-ARM101 (Single-GPU Local Ubuntu or Cloud)
+# Schema: lerobot v0.7.1 TrainPipelineConfig + ACTConfig
+# Run:
+#   lerobot-train --config_path=configs/train/act_so101.yaml \
+#     --dataset.repo_id=${HF_USER}/arm101_task \
+#     --policy.repo_id=${HF_USER}/act_arm101_task
+# VRAM: ~6-10 GB (fits RTX 3060/4060/4090)
+
+dataset:
+  repo_id: your_hf_user/arm101_demo_dataset
+  # root: data/datasets/arm101_demo_dataset  # Optional local dataset root
+  use_imagenet_stats: true
+
+policy:
+  type: act
+  device: cuda
+  push_to_hub: false
+  repo_id: your_hf_user/act_arm101_demo
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+  dropout: 0.1
+  optimizer_lr: 1.0e-5
+  optimizer_weight_decay: 1.0e-4
+  optimizer_lr_backbone: 1.0e-5
+
+output_dir: models/checkpoints/act_so101
+job_name: act_so101
+seed: 1000
+batch_size: 8
+num_workers: 4
+steps: 100000
+log_freq: 200
+save_checkpoint: true
+save_freq: 20000
+use_policy_training_preset: true
+
+trackio:
+  enable: false
+  project: tust-arm101

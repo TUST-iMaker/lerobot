@@ -6,6 +6,8 @@ import math
 import unittest
 
 from core.data_types import (
+    SO101_ARM_JOINT_NAMES,
+    SO101_GRIPPER_JOINT_NAME,
     SO101_JOINT_NAMES,
     ActionType,
     CameraFrameRef,
@@ -56,17 +58,39 @@ class TestJointState(unittest.TestCase):
         self.assertIn("非有限数值", str(err))
 
     def test_unit_conversion(self) -> None:
-        positions_deg = {j: 90.0 for j in SO101_JOINT_NAMES}
-        state_deg = JointState(timestamp=1.0, positions=positions_deg, unit=JointUnit.DEGREE)
+        positions_deg = {j: 90.0 for j in SO101_ARM_JOINT_NAMES}
+        positions_deg[SO101_GRIPPER_JOINT_NAME] = 75.0
+        state_deg = JointState(
+            timestamp=1.0,
+            positions=positions_deg,
+            unit=JointUnit.DEGREE,
+            gripper_unit=JointUnit.RANGE_0_100,
+        )
         state_rad = state_deg.to_radians()
         self.assertEqual(state_rad.unit, JointUnit.RADIAN)
-        for val in state_rad.positions.values():
-            self.assertAlmostEqual(val, math.pi / 2, places=5)
+        for j in SO101_ARM_JOINT_NAMES:
+            self.assertAlmostEqual(state_rad.positions[j], math.pi / 2, places=5)
+        self.assertAlmostEqual(state_rad.positions[SO101_GRIPPER_JOINT_NAME], 75.0, places=5)
 
         state_back = state_rad.to_degrees()
         self.assertEqual(state_back.unit, JointUnit.DEGREE)
-        for val in state_back.positions.values():
-            self.assertAlmostEqual(val, 90.0, places=5)
+        for j in SO101_ARM_JOINT_NAMES:
+            self.assertAlmostEqual(state_back.positions[j], 90.0, places=5)
+        self.assertAlmostEqual(state_back.positions[SO101_GRIPPER_JOINT_NAME], 75.0, places=5)
+
+    def test_robot_action_to_radians_preserves_gripper(self) -> None:
+        act = RobotAction(
+            action_type=ActionType.JOINT_POSITION,
+            source=ControlSource.UI,
+            timestamp=2.0,
+            target_joint_positions={"shoulder_pan": 45.0, "gripper": 88.0},
+            unit=JointUnit.DEGREE,
+            gripper_unit=JointUnit.RANGE_0_100,
+        )
+        act_rad = act.to_radians()
+        self.assertEqual(act_rad.unit, JointUnit.RADIAN)
+        self.assertAlmostEqual(act_rad.target_joint_positions["shoulder_pan"], math.pi / 4, places=5)
+        self.assertAlmostEqual(act_rad.target_joint_positions["gripper"], 88.0, places=5)
 
     def test_serialization_roundtrip(self) -> None:
         positions = {j: 0.25 for j in SO101_JOINT_NAMES}

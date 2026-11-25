@@ -1,13 +1,17 @@
 """测试全局配置加载与解析 (test_config.py)."""
 
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from core.config_loader import (
     DEFAULT_CONFIG_PATH,
     FollowerConfig,
     LeaderConfig,
     get_config,
     load_config,
+    resolve_calibration_dir,
+    resolve_lerobot_home,
 )
 
 
@@ -23,10 +27,10 @@ class TestConfigLoader(unittest.TestCase):
         cfg = get_config(reload=True)
         self.assertIsInstance(cfg.follower, FollowerConfig)
         self.assertIsInstance(cfg.leader, LeaderConfig)
-        self.assertEqual(cfg.follower.port, "/dev/ttyACM0")
-        self.assertEqual(cfg.leader.port, "/dev/ttyACM1")
-        self.assertEqual(cfg.follower.id, "zihao_follower_arm")
-        self.assertEqual(cfg.leader.id, "zihao_leader_arm")
+        self.assertTrue(bool(cfg.follower.port))
+        self.assertTrue(bool(cfg.leader.port))
+        self.assertTrue(bool(cfg.follower.id))
+        self.assertTrue(bool(cfg.leader.id))
         self.assertEqual(cfg.camera.width, 640)
         self.assertEqual(cfg.camera.height, 480)
         self.assertEqual(cfg.camera.fps, 30)
@@ -37,7 +41,7 @@ class TestConfigLoader(unittest.TestCase):
     def test_camera_index_or_path(self):
         """测试相机设备路径与索引属性解析."""
         cfg = get_config()
-        self.assertEqual(cfg.camera.index_or_path, 2)
+        self.assertIsInstance(cfg.camera.index_or_path, (int, str))
 
     def test_safety_rest_pose_path(self):
         """测试蜷缩姿态绝对路径解析."""
@@ -52,6 +56,16 @@ class TestConfigLoader(unittest.TestCase):
         home_pose = get_preset_pose("home")
         self.assertIn("wrist_flex", home_pose)
         self.assertIn("wrist_roll", home_pose)
+
+    def test_leader_default_type_and_calibration_resolution(self) -> None:
+        self.assertEqual(LeaderConfig().type, "so101_leader")
+        with patch.dict(os.environ, {"HF_LEROBOT_HOME": "/tmp/custom_lerobot"}, clear=False):
+            os.environ.pop("HF_LEROBOT_CALIBRATION", None)
+            self.assertEqual(resolve_lerobot_home().name, "custom_lerobot")
+            f_dir = resolve_calibration_dir("follower")
+            l_dir = resolve_calibration_dir("leader")
+            self.assertTrue(str(f_dir).endswith(str(Path("robots") / "so_follower")))
+            self.assertTrue(str(l_dir).endswith(str(Path("teleoperators") / "so_leader")))
 
 
 if __name__ == "__main__":

@@ -29,6 +29,15 @@ SO101_JOINT_NAMES: tuple[str, ...] = (
     "gripper",
 )
 
+SO101_ARM_JOINT_NAMES: tuple[str, ...] = (
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+)
+SO101_GRIPPER_JOINT_NAME: str = "gripper"
+
 # 中位回零与使能安全顺序 (自外向内或按物理承重顺序)
 MIDDLE_ORDER: tuple[str, ...] = (
     "elbow_flex",
@@ -48,6 +57,7 @@ class JointUnit(str, Enum):
     """关节数值单位定义."""
     RADIAN = "radian"               # 弧度 ([-pi, pi] 国际标准单位，运动学内部推荐)
     DEGREE = "degree"               # 角度 ([-180, 180] 直观易读)
+    RANGE_0_100 = "range_0_100"     # 百分比 [0.0, 100.0] (官方 gripper 归一化单位)
     NORMALIZED = "normalized"       # 归一化 ([-100, 100] 或 [-1, 1]，LeRobot 常见格式)
     RAW_STEPS = "raw_steps"         # 舵机底层原始计数值 (如 0~4096)
 
@@ -106,6 +116,34 @@ def rad_to_deg(val: float) -> float:
     return val * 180.0 / math.pi
 
 
+def clamp_gripper_pct(val: float) -> float:
+    """将夹爪开合度钳位至官方 RANGE_0_100 范围 [0.0, 100.0]."""
+    return max(0.0, min(100.0, float(val)))
+
+
+def convert_joint_positions(
+    positions: dict[str, float],
+    from_unit: JointUnit,
+    to_unit: JointUnit,
+    gripper_unit: JointUnit = JointUnit.RANGE_0_100,
+) -> dict[str, float]:
+    """在 RADIAN 与 DEGREE 之间转换 5 个臂关节，同时保持 RANGE_0_100 夹爪百分比不变."""
+    if from_unit == to_unit:
+        return {k: float(v) for k, v in positions.items()}
+    out: dict[str, float] = {}
+    for k, v in positions.items():
+        fval = float(v)
+        if k == SO101_GRIPPER_JOINT_NAME and gripper_unit == JointUnit.RANGE_0_100:
+            out[k] = fval
+        elif from_unit == JointUnit.DEGREE and to_unit == JointUnit.RADIAN:
+            out[k] = deg_to_rad(fval)
+        elif from_unit == JointUnit.RADIAN and to_unit == JointUnit.DEGREE:
+            out[k] = rad_to_deg(fval)
+        else:
+            raise ValueError(f"暂不支持从 {from_unit} 转换为 {to_unit}")
+    return out
+
+
 # ==============================================================================
 # 4. 核心数据类
 # ==============================================================================
@@ -128,6 +166,7 @@ class JointState:
     velocities: dict[str, float] | None = None
     efforts: dict[str, float] | None = None
     torques_enabled: dict[str, bool] | None = None
+    gripper_unit: JointUnit = JointUnit.RANGE_0_100
 
     def validate(self, require_all_joints: bool = True) -> tuple[bool, str | None]:
         """校验关节状态数据的完备性与合法性."""
@@ -148,11 +187,16 @@ class JointState:
         return True, None
 
     def to_radians(self) -> JointState:
-        """转换位置为弧度表示."""
+        """转换臂关节位置为弧度表示 (保持 RANGE_0_100 夹爪原值不变)."""
         if self.unit == JointUnit.RADIAN:
             return self
         if self.unit == JointUnit.DEGREE:
-            new_pos = {k: deg_to_rad(v) for k, v in self.positions.items()}
+            new_pos = convert_joint_positions(
+                self.positions,
+                self.unit,
+                JointUnit.RADIAN,
+                gripper_unit=self.gripper_unit,
+            )
             return JointState(
                 timestamp=self.timestamp,
                 positions=new_pos,
@@ -160,15 +204,21 @@ class JointState:
                 velocities=self.velocities,
                 efforts=self.efforts,
                 torques_enabled=self.torques_enabled,
+                gripper_unit=self.gripper_unit,
             )
         raise ValueError(f"暂不支持从 {self.unit} 转换为 RADIAN")
 
     def to_degrees(self) -> JointState:
-        """转换位置为角度表示."""
+        """转换臂关节位置为角度表示 (保持 RANGE_0_100 夹爪原值不变)."""
         if self.unit == JointUnit.DEGREE:
             return self
         if self.unit == JointUnit.RADIAN:
-            new_pos = {k: rad_to_deg(v) for k, v in self.positions.items()}
+            new_pos = convert_joint_positions(
+                self.positions,
+                self.unit,
+                JointUnit.DEGREE,
+                gripper_unit=self.gripper_unit,
+            )
             return JointState(
                 timestamp=self.timestamp,
                 positions=new_pos,
@@ -176,6 +226,7 @@ class JointState:
                 velocities=self.velocities,
                 efforts=self.efforts,
                 torques_enabled=self.torques_enabled,
+                gripper_unit=self.gripper_unit,
             )
         raise ValueError(f"暂不支持从 {self.unit} 转换为 DEGREE")
 
@@ -183,12 +234,14 @@ class JointState:
         """序列化为标准字典."""
         d = asdict(self)
         d["unit"] = self.unit.value
+        d["gripper_unit"] = self.gripper_unit.value
         return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JointState:
         """从标准字典反序列化."""
         unit_str = data.get("unit", JointUnit.RADIAN.value)
+        gripper_unit_str = data.get("gripper_unit", JointUnit.RANGE_0_100.value)
         return cls(
             timestamp=float(data["timestamp"]),
             positions={k: float(v) for k, v in data["positions"].items()},
@@ -196,6 +249,7 @@ class JointState:
             velocities={k: float(v) for k, v in data["velocities"].items()} if data.get("velocities") else None,
             efforts={k: float(v) for k, v in data["efforts"].items()} if data.get("efforts") else None,
             torques_enabled={k: bool(v) for k, v in data["torques_enabled"].items()} if data.get("torques_enabled") else None,
+            gripper_unit=JointUnit(gripper_unit_str),
         )
 
 
@@ -292,6 +346,7 @@ class RobotAction:
     target_cartesian_delta: tuple[float, ...] | None = None
     target_cartesian_pose: Pose3D | None = None
     unit: JointUnit = JointUnit.RADIAN
+    gripper_unit: JointUnit = JointUnit.RANGE_0_100
 
     def validate(self) -> tuple[bool, str | None]:
         """校验动作意图是否符合对应的动作类型定义."""
@@ -327,11 +382,48 @@ class RobotAction:
 
         return True, None
 
+    def to_radians(self) -> RobotAction:
+        """将关节目标/增量转换为弧度表示 (保持 RANGE_0_100 夹爪不变)."""
+        if self.unit == JointUnit.RADIAN:
+            return self
+        new_pos = (
+            convert_joint_positions(
+                self.target_joint_positions,
+                self.unit,
+                JointUnit.RADIAN,
+                gripper_unit=self.gripper_unit,
+            )
+            if self.target_joint_positions is not None
+            else None
+        )
+        new_deltas = (
+            convert_joint_positions(
+                self.target_joint_deltas,
+                self.unit,
+                JointUnit.RADIAN,
+                gripper_unit=self.gripper_unit,
+            )
+            if self.target_joint_deltas is not None
+            else None
+        )
+        return RobotAction(
+            action_type=self.action_type,
+            source=self.source,
+            timestamp=self.timestamp,
+            target_joint_positions=new_pos,
+            target_joint_deltas=new_deltas,
+            target_cartesian_delta=self.target_cartesian_delta,
+            target_cartesian_pose=self.target_cartesian_pose,
+            unit=JointUnit.RADIAN,
+            gripper_unit=self.gripper_unit,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["action_type"] = self.action_type.value
         d["source"] = self.source.value
         d["unit"] = self.unit.value
+        d["gripper_unit"] = self.gripper_unit.value
         if self.target_cartesian_pose:
             d["target_cartesian_pose"] = self.target_cartesian_pose.to_dict()
         return d
@@ -349,6 +441,7 @@ class RobotAction:
             target_cartesian_delta=tuple(data["target_cartesian_delta"]) if data.get("target_cartesian_delta") else None,
             target_cartesian_pose=target_pose,
             unit=JointUnit(data.get("unit", JointUnit.RADIAN.value)),
+            gripper_unit=JointUnit(data.get("gripper_unit", JointUnit.RANGE_0_100.value)),
         )
 
 

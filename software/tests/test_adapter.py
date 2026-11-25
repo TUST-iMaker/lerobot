@@ -34,8 +34,9 @@ class TestHardwareAdapters(unittest.TestCase):
     def test_config_roles(self) -> None:
         self.assertEqual(self.follower_cfg.role, ArmRole.FOLLOWER)
         self.assertEqual(self.leader_cfg.role, ArmRole.LEADER)
-        self.assertEqual(self.follower_cfg.port, "/dev/ttyACM0")
-        self.assertEqual(self.leader_cfg.port, "/dev/ttyACM1")
+        self.assertTrue(bool(self.follower_cfg.port))
+        self.assertTrue(bool(self.leader_cfg.port))
+        self.assertNotEqual(self.follower_cfg.port, self.leader_cfg.port)
 
     def test_follower_unconnected_safety(self) -> None:
         self.assertIsInstance(self.follower, BaseArmAdapter)
@@ -122,6 +123,18 @@ class TestHardwareAdapters(unittest.TestCase):
         object.__setattr__(cfg, "joint_offsets_deg", {"wrist_roll": 90.0})
         leader = SO101LeaderArm(cfg)
         self.assertEqual(leader.config.joint_offsets_deg.get("wrist_roll"), 90.0)
+
+    def test_calibration_dir_no_hardcoded_aguiya_and_forwards_robot_id(self) -> None:
+        self.assertNotIn("aguiya", str(DEFAULT_FOLLOWER_CALIBRATION))
+        cfg = ArmConfig.default_follower(
+            port="COM99",
+            robot_id="custom_arm_01",
+            calibration_dir=Path("data/calibration"),
+        )
+        self.assertEqual(cfg.robot_id, "custom_arm_01")
+        self.assertEqual(cfg.calibration_dir.name, "so_follower")
+        self.assertEqual(cfg.calibration_fpath.name, "custom_arm_01.json")
+        self.assertEqual(cfg.max_relative_target, 15.0)
 
 
 if __name__ == "__main__":

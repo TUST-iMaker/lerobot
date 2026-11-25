@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import platform
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,26 +16,110 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _software_root = Path(__file__).resolve().parent.parent
+_workspace_root = _software_root.parent
 DEFAULT_CONFIG_PATH = _software_root / "config.yaml"
+
+_DEFAULT_FOLLOWER_PORT = "COM3" if platform.system() == "Windows" else "/dev/ttyACM0"
+_DEFAULT_LEADER_PORT = "COM4" if platform.system() == "Windows" else "/dev/ttyACM1"
+
+
+def _read_workspace_env_file() -> dict[str, str]:
+    """解析工作区根目录 .env 文件 (不污染全局 os.environ)."""
+    workspace_env = _workspace_root / ".env"
+    env_map: dict[str, str] = {}
+    if workspace_env.is_file():
+        try:
+            for raw_line in workspace_env.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env_map[k.strip()] = v.strip().strip('"').strip("'")
+        except Exception:
+            return {}
+    return env_map
+
+
+def _get_env_or_dotenv(key: str, env_map: dict[str, str] | None = None) -> str:
+    val = os.environ.get(key)
+    if val is not None and val.strip():
+        return val.strip()
+    if env_map is None:
+        env_map = _read_workspace_env_file()
+    return (env_map.get(key) or "").strip()
+
+
+def _resolve_workspace_path(raw_path: str | Path) -> Path:
+    p = Path(raw_path).expanduser()
+    if not p.is_absolute():
+        p = (_workspace_root / p).resolve()
+    return p
+
+
+def resolve_lerobot_home() -> Path:
+    """按官方优先级解析 HF_LEROBOT_HOME (环境变量 > .env > $HF_HOME/lerobot)."""
+    env_map = _read_workspace_env_file()
+    home_val = _get_env_or_dotenv("HF_LEROBOT_HOME", env_map)
+    if home_val:
+        return _resolve_workspace_path(home_val)
+    hf_home = _get_env_or_dotenv("HF_HOME", env_map)
+    if hf_home:
+        return _resolve_workspace_path(hf_home) / "lerobot"
+    return Path.home() / ".cache" / "huggingface" / "lerobot"
+
+
+def resolve_calibration_dir(
+    role: str | None = None,
+    calibration_dir: str | Path | None = None,
+) -> Path:
+    """按官方优先级解析校准目录 (role='follower'|'leader'|None)."""
+    role_norm = role.lower().strip() if role else None
+    if role_norm == "follower":
+        leaf_parts = ("robots", "so_follower")
+    elif role_norm == "leader":
+        leaf_parts = ("teleoperators", "so_leader")
+    else:
+        leaf_parts = ()
+
+    if calibration_dir is not None:
+        p = _resolve_workspace_path(calibration_dir)
+        if leaf_parts:
+            if p.name in ("so_follower", "so_leader"):
+                return p
+            if p.name == "calibration" or (p / "robots").is_dir() or (p / "teleoperators").is_dir():
+                return p.joinpath(*leaf_parts)
+        return p
+
+    env_map = _read_workspace_env_file()
+    cal_val = _get_env_or_dotenv("HF_LEROBOT_CALIBRATION", env_map)
+    if cal_val:
+        base = _resolve_workspace_path(cal_val)
+    else:
+        base = resolve_lerobot_home() / "calibration"
+
+    if leaf_parts:
+        return base.joinpath(*leaf_parts)
+    return base
 
 
 @dataclass
 class FollowerConfig:
     """从臂 (Follower Arm) 配置."""
-    port: str = "/dev/ttyACM0"
+    port: str = _DEFAULT_FOLLOWER_PORT
     id: str = "zihao_follower_arm"
     type: str = "so101_follower"
     baudrate: int = 1_000_000
+    calibration_dir: str | None = None
 
 
 @dataclass
 class LeaderConfig:
     """主臂 (Leader Arm) 配置."""
-    port: str = "/dev/ttyACM1"
+    port: str = _DEFAULT_LEADER_PORT
     id: str = "zihao_leader_arm"
-    type: str = "so_leader"
+    type: str = "so101_leader"
     baudrate: int = 1_000_000
     joint_offsets_deg: dict[str, float] = field(default_factory=dict)
+    calibration_dir: str | None = None
 
 
 @dataclass
@@ -147,6 +233,11 @@ def load_config(config_path: Path | str | None = None) -> SystemConfig:
             id=str(follower_raw.get("id", FollowerConfig.id)),
             type=str(follower_raw.get("type", FollowerConfig.type)),
             baudrate=int(follower_raw.get("baudrate", FollowerConfig.baudrate)),
+            calibration_dir=(
+                str(follower_raw["calibration_dir"])
+                if follower_raw.get("calibration_dir")
+                else None
+            ),
         ),
         leader=LeaderConfig(
             port=str(leader_raw.get("port", LeaderConfig.port)),
@@ -157,6 +248,11 @@ def load_config(config_path: Path | str | None = None) -> SystemConfig:
                 str(k): float(v)
                 for k, v in (leader_raw.get("joint_offsets_deg") or {}).items()
             },
+            calibration_dir=(
+                str(leader_raw["calibration_dir"])
+                if leader_raw.get("calibration_dir")
+                else None
+            ),
         ),
         camera=CameraConfig(
             port=camera_raw.get("port", CameraConfig.port),
@@ -167,6 +263,7 @@ def load_config(config_path: Path | str | None = None) -> SystemConfig:
         ),
         safety=SafetyConfig(
             rest_pose_file=str(safety_raw.get("rest_pose_file", SafetyConfig.rest_pose_file)),
+            home_pose_file=str(safety_raw.get("home_pose_file", SafetyConfig.home_pose_file)),
             auto_rest_on_exit=bool(safety_raw.get("auto_rest_on_exit", SafetyConfig.auto_rest_on_exit)),
             rest_duration_s=float(safety_raw.get("rest_duration_s", SafetyConfig.rest_duration_s)),
             max_speed_deg_per_s=float(safety_raw.get("max_speed_deg_per_s", SafetyConfig.max_speed_deg_per_s)),
@@ -180,6 +277,40 @@ def load_config(config_path: Path | str | None = None) -> SystemConfig:
             default_replay_episode=int(operation_raw.get("default_replay_episode", OperationConfig.default_replay_episode)),
         ),
     )
+
+    # 当使用默认工作区配置时，同步根目录 .env 的跨平台串口与相机映射（实现与 Arm101 Studio 一处配置全局生效）
+    if config_path is None:
+        env_map = _read_workspace_env_file()
+
+        def _env_val(key: str) -> str:
+            return _get_env_or_dotenv(key, env_map)
+
+        is_win = platform.system() == "Windows"
+        f_port = _env_val("ARM101_FOLLOWER_PORT_WIN" if is_win else "ARM101_FOLLOWER_PORT_UBUNTU")
+        l_port = _env_val("ARM101_LEADER_PORT_WIN" if is_win else "ARM101_LEADER_PORT_UBUNTU")
+        f_id = _env_val("ARM101_FOLLOWER_ID")
+        l_id = _env_val("ARM101_LEADER_ID")
+        front_cam = _env_val("ARM101_FRONT_CAMERA_ID")
+        cal_override = _env_val("ARM101_CALIBRATION_DIR")
+        if f_port:
+            cfg.follower.port = f_port
+        if l_port:
+            cfg.leader.port = l_port
+        if f_id:
+            cfg.follower.id = f_id
+        if l_id:
+            cfg.leader.id = l_id
+        if front_cam and front_cam.lower() != "none":
+            cfg.camera.port = int(front_cam) if front_cam.isdigit() else front_cam
+        if cal_override:
+            cfg.follower.calibration_dir = str(resolve_calibration_dir("follower", cal_override))
+            cfg.leader.calibration_dir = str(resolve_calibration_dir("leader", cal_override))
+        else:
+            if cfg.follower.calibration_dir is None:
+                cfg.follower.calibration_dir = str(resolve_calibration_dir("follower"))
+            if cfg.leader.calibration_dir is None:
+                cfg.leader.calibration_dir = str(resolve_calibration_dir("leader"))
+
     return cfg
 
 

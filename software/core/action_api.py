@@ -17,12 +17,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from core.data_types import (
+    SO101_ARM_JOINT_NAMES,
+    SO101_GRIPPER_JOINT_NAME,
+    ActionType,
     ControlSource,
     JointState,
+    JointUnit,
     RobotAction,
     RobotObservation,
     SafetyReport,
     SystemState,
+    clamp_gripper_pct,
 )
 from core.safety_controller import SafetyController, SafetyLimitsConfig
 from core.state_machine import RobotStateMachine
@@ -43,6 +48,7 @@ class ActionAPI:
         state_machine: RobotStateMachine | None = None,
         safety_controller: SafetyController | None = None,
         config: RobotSystemConfig | None = None,
+        calibration_dir: Path | str | None = None,
     ) -> None:
         """初始化统一动作中枢.
         
@@ -54,7 +60,12 @@ class ActionAPI:
             from hardware.config import ArmConfig, RobotSystemConfig
             from hardware.system_adapter import RobotSystemAdapter
 
-            sys_cfg = config or RobotSystemConfig(follower=ArmConfig.default_follower())
+            if config is not None:
+                sys_cfg = config
+            else:
+                sys_cfg = RobotSystemConfig(
+                    follower=ArmConfig.default_follower(calibration_dir=calibration_dir)
+                )
             self.hardware = RobotSystemAdapter(sys_cfg)
 
         self.state_machine = state_machine or RobotStateMachine(initial_state=SystemState.DISCONNECTED)
@@ -103,9 +114,6 @@ class ActionAPI:
         import json
         from core.data_types import (
             ActionType,
-            ControlSource,
-            JointUnit,
-            RobotAction,
             SO101_JOINT_NAMES,
             deg_to_rad,
         )
@@ -131,7 +139,10 @@ class ActionAPI:
                 parsed_rad: dict[str, float] = {}
                 for k, v in joints_data.items():
                     name = k[:-4] if k.endswith(".pos") else k
-                    parsed_rad[name] = deg_to_rad(float(v)) if is_deg else float(v)
+                    if name == SO101_GRIPPER_JOINT_NAME:
+                        parsed_rad[name] = clamp_gripper_pct(float(v))
+                    else:
+                        parsed_rad[name] = deg_to_rad(float(v)) if is_deg else float(v)
                 if all(j in parsed_rad for j in SO101_JOINT_NAMES):
                     target_rad = parsed_rad
                     is_from_file = True
@@ -145,11 +156,19 @@ class ActionAPI:
 
         try:
             cur_state = self.hardware.read_follower_state()
-            start_positions = {j: cur_state.positions.get(j, 0.0) for j in SO101_JOINT_NAMES}
+            cur_state_rad = cur_state.to_radians() if cur_state.unit != JointUnit.RADIAN else cur_state
+            start_positions = {j: cur_state_rad.positions.get(j, 0.0) for j in SO101_JOINT_NAMES}
 
-            # 若各关节距离目标平均差值小于 0.04 rad (~2°)，说明已在蜷缩位附近
-            max_diff = max(abs(start_positions[j] - target_rad.get(j, start_positions[j])) for j in SO101_JOINT_NAMES)
-            if max_diff < 0.04:
+            # 若臂关节平均差值 < 0.04 rad (~2°) 且夹爪差值 < 2.5%，说明已在蜷缩位附近
+            max_arm_diff = max(
+                abs(start_positions[j] - target_rad.get(j, start_positions[j]))
+                for j in SO101_ARM_JOINT_NAMES
+            )
+            gripper_diff = abs(
+                start_positions.get(SO101_GRIPPER_JOINT_NAME, 0.0)
+                - target_rad.get(SO101_GRIPPER_JOINT_NAME, start_positions.get(SO101_GRIPPER_JOINT_NAME, 0.0))
+            )
+            if max_arm_diff < 0.04 and gripper_diff < 2.5:
                 if release_torque:
                     self.disable_torque()
                     curr_src = self.state_machine.active_source
@@ -169,10 +188,10 @@ class ActionAPI:
                         self.state_machine.request_reset()
                         self.claim_control(ControlSource.SCRIPT)
 
-            # 自适应运动时长: 如果最大角跨度很大，动态延长耗时，避免舵机严重脱缰滞后
-            actual_duration = max(duration_s, max_diff / 0.75)
+            # 自适应运动时长: 臂关节与夹爪分别按 rad 与 % 换算时长，避免混合单位导致百秒级停顿
+            actual_duration = max(duration_s, max_arm_diff / 0.75, gripper_diff / 50.0)
             target_source_name = rest_path.name if is_from_file else "内置折叠预设"
-            print(f"[*] 正在执行 S 曲线平滑过渡 (当前姿态 -> {target_source_name}, 角跨度 {math.degrees(max_diff):.1f}°, 耗时 {actual_duration:.1f}s)...")
+            print(f"[*] 正在执行 S 曲线平滑过渡 (当前姿态 -> {target_source_name}, 角跨度 {math.degrees(max_arm_diff):.1f}°, 耗时 {actual_duration:.1f}s)...")
 
             rate_hz = 30.0
             total_steps = max(10, int(actual_duration * rate_hz))
@@ -194,6 +213,7 @@ class ActionAPI:
                     timestamp=time.monotonic(),
                     target_joint_positions=interp_pos,
                     unit=JointUnit.RADIAN,
+                    gripper_unit=JointUnit.RANGE_0_100,
                 )
                 ok, msg = self.submit_action(action)
                 if not ok:
@@ -209,6 +229,7 @@ class ActionAPI:
                     timestamp=time.monotonic(),
                     target_joint_positions=target_rad,
                     unit=JointUnit.RADIAN,
+                    gripper_unit=JointUnit.RANGE_0_100,
                 )
                 self.submit_action(hold_action)
                 time.sleep(dt)
@@ -335,7 +356,19 @@ class ActionAPI:
         """若主臂已连接，捕获主臂当前的示教动作意图."""
         if not self.hardware.leader or not self.hardware.is_leader_connected:
             return None
-        return self.hardware.leader.read_action()
+        if hasattr(self.hardware.leader, "read_action"):
+            return self.hardware.leader.read_action()
+        l_state = self.hardware.read_leader_state()
+        if l_state is None:
+            return None
+        return RobotAction(
+            action_type=ActionType.JOINT_POSITION,
+            source=ControlSource.LEADER,
+            timestamp=l_state.timestamp,
+            target_joint_positions=dict(l_state.positions),
+            unit=l_state.unit,
+            gripper_unit=l_state.gripper_unit,
+        )
 
     def get_observation(self) -> RobotObservation:
         """生成某一时刻的标准多模态观测快照."""

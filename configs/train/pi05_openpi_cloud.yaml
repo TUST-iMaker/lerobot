@@ -1,0 +1,97 @@
+# Pi0.5 (pi05) Cloud Fine-Tuning Reference Profile — OpenPI + LeRobot Dual Guide
+# Sources:
+#   - Physical-Intelligence/openpi: src/openpi/training/config.py, src/openpi/models/pi0_config.py, README.md
+#   - huggingface/lerobot v0.7.1: src/lerobot/policies/pi05/configuration_pi05.py, docs/source/pi05.mdx
+#
+# IMPORTANT:
+#   `repos/openpi` uses Python dataclasses + `tyro` CLI (NOT `--config_path` YAML).
+#   Use Section A as the exact parameter reference when registering a SO-101 `TrainConfig`
+#   in `repos/openpi/src/openpi/training/config.py`, or run Section B directly with `lerobot-train`.
+#
+# Cloud GPU VRAM Requirements (from openpi README.md):
+#   - Inference:          > 8 GB   (e.g., RTX 4090)
+#   - LoRA Fine-Tuning:   > 22.5 GB (e.g., RTX 4090 / A10G; set paligemma_variant=gemma_2b_lora, action_expert_variant=gemma_300m_lora, ema_decay=null)
+#   - Full Fine-Tuning:   > 70 GB  (e.g., A100 80GB / H100; or multi-GPU via --fsdp-devices=<N>)
+
+# ==============================================================================
+# SECTION A: Physical-Intelligence/openpi `TrainConfig` Schema Reference
+# Workflow in repos/openpi (Ubuntu / Cloud Linux, Python 3.11 venv):
+#   1. Compute norm stats (required before training; Pi0.5 uses quantile norm):
+#      uv run scripts/compute_norm_stats.py --config-name pi05_so101_custom
+#   2. JAX Training:
+#      XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_so101_custom --exp-name=so101_run1 --overwrite
+#   3. PyTorch Training (alternative; requires examples/convert_jax_model_to_pytorch.py first):
+#      uv run scripts/train_pytorch.py pi05_so101_custom --exp_name so101_run1 --save_interval 1000
+#   4. Policy WebSocket Server (port 8000):
+#      uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_so101_custom --policy.dir=checkpoints/pi05_so101_custom/so101_run1/20000
+# ==============================================================================
+openpi_train_config:
+  name: pi05_so101_custom
+  project_name: openpi
+  exp_name: so101_run1
+  model:                          # openpi.models.pi0_config.Pi0Config
+    pi05: true
+    dtype: bfloat16
+    paligemma_variant: gemma_2b   # Use "gemma_2b_lora" for LoRA (>22.5GB VRAM)
+    action_expert_variant: gemma_300m  # Use "gemma_300m_lora" for LoRA
+    action_dim: 32
+    action_horizon: 50
+    max_token_len: 200            # Pi0.5 default when pi05=true
+    discrete_state_input: true    # Auto-set to self.pi05 in Pi0Config.__post_init__
+    pytorch_compile_mode: max-autotune
+  weight_loader:
+    type: CheckpointWeightLoader
+    params_path: gs://openpi-assets/checkpoints/pi05_base/params
+  pytorch_weight_path: null       # Set local converted PyTorch dir if using train_pytorch.py
+  pytorch_training_precision: bfloat16
+  data:                           # DataConfigFactory + AssetsConfig + DataConfig
+    repo_id: your_hf_user/arm101_demo_dataset
+    assets:
+      assets_dir: ./assets
+      asset_id: your_hf_user/arm101_demo_dataset
+    base_config:
+      use_quantile_norm: true     # Automatic in openpi when model_type == ModelType.PI05
+      prompt_from_task: true
+      action_sequence_keys: ["action"]
+  lr_schedule:                    # CosineDecaySchedule
+    warmup_steps: 1000
+    peak_lr: 5.0e-5
+    decay_steps: 1000000
+    decay_lr: 5.0e-5
+  optimizer:                      # AdamW
+    clip_gradient_norm: 1.0
+  ema_decay: 0.999                # Set null when using LoRA finetuning
+  assets_base_dir: ./assets
+  checkpoint_base_dir: ./checkpoints
+  seed: 42
+  batch_size: 32                  # Increase to 64-256 on 80GB+ / multi-GPU
+  num_workers: 2
+  num_train_steps: 20000
+  log_interval: 100
+  save_interval: 1000
+  keep_period: 5000
+  overwrite: false
+  resume: false
+  wandb_enabled: true
+  fsdp_devices: 1                 # Set to GPU count for FSDP sharding
+
+# ==============================================================================
+# SECTION B: Equivalent LeRobot v0.7.1 `lerobot-train` CLI Reference (PI05Config)
+# NOTE: PI05Config defaults normalization_mapping to QUANTILES (requires q01/q99 in meta/stats.json).
+# If dataset lacks q01/q99, run:
+#   lerobot-edit-dataset --repo_id <repo> --new_repo_id <repo> --operation.type=recompute_stats --operation.overwrite=true
+# Or pass: --policy.normalization_mapping='{"ACTION":"MEAN_STD","STATE":"MEAN_STD","VISUAL":"IDENTITY"}'
+#
+# Command (set --policy.push_to_hub=true and --policy.repo_id=${HF_USER}/pi05_arm101 if pushing to Hub):
+#   lerobot-train \
+#     --dataset.repo_id=${HF_USER}/arm101_task \
+#     --policy.type=pi05 \
+#     --policy.pretrained_path=lerobot/pi05_base \
+#     --policy.push_to_hub=false \
+#     --policy.dtype=bfloat16 \
+#     --policy.gradient_checkpointing=true \
+#     --policy.device=cuda \
+#     --batch_size=16 \
+#     --steps=20000 \
+#     --output_dir=models/checkpoints/pi05_so101
+# ==============================================================================

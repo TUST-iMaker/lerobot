@@ -1,0 +1,52 @@
+# ==============================================================================
+# Cross-OS Line Ending & Binary Policy (Windows + Ubuntu Shared Workspace)
+# ==============================================================================
+* text=auto
+
+# Shell scripts & POSIX files MUST remain LF even on Windows (core.autocrlf=true)
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Python, configs, docs & metadata use LF
+*.py text eol=lf
+*.pyi text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.md text eol=lf
+*.mdx text eol=lf
+*.toml text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+.env.example text eol=lf
+
+# Windows native scripts use CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Media, datasets, model weights & CAD binaries
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.mp4 binary
+*.avi binary
+*.mkv binary
+*.safetensors binary
+*.pt binary
+*.pth binary
+*.bin binary
+*.onnx binary
+*.stl binary
+*.step binary
+*.stp binary
+*.parquet binary
+*.arrow binary
+*.memmap binary
+*.bag binary
