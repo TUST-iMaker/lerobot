@@ -187,6 +187,17 @@ function syncArmControlMutexUI() {
       : "从臂末端 IK 坐标 (独立控制, mm)";
   }
 
+  const authBadge = $("control-authority-badge");
+  if (authBadge) {
+    if (linked) {
+      authBadge.textContent = state.mode === "real" ? "真实主臂操控从臂" : "主臂联动操控从臂";
+      authBadge.className = "status-tag tag-ok";
+    } else {
+      authBadge.textContent = "电脑操控从臂";
+      authBadge.className = "status-tag tag-warn";
+    }
+  }
+
   // Calibration is strictly joint-space (no red-ring IK on either arm)
   if (inCal) {
     stageViews.leader?.setIkEnabled(false);
@@ -333,6 +344,40 @@ function initStructuralResizers() {
     };
     consoleHandle.addEventListener("pointerup", end);
     consoleHandle.addEventListener("pointercancel", end);
+  }
+
+  // Resizer 5: Tab 4 Continuous Trajectory Card vs Waypoints Queue Vertical Split
+  const teachResizer = $("teaching-split-resizer");
+  const linearCard = $("linear-teach-card");
+  const wpCard = $("waypoints-card");
+  if (teachResizer && linearCard && wpCard) {
+    let dragging = false;
+    let startY = 0;
+    let startTopH = 260;
+    let totalH = 520;
+    teachResizer.addEventListener("pointerdown", (ev) => {
+      dragging = true;
+      startY = ev.clientY;
+      const topRect = linearCard.getBoundingClientRect();
+      const botRect = wpCard.getBoundingClientRect();
+      startTopH = topRect.height;
+      totalH = Math.max(320, topRect.height + botRect.height);
+      teachResizer.classList.add("dragging");
+      teachResizer.setPointerCapture(ev.pointerId);
+    });
+    teachResizer.addEventListener("pointermove", (ev) => {
+      if (!dragging) return;
+      const nextTop = Math.max(150, Math.min(totalH - 140, startTopH + (ev.clientY - startY)));
+      const ratio = nextTop / totalH;
+      linearCard.style.flex = `${ratio.toFixed(3)} 1 0px`;
+      wpCard.style.flex = `${(1 - ratio).toFixed(3)} 1 0px`;
+    });
+    const end = () => {
+      dragging = false;
+      teachResizer.classList.remove("dragging");
+    };
+    teachResizer.addEventListener("pointerup", end);
+    teachResizer.addEventListener("pointercancel", end);
   }
 }
 
@@ -536,10 +581,29 @@ function updateAllStickViews() {
    ========================================================================== */
 function setModeUI(mode) {
   state.mode = mode;
+  const isReal = mode === "real";
   const badge = $("mode-badge");
   if (badge) {
-    badge.textContent = mode === "real" ? "MODE: REAL" : "MODE: DRY-RUN";
+    badge.textContent = isReal ? "MODE: REAL (真机)" : "MODE: DRY-RUN (仿真)";
     badge.className = "sb-item";
+  }
+  const topbar = document.querySelector(".topbar");
+  if (topbar) {
+    topbar.classList.toggle("mode-real", isReal);
+    topbar.classList.toggle("mode-dry", !isReal);
+  }
+  const cap = $("mode-capsule");
+  if (cap) {
+    cap.classList.toggle("mode-real", isReal);
+    cap.classList.toggle("mode-dry", !isReal);
+  }
+  const capDot = $("mode-capsule-dot");
+  if (capDot) {
+    capDot.className = isReal ? "status-dot dot-ok" : "status-dot dot-warn";
+  }
+  const liveTag = $("mode-live-tag");
+  if (liveTag) {
+    liveTag.textContent = isReal ? "真机 REAL" : "仿真 SIM";
   }
   renderReadinessState();
 }
@@ -584,15 +648,19 @@ function renderReadinessState() {
   } else if (isReal) {
     if (dir === "teleop_bidirectional") {
       level = "ready";
-      pillLabel = "真机双向就绪";
-      title = "真机双向联动就绪 · 真机与仿真实时同步";
-      desc = "用手移动主臂会实时带动从臂与 3D 画面；在界面拖动滑块、红圈或按 WASD/QE 也会直接驱动真机从臂。";
+      pillLabel = state.linkedArms ? "真实主臂操控从臂" : "电脑操控从臂";
+      title = state.linkedArms
+        ? "真实主臂操控从臂 · 遥操作双向同步中"
+        : "电脑操控从臂 · 主从已解绑（防主臂干扰）";
+      desc = state.linkedArms
+        ? "当前主从联动开启：用手移动物理主臂会实时带动从臂；若用滑块/键控微调从臂，松手后将保持在新位置，直到再次掰动主臂。"
+        : "当前主从联动关闭：由电脑滑块、红圈 IK 或 WASD/QE 单独控制真机从臂，碰主臂不会干扰从臂。";
       actionLabel = "前往 2. 遥操作";
       actionType = "tab_teleop";
     } else if (dir === "sim_to_real") {
       level = "ready";
-      pillLabel = "仿真→真机就绪";
-      title = "真机驱动已就绪 · 界面操作将带动真机";
+      pillLabel = "电脑操控从臂";
+      title = "电脑操控从臂 · 界面操作将实时带动真机";
       desc = "拖动 3D 红圈、滑块、WASD/QE 或执行示教回放都会实时驱动真机从臂，并回读编码器更新画面。";
       actionLabel = "前往 3. 仿真控臂";
       actionType = "tab_sim";
@@ -696,6 +764,11 @@ function updateConnectionBadge(conn) {
 
 function renderHardwareProbe(probe) {
   if (!probe) return;
+  const isLinux = String(probe.os || "").toLowerCase().includes("linux");
+  const hwTag = $("nav-os-hw-tag");
+  const trainTag = $("nav-os-train-tag");
+  if (hwTag) hwTag.textContent = isLinux ? "LINUX" : "WIN";
+  if (trainTag) trainTag.textContent = isLinux ? "本机 GPU" : "UBUNTU";
   setModeUI(probe.active_mode || "dry_run");
   const modeSelect = $("mode-select");
   if (modeSelect && probe.requested_mode) {
@@ -1241,22 +1314,82 @@ async function refreshWaypoints() {
 async function refreshLinearTrajectories() {
   const res = await apiFetch("/api/workflows/teaching/linear/list");
   const sel = $("linear-traj-select");
-  if (!res.ok || !sel) return;
+  const tbody = $("linear-traj-tbody");
+  if (!res.ok) return;
   const items = res.data.trajectories || [];
-  const prev = sel.value;
-  if (!items.length) {
-    sel.innerHTML = '<option value="">暂无已录制连续轨迹</option>';
-    return;
+  if (sel) {
+    const prev = sel.value;
+    if (!items.length) {
+      sel.innerHTML = '<option value="">暂无已录制连续轨迹</option>';
+    } else {
+      sel.innerHTML = items
+        .map((t) => {
+          const val = JSON.stringify({ name: t.name, episode: t.episode, fps: t.fps });
+          const tag = t.mode === "real" ? "真机" : "仿真";
+          return `<option value='${val.replace(/'/g, "&apos;")}'>[${tag}] ${t.name} (ep${t.episode} · ${t.frames}帧 @ ${t.fps}Hz)</option>`;
+        })
+        .join("");
+      if (prev && Array.from(sel.options).some((o) => o.value === prev)) {
+        sel.value = prev;
+      }
+    }
   }
-  sel.innerHTML = items
-    .map((t) => {
-      const val = JSON.stringify({ name: t.name, episode: t.episode, fps: t.fps });
-      const tag = t.mode === "real" ? "真机" : "仿真";
-      return `<option value='${val.replace(/'/g, "&apos;")}'>[${tag}] ${t.name} (ep${t.episode} · ${t.frames}帧 @ ${t.fps}Hz)</option>`;
-    })
-    .join("");
-  if (prev && Array.from(sel.options).some((o) => o.value === prev)) {
-    sel.value = prev;
+  if (tbody) {
+    if (!items.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无已录制连续轨迹。</td></tr>';
+    } else {
+      tbody.innerHTML = items
+        .map((t, idx) => {
+          const dur = t.fps ? (t.frames / t.fps).toFixed(1) : "0.0";
+          const modeLabel = t.mode === "real" ? "真机" : "仿真";
+          const safeName = String(t.name).replace(/"/g, "&quot;");
+          return `<tr>
+            <td>${idx + 1}</td>
+            <td><strong>${safeName}</strong></td>
+            <td>ep${t.episode}</td>
+            <td class="joint-values">${t.frames} 帧 / ${t.fps}Hz (${dur}s)</td>
+            <td><span class="status-tag ${t.mode === "real" ? "tag-ok" : "tag-warn"}">${modeLabel}</span></td>
+            <td>
+              <button type="button" class="btn btn-xs btn-primary btn-row-linear-replay" data-name="${safeName}" data-ep="${t.episode}" data-fps="${t.fps}">回放</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-row-linear-del" data-name="${safeName}" data-ep="${t.episode}">删除</button>
+            </td>
+          </tr>`;
+        })
+        .join("");
+      tbody.querySelectorAll(".btn-row-linear-replay").forEach((b) => {
+        b.addEventListener("click", async () => {
+          ensureStageVisibleForAction();
+          const name = b.dataset.name;
+          const episode = Number(b.dataset.ep || 0);
+          const fps = Number(b.dataset.fps || 30);
+          const r = await apiFetch("/api/workflows/teaching/linear/replay", {
+            method: "POST",
+            body: JSON.stringify({ name, episode, fps }),
+          });
+          if (r.ok) {
+            state.activeWorkflow = "linear_replay";
+            if ($("linear-teach-status")) {
+              $("linear-teach-status").textContent = `线性回放中 [${r.data.mode}]: ${name} (ep${episode})`;
+            }
+            showFeedbackToast(`开始线性回放: ${name}`, "ok");
+          } else {
+            showAnomalyToast(r.error || "启动线性回放失败");
+          }
+        });
+      });
+      tbody.querySelectorAll(".btn-row-linear-del").forEach((b) => {
+        b.addEventListener("click", async () => {
+          const name = b.dataset.name;
+          const episode = Number(b.dataset.ep || 0);
+          await apiFetch("/api/workflows/teaching/linear/delete", {
+            method: "POST",
+            body: JSON.stringify({ name, episode }),
+          });
+          await refreshLinearTrajectories();
+          showFeedbackToast(`已删除轨迹 ${name} (ep${episode})`, "info");
+        });
+      });
+    }
   }
 }
 
@@ -1870,7 +2003,11 @@ function connectTelemetryBus() {
       if (msg.workflow_status) {
         const colProg = $("collect-progress-text");
         if (colProg) {
-          colProg.textContent = `进度: ${msg.workflow_status.current_episode || 0} / ${msg.workflow_status.target_episodes || 0} 回合 (步数: ${msg.workflow_status.current_step || 0})`;
+          if (wf === "collect") {
+            colProg.textContent = `采集中: ${msg.workflow_status.current_episode || 0} / ${msg.workflow_status.target_episodes || 0} 回合 (步数: ${msg.workflow_status.current_step || 0})`;
+          } else {
+            colProg.textContent = "待机（未在采集）";
+          }
         }
       }
       if (Array.isArray(msg.log_tail)) renderLogs(msg.log_tail);
@@ -1993,8 +2130,33 @@ function bindActions() {
     }
   });
 
-  $("readiness-pill")?.addEventListener("click", () => {
-    document.querySelector('.nav-item[data-tab="dashboard"]')?.click();
+  $("readiness-pill")?.addEventListener("click", async () => {
+    if (state.estopLatched) {
+      const res = await apiFetch("/api/safety/reset", { method: "POST" });
+      if (res.ok) showFeedbackToast("急停已解除", "ok");
+      return;
+    }
+    if (state.mode !== "real") {
+      showFeedbackToast("当前为 dry_run 仿真模式；连接真机后切到 real/auto 可切换实时监听。", "info");
+      return;
+    }
+    const nextDir = state.syncDirection === "off" ? "real_to_sim" : "off";
+    const res = await apiFetch("/api/sim/sync_mode", {
+      method: "POST",
+      body: JSON.stringify({ direction: nextDir, safety_confirmed: false }),
+    });
+    if (res.ok) {
+      state.syncDirection = nextDir;
+      renderReadinessState();
+      showFeedbackToast(
+        nextDir === "real_to_sim"
+          ? "已开启真机 30Hz 实时监听（手掰从臂 → 3D 实时跟随）"
+          : "已暂停真机监听并释放串口（可供外部工具使用）",
+        nextDir === "real_to_sim" ? "ok" : "info"
+      );
+    } else {
+      showAnomalyToast(res.error || "切换真机监听状态失败");
+    }
   });
 
   $("btn-readiness-action")?.addEventListener("click", async () => {
@@ -2003,7 +2165,7 @@ function bindActions() {
       await apiFetch("/api/safety/reset", { method: "POST" });
       showFeedbackToast("急停已解除", "ok");
     } else if (action === "enable_real_to_sim") {
-      const res = await apiFetch("/api/sim/sync-mode", {
+      const res = await apiFetch("/api/sim/sync_mode", {
         method: "POST",
         body: JSON.stringify({ direction: "real_to_sim", safety_confirmed: false }),
       });
@@ -2015,13 +2177,13 @@ function bindActions() {
         showAnomalyToast(res.error || "开启实时同步失败");
       }
     } else if (action === "tab_teleop") {
-      document.querySelector('.nav-item[data-tab="teleop"]')?.click();
+      document.querySelector('.tab-btn[data-tab="teleop"]')?.click();
     } else if (action === "tab_teaching") {
-      document.querySelector('.nav-item[data-tab="teaching"]')?.click();
+      document.querySelector('.tab-btn[data-tab="teaching"]')?.click();
     } else if (action === "tab_dashboard") {
-      document.querySelector('.nav-item[data-tab="dashboard"]')?.click();
+      document.querySelector('.tab-btn[data-tab="dashboard"]')?.click();
     } else {
-      document.querySelector('.nav-item[data-tab="sim"]')?.click();
+      document.querySelector('.tab-btn[data-tab="sim"]')?.click();
     }
   });
 
@@ -2283,13 +2445,24 @@ function bindActions() {
     });
   });
 
+  $("chk-wasd-enable")?.addEventListener("change", (ev) => {
+    // Blur checkbox immediately so space/WASD/QE work right away on every tab
+    ev.target.blur();
+  });
+
   document.addEventListener("keydown", async (ev) => {
     if (!$("chk-wasd-enable")?.checked) return;
     const activeEl = document.activeElement;
-    if (
+    const isTextInput =
       activeEl &&
-      (["INPUT", "TEXTAREA", "SELECT"].includes(activeEl.tagName) || activeEl.isContentEditable)
-    ) {
+      (activeEl.tagName === "TEXTAREA" ||
+        activeEl.tagName === "SELECT" ||
+        activeEl.isContentEditable ||
+        (activeEl.tagName === "INPUT" &&
+          !["checkbox", "radio", "range", "button", "submit"].includes(
+            (activeEl.type || "").toLowerCase()
+          )));
+    if (isTextInput) {
       return;
     }
     const k = ev.key.toLowerCase();
@@ -2297,9 +2470,10 @@ function bindActions() {
       return;
     }
     ev.preventDefault();
+    const stepMm = ["q", "e", "r", "f"].includes(k) ? 15.0 : 12.0;
     const res = await apiFetch("/api/workflows/control/key", {
       method: "POST",
-      body: JSON.stringify({ key: k, step_mm: 10.0 }),
+      body: JSON.stringify({ key: k, step_mm: stepMm }),
     });
     if (res.ok && res.data?.follower_joints) {
       updateJointGauges(

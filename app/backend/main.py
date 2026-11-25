@@ -270,6 +270,27 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
             f"Arm101 Studio started in '{probe_data['active_mode']}' mode "
             f"(requested='{probe_data['requested_mode']}')."
         )
+        # Always-on Joint State Broadcaster: in real mode, automatically start passive real_to_sim
+        # monitoring on boot so the 3D viewport stays live-synced without manual activation.
+        if probe_data.get("active_mode") == "real":
+            async def _auto_start_broadcaster() -> None:
+                try:
+                    await asyncio.to_thread(
+                        runtime.workflows.bridge.set_sync_mode,
+                        "real_to_sim",
+                        is_real_mode=True,
+                        safety_confirmed=False,
+                    )
+                    runtime.workflows.simulator.torque_enabled = False
+                    runtime.workflows.log(
+                        "Auto-started always-on real_to_sim joint state broadcaster (Freedrive monitor)."
+                    )
+                except Exception as exc:
+                    runtime.workflows.log(
+                        f"Auto-start real_to_sim monitor skipped ({exc}); click readiness pill to retry."
+                    )
+
+            asyncio.create_task(_auto_start_broadcaster())
         try:
             yield
         finally:
@@ -578,6 +599,10 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     @fastapi_app.post("/api/workflows/teaching/linear/replay/stop")
     async def teaching_linear_replay_stop() -> dict[str, Any]:
         return await _rt().workflows.stop_linear_replay()
+
+    @fastapi_app.post("/api/workflows/teaching/linear/delete")
+    async def teaching_linear_delete(req: LinearReplayRequest) -> dict[str, Any]:
+        return _rt().workflows.delete_linear_trajectory(name=req.name, episode=req.episode)
 
     @fastapi_app.post("/api/workflows/collect/start")
     async def collect_start(req: CollectStartRequest | None = None) -> dict[str, Any]:

@@ -12,7 +12,7 @@
 
 ### 1. 本机补装 1 个缺的包（当前环境只缺 `datasets`）
 ```powershell
-envs\win\lerobot\Scripts\python.exe -m pip install -e "repos/lerobot[dataset]"
+uv pip install --python envs\win\lerobot\Scripts\python.exe -e "repos/lerobot[dataset]"
 ```
 
 ### 2. 直接可用的录制 & 线性回放命令（已填好你的 COM11 / COM12 与标定目录）

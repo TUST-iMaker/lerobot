@@ -30,6 +30,10 @@
       </div>
 
       <nav class="sidebar-nav" role="tablist" aria-label="Studio Modules">
+        <div class="nav-group-label" id="nav-group-hw" title="机械臂硬件连接、标定、遥操作、示教与采集（Windows / Ubuntu 通用）">
+          <span>硬件操控</span>
+          <span class="nav-os-tag tag-win" id="nav-os-hw-tag">WIN</span>
+        </div>
         <button type="button" role="tab" aria-selected="true" class="tab-btn active" data-tab="dashboard" data-title="1. 总览与标定" data-testid="tab-dashboard" title="1. 总览与标定">
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
           <span class="nav-label">1. 总览与标定</span>
@@ -50,6 +54,12 @@
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.66 3.58 3 8 3s8-1.34 8-3V6"/><path d="M4 12v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6"/></svg>
           <span class="nav-label">5. 数据采集</span>
         </button>
+
+        <div class="nav-group-divider" aria-hidden="true"></div>
+        <div class="nav-group-label" id="nav-group-train" title="模型训练、OpenPI 与云端算力部署（推荐 Ubuntu / Linux GPU）">
+          <span>训练算力</span>
+          <span class="nav-os-tag tag-ubuntu" id="nav-os-train-tag">UBUNTU</span>
+        </div>
         <button type="button" role="tab" aria-selected="false" class="tab-btn" data-tab="plugins" data-title="6. 插件与开源数据" data-testid="tab-plugins" title="6. 插件与开源数据">
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4"/><circle cx="12" cy="12" r="4"/></svg>
           <span class="nav-label">6. 插件与开源数据</span>
@@ -91,8 +101,9 @@
         </div>
 
         <div class="topbar-actions" aria-label="Hardware Safety and Mode Actions">
-          <label class="control-capsule" for="mode-select">
-            <span class="capsule-prefix">Mode:</span>
+          <label class="control-capsule mode-dry" id="mode-capsule" for="mode-select">
+            <span class="status-dot dot-warn" id="mode-capsule-dot"></span>
+            <span class="mode-live-tag" id="mode-live-tag">仿真 SIM</span>
             <select id="mode-select" aria-label="Operating Mode">
               <option value="auto">auto (自动)</option>
               <option value="dry_run">dry_run (仿真)</option>
@@ -318,6 +329,7 @@
                 </div>
                 <div class="btn-group">
                   <button type="button" class="btn btn-xs link-toggle-pill active" id="btn-teleop-link-toggle" data-testid="btn-teleop-link-toggle">主从联动: 开</button>
+                  <span id="control-authority-badge" data-testid="control-authority-badge" class="status-tag tag-ok">真实主臂操控从臂</span>
                   <label class="inline-field"><span>FPS</span><input id="teleop-fps" type="number" min="1" max="120" value="60" /></label>
                   <button type="button" class="btn btn-xs btn-primary" data-testid="btn-start-teleop" id="btn-start-teleop">启动遥操作</button>
                   <button type="button" class="btn btn-xs btn-secondary" data-testid="btn-stop-teleop" id="btn-stop-teleop" disabled>停止遥操作</button>
@@ -345,7 +357,7 @@
             <div class="cockpit-split">
               <div class="card flex-card sliders-card">
                 <div class="panel-header">
-                  <h3>5-DOF + 夹爪关节直推滑块</h3>
+                  <h3>从臂 5-DOF + 夹爪关节直推滑块</h3>
                   <span class="mono-meta">角度 | 编码器</span>
                 </div>
                 <div id="joints-container" class="joints-list"></div>
@@ -457,9 +469,9 @@
               <div id="teach-stick-data" class="telemetry-strip-wrap"></div>
             </div>
 
-            <div class="card" id="linear-teach-card" data-testid="linear-teach-card">
+            <div class="card flex-card" id="linear-teach-card" data-testid="linear-teach-card" style="flex:1.15;min-height:170px">
               <div class="panel-header">
-                <h3>连续轨迹示教与线性回放 (官方 lerobot-record / lerobot-replay)</h3>
+                <h3>连续轨迹示教与线性回放 (主示教 → 从跟随 → 线性回放)</h3>
                 <div class="btn-group">
                   <input id="linear-teach-name" type="text" value="demo_linear_01" placeholder="轨迹名称" style="width:130px" />
                   <input id="linear-teach-duration" type="number" value="30" min="2" max="300" title="最大录制秒数" style="width:64px" />
@@ -476,9 +488,21 @@
                 <button type="button" class="btn btn-xs btn-secondary" id="btn-linear-refresh">刷新列表</button>
                 <span id="linear-teach-status" class="mono-meta">就绪：点击「开始连续示教」主臂带从臂做动作，结束后可一键线性回放。</span>
               </div>
+              <div class="table-wrap flex-table" style="margin-top:8px">
+                <table>
+                  <thead>
+                    <tr><th>#</th><th>轨迹名称</th><th>回合</th><th>帧数 / 频率</th><th>模式</th><th>操作</th></tr>
+                  </thead>
+                  <tbody id="linear-traj-tbody">
+                    <tr><td colspan="6" class="muted">暂无已录制连续轨迹。</td></tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
 
-            <div class="card flex-card">
+            <div class="split-resizer-h" id="teaching-split-resizer" data-testid="teaching-split-resizer" title="拖拽调整连续轨迹列表与航点队列的上下比例"></div>
+
+            <div class="card flex-card" id="waypoints-card" style="flex:1;min-height:150px">
               <div class="panel-header">
                 <h3>关键帧示教航点队列</h3>
                 <div class="btn-group">
@@ -508,7 +532,7 @@
               <div class="panel-header">
                 <div class="btn-group">
                   <h3>LeRobotDataset v3.0 数据采集</h3>
-                  <span id="collect-progress-text" class="mono-meta">进度: 0 / 0 回合</span>
+                  <span id="collect-progress-text" class="mono-meta">待机（未在采集）</span>
                 </div>
                 <div class="btn-group">
                   <button type="button" class="btn btn-xs btn-primary" data-testid="btn-start-collect" id="btn-start-collect">开始采集</button>

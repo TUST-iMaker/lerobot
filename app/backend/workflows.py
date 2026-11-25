@@ -1008,13 +1008,15 @@ class WorkflowManager:
     def update_teleop_joints(self, raw_joints: dict[str, Any]) -> dict[str, Any]:
         self._arbitrate_manual_write()
         validated = validate_joint_dict(raw_joints, require_non_empty=True)
-        # Respect user's current Link Leader-Follower toggle instead of forcing it back ON
-        self.simulator.set_leader_joints(validated, step_immediately=True)
+        # Tab 2 direct-push sliders always control the actuated Follower arm.
+        # Never overwrite physical Leader's 3D pose when real Leader is actively streaming (prevents twitching).
+        if self.simulator.linked_arms and not self.simulator.real_leader_active:
+            self.simulator.set_leader_joints(validated, step_immediately=True)
+        else:
+            self.simulator.set_follower_joints(validated)
         self._notify_motion()
         leader, follower, _ = self.simulator.snapshot()
-        real_dispatched = (
-            self.bridge.send_follower_target_deg(follower) if self.simulator.linked_arms else False
-        )
+        real_dispatched = self.bridge.send_follower_target_deg(follower)
         return {
             "status": "ok",
             "leader_joints": leader,
@@ -1112,10 +1114,14 @@ class WorkflowManager:
                                 )
                                 for k in JOINT_NAMES
                             }
-                            self.simulator.set_leader_joints(interp, step_immediately=False)
-                            self.simulator.set_follower_joints(interp)
-                            self.bridge.send_follower_target_deg(interp)
-                            self._notify_motion()
+                            use_real_fb = self.hardware.active_mode == "real" and self.bridge.connected_follower
+                            if use_real_fb:
+                                self.bridge.send_follower_target_deg(interp)
+                            else:
+                                if not self.simulator.real_leader_active:
+                                    self.simulator.set_leader_joints(interp, step_immediately=False)
+                                self.simulator.set_follower_joints(interp)
+                                self._notify_motion()
                             self.current_step += 1
                             await asyncio.sleep(0.03)
                     if not loop:
@@ -1151,32 +1157,59 @@ class WorkflowManager:
         return {"status": "cleared", "count": 0}
 
     # ------------------------------------------------------------------
-    # Official Continuous Trajectory Teaching & Linear Replay (lerobot-record / lerobot-replay)
+    # Continuous Trajectory Teaching & Linear Replay (Live Teleop Bridge + Official lerobot-replay)
     # ------------------------------------------------------------------
-    def _linear_dry_dir(self) -> Path:
-        p = self.config.dry_run_dir / "linear_teach"
+    def _linear_store_dir(self, *, is_real: bool) -> Path:
+        base = self.config.datasets_dir if is_real else self.config.dry_run_dir
+        p = base / "linear_teach"
         p.mkdir(parents=True, exist_ok=True)
         return p
 
     def list_linear_trajectories(self) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
-        # 1. Real official LeRobot datasets under data/datasets/
+        # 1. Real live-recorded linear trajectories under data/datasets/linear_teach/
+        real_lin_dir = self._linear_store_dir(is_real=True)
+        for f in sorted(real_lin_dir.glob("*.json")):
+            try:
+                payload = json.loads(f.read_text(encoding="utf-8"))
+                name = str(payload.get("name") or f.stem)
+                ep = int(payload.get("episode", 0))
+                fps = int(payload.get("fps", 30))
+                frames = len(payload.get("frames", []))
+                items.append(
+                    {
+                        "name": name,
+                        "episode": ep,
+                        "mode": "real",
+                        "fps": fps,
+                        "frames": frames,
+                        "path": str(f),
+                        "replay_cmd": " ".join(
+                            self.build_replay_cmd(dataset_name=name, episode=ep, fps=fps)
+                        ),
+                    }
+                )
+            except Exception:
+                continue
+
+        # 2. Official LeRobot datasets under data/datasets/<name>/ (with meta/info.json)
         if self.config.datasets_dir.exists():
             for ds_dir in sorted(self.config.datasets_dir.iterdir()):
-                if not ds_dir.is_dir():
+                if not ds_dir.is_dir() or ds_dir.name == "linear_teach":
                     continue
                 info_p = ds_dir / "meta" / "info.json"
+                if not info_p.exists():
+                    continue
                 total_eps = 1
                 fps = 30
                 total_frames = 0
-                if info_p.exists():
-                    try:
-                        info = json.loads(info_p.read_text(encoding="utf-8"))
-                        total_eps = max(1, int(info.get("total_episodes", 1)))
-                        fps = int(info.get("fps", 30))
-                        total_frames = int(info.get("total_frames", 0))
-                    except Exception:
-                        pass
+                try:
+                    info = json.loads(info_p.read_text(encoding="utf-8"))
+                    total_eps = max(1, int(info.get("total_episodes", 1)))
+                    fps = int(info.get("fps", 30))
+                    total_frames = int(info.get("total_frames", 0))
+                except Exception:
+                    pass
                 for ep in range(total_eps):
                     cmd = self.build_replay_cmd(dataset_name=ds_dir.name, episode=ep, fps=fps)
                     items.append(
@@ -1191,8 +1224,8 @@ class WorkflowManager:
                         }
                     )
 
-        # 2. Dry-run continuous trajectories under data/dry_run/linear_teach/
-        dry_dir = self._linear_dry_dir()
+        # 3. Dry-run continuous trajectories under data/dry_run/linear_teach/
+        dry_dir = self._linear_store_dir(is_real=False)
         for f in sorted(dry_dir.glob("*.json")):
             try:
                 payload = json.loads(f.read_text(encoding="utf-8"))
@@ -1200,7 +1233,6 @@ class WorkflowManager:
                 ep = int(payload.get("episode", 0))
                 fps = int(payload.get("fps", 20))
                 frames = len(payload.get("frames", []))
-                cmd = self.build_replay_cmd(dataset_name=name, episode=ep, fps=fps)
                 items.append(
                     {
                         "name": name,
@@ -1209,7 +1241,9 @@ class WorkflowManager:
                         "fps": fps,
                         "frames": frames,
                         "path": str(f),
-                        "replay_cmd": " ".join(cmd),
+                        "replay_cmd": " ".join(
+                            self.build_replay_cmd(dataset_name=name, episode=ep, fps=fps)
+                        ),
                     }
                 )
             except Exception:
@@ -1222,20 +1256,23 @@ class WorkflowManager:
             "count": len(items),
         }
 
-    def _flush_linear_dry_trajectory(self) -> dict[str, Any] | None:
+    def _flush_linear_trajectory(self) -> dict[str, Any] | None:
         ctx = self._linear_teach_ctx
         if not ctx:
             return None
         frames = ctx.get("frames", [])
         if not frames:
+            self._linear_teach_ctx = None
             return None
         name = str(ctx["name"])
         ep = int(ctx.get("episode", 0))
-        fps = int(ctx.get("fps", 20))
-        out_file = self._linear_dry_dir() / f"{name}_ep{ep:04d}.json"
+        fps = int(ctx.get("fps", 30))
+        is_real = bool(ctx.get("is_real", False))
+        out_file = self._linear_store_dir(is_real=is_real) / f"{name}_ep{ep:04d}.json"
         payload = {
             "name": name,
             "episode": ep,
+            "mode": "real" if is_real else "dry_run",
             "fps": fps,
             "num_frames": len(frames),
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1243,13 +1280,16 @@ class WorkflowManager:
         }
         out_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         self._linear_teach_ctx = None
-        return {
+        result = {
             "name": name,
             "episode": ep,
+            "mode": "real" if is_real else "dry_run",
             "fps": fps,
             "frames": len(frames),
             "path": str(out_file),
         }
+        self._last_linear_saved = result
+        return result
 
     async def start_linear_teach(
         self,
@@ -1260,68 +1300,45 @@ class WorkflowManager:
     ) -> dict[str, Any]:
         self._sync_process_state()
         safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.strip() or "demo_linear_01")
-        await self._ensure_idle()
+        is_real = self.hardware.active_mode == "real"
+
+        # Keep existing live teleop running seamlessly! Only stop non-teleop conflicts.
+        if self.active_workflow not in ("idle", "teleop"):
+            await self._ensure_idle()
         self.last_error = None
+
+        if is_real:
+            # Ensure live Leader->Follower teleop is running (do NOT disconnect teleop!)
+            self.simulator.set_linked_arms(True)
+            if self.bridge.direction != "teleop_bidirectional":
+                await asyncio.to_thread(
+                    self.bridge.start_bidirectional_teleop,
+                    fps=min(60, max(20, int(fps))),
+                )
+            # Clear UI latch so physical Leader immediately drives Follower
+            with self.bridge._lock:
+                self.bridge._ui_control_latched = False
+            self.simulator.clear_follower_cmd_target()
+
+        rec_fps = min(30, max(10, int(fps))) if is_real else min(20, max(10, int(fps)))
         self.active_workflow = "linear_teach"
         self.state = "running"
         self.current_step = 0
-
-        if self.hardware.active_mode == "real":
-            if not self.hardware.dual_arm_ready:
-                self.active_workflow = "idle"
-                self.state = "idle"
-                raise WorkflowConflictError(
-                    "真机连续示教需要主臂与从臂同时连接。", code="DUAL_ARM_REQUIRED"
-                )
-            self._camera_hub.release_all()
-            self.bridge.disconnect(return_to_rest=False, keep_torque=False)
-            cmd = self.build_record_cmd(
-                dataset_name=safe_name,
-                single_task="linear teaching demo",
-                num_episodes=1,
-                episode_time_s=duration_s,
-                reset_time_s=3.0,
-                fps=fps,
-                push_to_hub=False,
-            )
-            env = {
-                "PYTHONPATH": str(self.config.repos_dir / "lerobot" / "src"),
-                "PYTHONUNBUFFERED": "1",
-            }
-            managed = self.process_registry.spawn(
-                "linear_teach",
-                "lerobot-record (linear teach)",
-                cmd,
-                cwd=self.config.workspace_root,
-                env=env,
-                on_line=self.log,
-            )
-            self._active_proc_id = "linear_teach"
-            self.log(f"Started official lerobot-record linear teaching '{safe_name}' (pid={managed.proc.pid}).")
-            return {
-                "status": "recording",
-                "mode": "real",
-                "workflow": "linear_teach",
-                "name": safe_name,
-                "duration_s": duration_s,
-                "fps": fps,
-                "command": cmd,
-                "pid": managed.proc.pid,
-            }
-
-        # dry_run mode: continuous 20 Hz trajectory capture (follows user moves or gentle demo sweep)
-        sim_fps = min(20, max(10, int(fps)))
         self._linear_teach_ctx = {
             "name": safe_name,
             "episode": 0,
-            "fps": sim_fps,
+            "is_real": is_real,
+            "fps": rec_fps,
             "frames": [],
         }
-        self.log(f"Started dry_run linear teaching '{safe_name}' ({duration_s}s @ {sim_fps}Hz).")
+        self.log(
+            f"Started {'real teleop' if is_real else 'dry_run'} continuous linear teaching "
+            f"'{safe_name}' ({duration_s}s @ {rec_fps}Hz — Leader guides Follower live)."
+        )
 
-        async def _sim_linear_record() -> None:
-            dt = 1.0 / sim_fps
-            max_frames = max(10, int(duration_s * sim_fps))
+        async def _linear_record_loop() -> None:
+            dt = 1.0 / rec_fps
+            max_frames = max(10, int(duration_s * rec_fps))
             try:
                 for i in range(max_frames):
                     _, f_j, _ = self.simulator.snapshot()
@@ -1329,36 +1346,33 @@ class WorkflowManager:
                         self._linear_teach_ctx["frames"].append(dict(f_j))
                     self.current_step = i + 1
                     await asyncio.sleep(dt)
-                saved = self._flush_linear_dry_trajectory()
+                saved = self._flush_linear_trajectory()
                 if saved:
-                    self.log(f"Saved dry_run linear trajectory '{saved['name']}' ({saved['frames']} frames).")
+                    self.log(f"Saved linear trajectory '{saved['name']}' ({saved['frames']} frames).")
             except asyncio.CancelledError:
-                saved = self._flush_linear_dry_trajectory()
+                saved = self._flush_linear_trajectory()
                 if saved:
-                    self.log(f"Stopped & saved dry_run linear trajectory '{saved['name']}' ({saved['frames']} frames).")
+                    self.log(f"Stopped & saved linear trajectory '{saved['name']}' ({saved['frames']} frames).")
                 raise
             finally:
                 if self.active_workflow == "linear_teach":
-                    self.active_workflow = "idle"
-                    self.state = "idle"
+                    # If real teleop bridge is still live, return cleanly to teleop state instead of dropping it
+                    if is_real and self.bridge.direction == "teleop_bidirectional":
+                        self.active_workflow = "teleop"
+                        self.state = "running"
+                    else:
+                        self.active_workflow = "idle"
+                        self.state = "idle"
 
-        self._task = asyncio.create_task(_sim_linear_record())
+        self._task = asyncio.create_task(_linear_record_loop())
         return {
             "status": "recording",
-            "mode": "dry_run",
+            "mode": "real" if is_real else "dry_run",
             "workflow": "linear_teach",
             "name": safe_name,
             "duration_s": duration_s,
-            "fps": sim_fps,
-            "command": self.build_record_cmd(
-                dataset_name=safe_name,
-                single_task="linear teaching demo",
-                num_episodes=1,
-                episode_time_s=duration_s,
-                reset_time_s=3.0,
-                fps=fps,
-                push_to_hub=False,
-            ),
+            "fps": rec_fps,
+            "teleop_kept_alive": is_real,
         }
 
     async def stop_linear_teach(self) -> dict[str, Any]:
@@ -1367,12 +1381,17 @@ class WorkflowManager:
             self.process_registry.terminate("linear_teach")
             self._active_proc_id = None
         if self.active_workflow == "linear_teach":
+            self._last_linear_saved = None
             await self._cancel_background_task()
-            saved = self._flush_linear_dry_trajectory()
-            self.active_workflow = "idle"
-            self.state = "idle"
+            saved = self._flush_linear_trajectory() or getattr(self, "_last_linear_saved", None)
+            if self.hardware.active_mode == "real" and self.bridge.direction == "teleop_bidirectional":
+                self.active_workflow = "teleop"
+                self.state = "running"
+            else:
+                self.active_workflow = "idle"
+                self.state = "idle"
         self.log("Stopped linear teaching.")
-        return {"status": "stopped", "workflow": "idle", "saved": saved}
+        return {"status": "stopped", "workflow": self.active_workflow, "saved": saved}
 
     async def replay_linear_teach(
         self,
@@ -1385,16 +1404,103 @@ class WorkflowManager:
         safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.strip())
         if not safe_name:
             raise WorkflowConflictError("请先选择要线性回放的轨迹名称。", code="NO_TRAJECTORY")
-        await self._ensure_idle()
-        self.last_error = None
 
-        if self.hardware.active_mode == "real":
+        is_real = self.hardware.active_mode == "real"
+        # Look for live-recorded JSON trajectory first (real dir -> dry_run dir)
+        traj_file = self._linear_store_dir(is_real=is_real) / f"{safe_name}_ep{episode:04d}.json"
+        if not traj_file.exists():
+            alt_file = self._linear_store_dir(is_real=not is_real) / f"{safe_name}_ep{episode:04d}.json"
+            if alt_file.exists():
+                traj_file = alt_file
+
+        if traj_file.exists():
+            payload = json.loads(traj_file.read_text(encoding="utf-8"))
+            frames = payload.get("frames", [])
+            rec_fps = max(5, int(payload.get("fps", fps)))
+            if not frames:
+                raise WorkflowConflictError("该轨迹文件帧数为 0，无法回放。", code="EMPTY_TRAJECTORY")
+
+            if self.active_workflow not in ("idle", "teleop"):
+                await self._ensure_idle()
+            self.last_error = None
+
+            if is_real:
+                # Keep live bridge if already connected; otherwise engage Follower drive bridge
+                if self.bridge.direction not in ("teleop_bidirectional", "sim_to_real"):
+                    await self._ensure_real_drive_bridge()
+
+            self.active_workflow = "linear_replay"
+            self.state = "running"
+            self.current_step = 0
+            self.log(
+                f"Replaying {'real Follower' if is_real else 'dry_run'} linear trajectory "
+                f"'{safe_name}' ({len(frames)} frames @ {rec_fps}Hz)."
+            )
+
+            async def _linear_replay_loop() -> None:
+                dt = 1.0 / rec_fps
+                try:
+                    # Smooth 0.6s anti-jump ramp from current Follower pose to frame 0
+                    _, cur_f, _ = self.simulator.snapshot()
+                    first_f = frames[0]
+                    ramp_steps = 18
+                    use_real_fb = is_real and self.bridge.connected_follower
+                    for r in range(1, ramp_steps + 1):
+                        t = 0.5 * (1.0 - math.cos(math.pi * (r / ramp_steps)))
+                        interp = {
+                            k: round(cur_f[k] + (float(first_f[k]) - cur_f[k]) * t, 3)
+                            for k in JOINT_NAMES
+                        }
+                        if use_real_fb:
+                            # Single source of truth: send to real arm; 30Hz bridge feedback animates 3D cleanly (zero jitter)
+                            self.bridge.send_follower_target_deg(interp)
+                        else:
+                            self.simulator.set_follower_joints(interp)
+                            self._notify_motion()
+                        await asyncio.sleep(0.03)
+
+                    # Frame-by-frame continuous linear replay on Follower only
+                    for i, frame in enumerate(frames):
+                        if use_real_fb:
+                            self.bridge.send_follower_target_deg(frame)
+                        else:
+                            self.simulator.set_follower_joints(frame)
+                            self._notify_motion()
+                        self.current_step = i + 1
+                        await asyncio.sleep(dt)
+                    self.log(f"Finished linear replay '{safe_name}'.")
+                except asyncio.CancelledError:
+                    self.log("Stopped linear replay.")
+                    raise
+                finally:
+                    if self.active_workflow == "linear_replay":
+                        if is_real and self.bridge.direction == "teleop_bidirectional":
+                            self.active_workflow = "teleop"
+                            self.state = "running"
+                        else:
+                            self.active_workflow = "idle"
+                            self.state = "idle"
+
+            self._task = asyncio.create_task(_linear_replay_loop())
+            return {
+                "status": "replaying",
+                "mode": "real" if is_real else "dry_run",
+                "workflow": "linear_replay",
+                "name": safe_name,
+                "episode": episode,
+                "frames": len(frames),
+                "fps": rec_fps,
+            }
+
+        # Fallback: official LeRobotDataset folder replay via lerobot-replay CLI (real mode)
+        if is_real:
             ds_dir = self.config.datasets_dir / safe_name
             if not ds_dir.exists():
                 raise WorkflowConflictError(
-                    f"未找到真机轨迹数据集目录: {ds_dir}，请先在真机模式下完成一次连续示教录制。",
+                    f"未找到连续轨迹 '{safe_name}'，请先点击「开始连续示教」录制一段轨迹。",
                     code="TRAJECTORY_NOT_FOUND",
                 )
+            await self._ensure_idle()
             self._camera_hub.release_all()
             self.bridge.disconnect(return_to_rest=False, keep_torque=False)
             cmd = self.build_replay_cmd(dataset_name=safe_name, episode=episode, fps=fps)
@@ -1407,7 +1513,7 @@ class WorkflowManager:
                 "lerobot-replay",
                 cmd,
                 cwd=self.config.workspace_root,
-                env=env,
+                env_overrides=env,
                 on_line=self.log,
             )
             self._active_proc_id = "linear_replay"
@@ -1424,53 +1530,10 @@ class WorkflowManager:
                 "pid": managed.proc.pid,
             }
 
-        # dry_run mode: linear frame-by-frame playback on 3D simulator
-        dry_file = self._linear_dry_dir() / f"{safe_name}_ep{episode:04d}.json"
-        if not dry_file.exists():
-            raise WorkflowConflictError(
-                f"未找到模拟连续轨迹文件: {dry_file.name}，请先点击「开始连续示教」录制一段轨迹。",
-                code="TRAJECTORY_NOT_FOUND",
-            )
-        payload = json.loads(dry_file.read_text(encoding="utf-8"))
-        frames = payload.get("frames", [])
-        rec_fps = max(5, int(payload.get("fps", fps)))
-        if not frames:
-            raise WorkflowConflictError("该轨迹文件帧数为 0，无法回放。", code="EMPTY_TRAJECTORY")
-
-        self.active_workflow = "linear_replay"
-        self.state = "running"
-        self.current_step = 0
-        self.log(f"Replaying dry_run linear trajectory '{safe_name}' ({len(frames)} frames @ {rec_fps}Hz).")
-
-        async def _sim_linear_replay() -> None:
-            dt = 1.0 / rec_fps
-            try:
-                for i, frame in enumerate(frames):
-                    self.simulator.set_leader_joints(frame, step_immediately=False)
-                    self.simulator.set_follower_joints(frame)
-                    self._notify_motion()
-                    self.current_step = i + 1
-                    await asyncio.sleep(dt)
-                self.log(f"Finished dry_run linear replay '{safe_name}'.")
-            except asyncio.CancelledError:
-                self.log("Stopped linear replay.")
-                raise
-            finally:
-                if self.active_workflow == "linear_replay":
-                    self.active_workflow = "idle"
-                    self.state = "idle"
-
-        self._task = asyncio.create_task(_sim_linear_replay())
-        return {
-            "status": "replaying",
-            "mode": "dry_run",
-            "workflow": "linear_replay",
-            "name": safe_name,
-            "episode": episode,
-            "frames": len(frames),
-            "fps": rec_fps,
-            "command": self.build_replay_cmd(dataset_name=safe_name, episode=episode, fps=fps),
-        }
+        raise WorkflowConflictError(
+            f"未找到模拟连续轨迹 '{safe_name}'，请先点击「开始连续示教」录制一段轨迹。",
+            code="TRAJECTORY_NOT_FOUND",
+        )
 
     async def stop_linear_replay(self) -> dict[str, Any]:
         if self._active_proc_id == "linear_replay":
@@ -1478,10 +1541,24 @@ class WorkflowManager:
             self._active_proc_id = None
         if self.active_workflow == "linear_replay":
             await self._cancel_background_task()
-            self.active_workflow = "idle"
-            self.state = "idle"
+            if self.hardware.active_mode == "real" and self.bridge.direction == "teleop_bidirectional":
+                self.active_workflow = "teleop"
+                self.state = "running"
+            else:
+                self.active_workflow = "idle"
+                self.state = "idle"
         self.log("Stopped linear replay.")
-        return {"status": "stopped", "workflow": "idle"}
+        return {"status": "stopped", "workflow": self.active_workflow}
+
+    def delete_linear_trajectory(self, *, name: str, episode: int = 0) -> dict[str, Any]:
+        safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.strip())
+        deleted = False
+        for is_real in (True, False):
+            p = self._linear_store_dir(is_real=is_real) / f"{safe_name}_ep{episode:04d}.json"
+            if p.exists():
+                p.unlink()
+                deleted = True
+        return {"status": "deleted" if deleted else "not_found", "name": safe_name, "episode": episode}
 
     # ------------------------------------------------------------------
     # Data Collection
@@ -1820,23 +1897,38 @@ class WorkflowManager:
                 f"当前正在运行 '{self.active_workflow}'（串口被占用），请先停止该任务再切换真机扭矩。",
                 code="WORKFLOW_BUSY",
             )
-        hw_ok, hw_msg = await asyncio.to_thread(
-            self.bridge.set_torque, enabled, is_real_mode=is_real
-        )
-        # In real mode, when disabling torque while idle, automatically start read-only real_to_sim
-        # so hand-guiding the limp arm immediately animates the 3D Studio for teaching & waypoint recording.
-        if is_real and not enabled and self.active_workflow == "idle" and self.bridge.direction == "off":
-            try:
-                await asyncio.to_thread(
-                    self.bridge.set_sync_mode,
-                    "real_to_sim",
-                    is_real_mode=True,
-                    safety_confirmed=False,
+        # Controller mode switch aligned with ros2_control architecture:
+        # - Torque OFF while idle -> FREEDRIVE (real_to_sim: torque disabled + always-on 30Hz state monitor)
+        # - Torque ON  while idle -> POSITION CONTROL (sim_to_real: zero-jump torque enable + UI drive + 30Hz monitor)
+        if is_real and self.active_workflow == "idle":
+            target_dir = "sim_to_real" if enabled else "real_to_sim"
+            if self.bridge.direction != target_dir and self.bridge.direction != "teleop_bidirectional":
+                try:
+                    await asyncio.to_thread(
+                        self.bridge.set_sync_mode,
+                        target_dir,
+                        is_real_mode=True,
+                        safety_confirmed=bool(enabled),
+                    )
+                    hw_ok = True
+                    hw_msg = (
+                        "已使能从臂扭矩并切入「电脑控从臂」驱动模式（零跳变锁位 + 30Hz 监听）"
+                        if enabled
+                        else "已释放扭矩并切入「自由示教」监听模式（手掰从臂 → 3D 实时跟随）"
+                    )
+                except Exception as exc:
+                    hw_ok, hw_msg = await asyncio.to_thread(
+                        self.bridge.set_torque, enabled, is_real_mode=is_real
+                    )
+                    hw_msg = f"{hw_msg}（自动切换同步模式失败: {exc}）"
+            else:
+                hw_ok, hw_msg = await asyncio.to_thread(
+                    self.bridge.set_torque, enabled, is_real_mode=is_real
                 )
-                hw_ok = True
-                hw_msg = f"{hw_msg}（已自动开启真机→3D实时跟随，可直接手掰示教）"
-            except Exception:
-                pass
+        else:
+            hw_ok, hw_msg = await asyncio.to_thread(
+                self.bridge.set_torque, enabled, is_real_mode=is_real
+            )
         self.simulator.torque_enabled = bool(enabled)
         self._notify_motion()
         self.log(f"[SAFETY] Torque {'enabled' if enabled else 'disabled'}: {hw_msg}")

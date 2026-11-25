@@ -46,7 +46,7 @@ class SO101RealBridge:
         self._poll_thread: threading.Thread | None = None
         self._poll_interval_s: float = 0.033
         self._stop_event = threading.Event()
-        self._ui_override_until: float = 0.0
+        self._ui_control_latched: bool = False
         self._last_leader_deg: dict[str, float] | None = None
         self.last_error: str | None = None
         self.connected_follower: bool = False
@@ -77,6 +77,8 @@ class SO101RealBridge:
             self.direction = "off"
             self.connected_follower = False
             self.connected_leader = False
+            self.simulator.real_leader_active = False
+            self.simulator.clear_follower_cmd_target()
 
         if api is not None:
             try:
@@ -231,12 +233,13 @@ class SO101RealBridge:
                 self._api = api
                 self.direction = "teleop_bidirectional"
                 self._poll_interval_s = max(0.02, min(0.05, 1.0 / max(1, fps)))
-                self._ui_override_until = 0.0
+                self._ui_control_latched = False
                 self._last_leader_deg = None
                 self.connected_follower = True
                 self.connected_leader = bool(
                     want_leader and leader_arm is not None and leader_arm.is_connected
                 )
+                self.simulator.real_leader_active = self.connected_leader
                 self.last_error = None
                 self._stop_event.clear()
 
@@ -298,17 +301,18 @@ class SO101RealBridge:
                 from core.data_types import SystemState
 
                 cur_state = getattr(getattr(api, "state_machine", None), "current_state", None)
-                if cur_state not in (SystemState.IDLE, SystemState.ESTOP_LATCHED, SystemState.ERROR, SystemState.DISCONNECTED):
-                    if leader_delta > 1.5:
-                        self._ui_override_until = 0.0  # Human moved real leader -> reclaim immediately
-                    if now >= self._ui_override_until:
+                if cur_state not in (SystemState.IDLE, SystemState.ESTOP_LATCHED, SystemState.FAULT, SystemState.DISCONNECTED):
+                    if leader_delta > 2.5:
+                        self._ui_control_latched = False  # Human actually moved real leader -> reclaim control
+                        self.simulator.clear_follower_cmd_target()
+                    if not self._ui_control_latched:
                         self._submit_follower_deg_unlocked(api, l_deg)
 
         obs = api.get_observation()
         f_state = getattr(obs, "joint_state", None) if obs is not None else None
         if f_state is not None and getattr(f_state, "positions", None):
             f_deg = self._positions_to_studio_deg(f_state.positions, f_state.unit)
-            self.simulator.set_follower_joints(f_deg)
+            self.simulator.set_follower_joints(f_deg, from_real_feedback=True)
             moved = True
 
         if moved and self._on_motion is not None:
@@ -359,7 +363,7 @@ class SO101RealBridge:
             if self.direction not in ("sim_to_real", "teleop_bidirectional") or self._api is None:
                 return False
             api = self._api
-            self._ui_override_until = time.monotonic() + 0.85
+            self._ui_control_latched = True
         return self._submit_follower_deg_unlocked(api, joints_deg)
 
     def trigger_estop(self, reason: str = "Web Studio E-Stop") -> None:
