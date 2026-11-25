@@ -380,15 +380,15 @@ class SO101RealBridge:
             self._leader_torque_enabled = False
         if api is None:
             return
-        leader_arm = getattr(getattr(api, "hardware", None), "leader", None)
-        if leader_arm is not None and getattr(leader_arm, "is_connected", False):
+        hw = getattr(api, "hardware", None)
+        if hw is not None and hasattr(hw, "disable_leader_torque"):
             try:
-                leader_arm.disable_torque()
+                hw.disable_leader_torque()
             except Exception:
                 pass
 
     def send_leader_target_deg(self, joints_deg: dict[str, float]) -> bool:
-        """Drive physical Leader STS3215 servos directly (reuses official SO101Leader.send_feedback)."""
+        """Drive physical Leader STS3215 servos through RobotSystemAdapter.send_leader_target_deg."""
         with self._lock:
             if (
                 self.direction not in ("sim_to_real", "teleop_bidirectional")
@@ -399,31 +399,17 @@ class SO101RealBridge:
             ):
                 return False
             api = self._api
-            need_enable = not self._leader_torque_enabled
-        leader_arm = getattr(getattr(api, "hardware", None), "leader", None)
-        if leader_arm is None or not getattr(leader_arm, "is_connected", False):
+        hw = getattr(api, "hardware", None)
+        if hw is None or not hasattr(hw, "send_leader_target_deg"):
             return False
-        try:
-            if need_enable:
-                # Zero-jump torque enable: hold current encoder positions first, then enable torque
-                cur_action = leader_arm.get_action()
-                if cur_action:
-                    leader_arm.send_feedback(cur_action)
-                leader_arm.enable_torque()
-                with self._lock:
-                    self._leader_torque_enabled = True
-            feedback = {
-                f"{k}.pos": float(joints_deg[k])
-                for k in JOINT_NAMES
-                if k in joints_deg
-            }
-            if feedback:
-                leader_arm.send_feedback(feedback)
-            return True
-        except Exception as exc:
+        ok = bool(hw.send_leader_target_deg(joints_deg))
+        if ok:
             with self._lock:
-                self.last_error = f"主臂舵机写入失败: {exc}"
-            return False
+                self._leader_torque_enabled = True
+        else:
+            with self._lock:
+                self.last_error = "主臂舵机目标写入失败"
+        return ok
 
     def trigger_estop(self, reason: str = "Web Studio E-Stop") -> None:
         self.disable_leader_torque()

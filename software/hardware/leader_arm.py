@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any
 
@@ -34,6 +35,8 @@ class SO101LeaderArm(BaseArmAdapter):
     def __init__(self, config: ArmConfig) -> None:
         super().__init__(config)
         self._leader: Any = None
+        self._bus_lock = threading.RLock()
+        self._torque_enabled: bool = False
 
     def connect(self) -> None:
         """连接示教主臂. 强制释放扭矩以便人工顺应拖拽."""
@@ -126,10 +129,11 @@ class SO101LeaderArm(BaseArmAdapter):
         t0 = time.perf_counter()
         try:
             # 尝试调用 teleoperator 的 get_action 或 robot 的 get_observation
-            if hasattr(self._leader, "get_action"):
-                obs = self._leader.get_action()
-            else:
-                obs = self._leader.get_observation()
+            with self._bus_lock:
+                if hasattr(self._leader, "get_action"):
+                    obs = self._leader.get_action()
+                else:
+                    obs = self._leader.get_observation()
             latency_ms = (time.perf_counter() - t0) * 1000.0
             self._record_read_latency(latency_ms)
         except Exception as exc:
@@ -167,10 +171,78 @@ class SO101LeaderArm(BaseArmAdapter):
             timestamp=timestamp,
             positions=converted_pos,
             unit=final_unit,
-            torques_enabled={k: False for k in converted_pos},
+            torques_enabled={k: getattr(self, "_torque_enabled", False) for k in converted_pos},
             gripper_unit=JointUnit.RANGE_0_100,
         )
         return state
+
+    def enable_torque(self) -> bool:
+        """平稳使能主臂全部舵机扭矩（配置与从臂一致的 PID 与夹爪限流保护 + 零跳变锁位）."""
+        if not self.is_connected or self._leader is None or not hasattr(self._leader, "bus"):
+            return False
+        with self._bus_lock:
+            try:
+                bus = self._leader.bus
+                try:
+                    for motor in bus.motors:
+                        bus.write("P_Coefficient", motor, 16)
+                        bus.write("I_Coefficient", motor, 0)
+                        bus.write("D_Coefficient", motor, 32)
+                        if motor == SO101_GRIPPER_JOINT_NAME:
+                            bus.write("Max_Torque_Limit", motor, 500)
+                            bus.write("Protection_Current", motor, 250)
+                            bus.write("Overload_Torque", motor, 25)
+                except Exception as cfg_exc:
+                    logger.debug("[%s] 配置主臂 PID/限流寄存器跳过: %s", self.config.robot_id, cfg_exc)
+                present = bus.sync_read("Present_Position", normalize=False)
+                bus.sync_write("Goal_Position", present, normalize=False)
+                bus.enable_torque()
+                self._torque_enabled = True
+                logger.info("[%s] 主臂舵机扭矩已零跳变平稳使能", self.config.robot_id)
+                return True
+            except Exception as exc:
+                logger.warning("[%s] 使能主臂舵机扭矩失败: %s", self.config.robot_id, exc)
+                return False
+
+    def disable_torque(self) -> bool:
+        """释放主臂全部舵机扭矩，恢复手掰遥操作模式."""
+        if not self.is_connected or self._leader is None or not hasattr(self._leader, "bus"):
+            self._torque_enabled = False
+            return False
+        with self._bus_lock:
+            try:
+                self._leader.bus.disable_torque()
+                self._torque_enabled = False
+                logger.info("[%s] 主臂舵机扭矩已释放（恢复手掰模式）", self.config.robot_id)
+                return True
+            except Exception as exc:
+                logger.warning("[%s] 释放主臂扭矩失败: %s", self.config.robot_id, exc)
+                return False
+
+    def send_target_deg(self, targets_deg: dict[str, float]) -> bool:
+        """像驱动从臂一样直接向主臂 6 轴下发角度/夹爪目标 (度 / 0..100%)."""
+        if not self.is_connected or self._leader is None or not hasattr(self._leader, "bus"):
+            return False
+        offsets = getattr(self.config, "joint_offsets_deg", None) or {}
+        goals: dict[str, float] = {}
+        for k, val in targets_deg.items():
+            fv = float(val)
+            if k == SO101_GRIPPER_JOINT_NAME:
+                goals[k] = max(0.0, min(100.0, fv))
+            else:
+                goals[k] = fv - float(offsets.get(k, 0.0))
+        if not goals:
+            return False
+        with self._bus_lock:
+            try:
+                if not getattr(self, "_torque_enabled", False):
+                    if not self.enable_torque():
+                        return False
+                self._leader.bus.sync_write("Goal_Position", goals)
+                return True
+            except Exception as exc:
+                logger.error("[%s] 主臂目标位置下发失败: %s", self.config.robot_id, exc)
+                return False
 
     def read_action(self) -> RobotAction:
         """从主臂生成当前的示教动作意图 (可以直接下发给从臂)."""
