@@ -56,7 +56,7 @@ function syncTwinIkMutex() {
     leaderView?.setIkEnabled(true);
     followerView?.setIkEnabled(false);
   } else {
-    leaderView?.setIkEnabled(false);
+    leaderView?.setIkEnabled(true);
     followerView?.setIkEnabled(true);
   }
 

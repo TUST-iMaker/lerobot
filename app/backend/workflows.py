@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import re
+import shutil
 import sys
 import threading
 import time
@@ -69,6 +70,7 @@ class _PersistentCameraHub:
                     "stop_ev": stop_ev,
                     "ready_ev": ready_ev,
                     "latest_jpeg": None,
+                    "latest_rgb": None,
                     "last_access": now,
                     "failed": False,
                 }
@@ -87,6 +89,12 @@ class _PersistentCameraHub:
         if worker["latest_jpeg"] is None and not worker["failed"]:
             worker["ready_ev"].wait(timeout=1.5)
         return worker["latest_jpeg"]
+
+    def get_latest_rgb(self, index_or_path: int | str) -> Any:
+        self.get_frame(index_or_path)
+        with self._lock:
+            worker = self._workers.get(str(index_or_path))
+            return worker.get("latest_rgb") if worker else None
 
     def _capture_loop(self, worker: dict[str, Any]) -> None:
         cap = None
@@ -118,6 +126,14 @@ class _PersistentCameraHub:
                     break
                 ok, frame = cap.read()
                 if ok and frame is not None:
+                    try:
+                        if frame.shape[0] != 480 or frame.shape[1] != 640:
+                            frame_std = cv2.resize(frame, (640, 480))
+                        else:
+                            frame_std = frame
+                        worker["latest_rgb"] = cv2.cvtColor(frame_std, cv2.COLOR_BGR2RGB)
+                    except Exception:
+                        pass
                     enc_ok, buf = cv2.imencode(".jpg", frame, encode_params)
                     if enc_ok:
                         worker["latest_jpeg"] = bytes(buf)
@@ -167,7 +183,7 @@ class WorkflowManager:
         self.simulator = simulator
         self.process_registry = process_registry
         self.bridge = SO101RealBridge(config, simulator, on_motion=self._notify_motion)
-        self._camera_hub = _PersistentCameraHub(idle_timeout_s=3.0)
+        self._camera_hub = _PersistentCameraHub(idle_timeout_s=15.0)
 
         self.active_workflow: WorkflowName = "idle"
         self.state: str = "idle"
@@ -180,6 +196,11 @@ class WorkflowManager:
         self._task: asyncio.Task[None] | None = None
         self._active_proc_id: str | None = None
         self._collect_ctx: dict[str, Any] | None = None
+        self._linear_teach_ctx: dict[str, Any] | None = None
+        self._collect_stage: str = "idle"
+        self._collect_stage_text: str = ""
+        self._collect_action_ev: asyncio.Event | None = None
+        self._collect_action_cmd: str | None = None
         self._dry_cal_queue: asyncio.Queue[str] | None = None
         self._cal_state: dict[str, Any] = self._empty_cal_state()
         self._waypoints: list[dict[str, Any]] = []
@@ -205,7 +226,6 @@ class WorkflowManager:
             "live_table": {},
             "saved_path": None,
         }
-        self._linear_teach_ctx: dict[str, Any] | None = None
 
     def get_calibration_snapshot(self) -> dict[str, Any]:
         table_rows = [
@@ -289,6 +309,8 @@ class WorkflowManager:
             "calibrate_active": self.active_workflow == "calibrate",
             "teaching_replaying": self.active_workflow == "teaching_replay",
             "collect_active": self.active_workflow == "collect",
+            "collect_stage": self._collect_stage,
+            "collect_stage_text": self._collect_stage_text,
             "current_episode": self.current_episode,
             "target_episodes": self.target_episodes,
             "current_step": self.current_step,
@@ -893,6 +915,24 @@ class WorkflowManager:
             return {"status": "sent", "value": cleaned}
         raise WorkflowConflictError("Dry-run calibration queue unavailable.", code="CALIBRATE_NOT_ACTIVE")
 
+    async def resume_real_monitor_if_idle(self) -> None:
+        """In real mode while idle, keep 30Hz passive real_to_sim monitor alive (torque OFF, 3D live)."""
+        if self.hardware.active_mode != "real" or self.active_workflow != "idle":
+            return
+        if self.bridge.direction == "real_to_sim":
+            return
+        try:
+            await asyncio.to_thread(
+                self.bridge.set_sync_mode,
+                "real_to_sim",
+                is_real_mode=True,
+                safety_confirmed=False,
+            )
+            self.simulator.torque_enabled = False
+            self._notify_motion()
+        except Exception as exc:
+            self.log(f"[BRIDGE] Auto-resume real_to_sim monitor skipped: {exc}")
+
     async def stop_calibrate(self) -> dict[str, Any]:
         if self.active_workflow == "calibrate":
             # Close stdin pipe first so calibrate_runner catches EOFError and runs device.disconnect()
@@ -917,6 +957,7 @@ class WorkflowManager:
             self._cal_state["waiting_for_input"] = False
             self._cal_state["stage"] = "stopped"
             self._cal_state["prompt"] = "标定已停止（已释放舵机扭矩）。"
+            await self.resume_real_monitor_if_idle()
             self.log("Calibration stopped.")
         return {"status": "stopped", "workflow": "calibrate"}
 
@@ -932,6 +973,8 @@ class WorkflowManager:
         display_data: bool = False,
         use_cameras: bool = False,
     ) -> dict[str, Any]:
+        if self.simulator.estop_latched:
+            raise WorkflowConflictError("急停已锁定 (E-STOP)，请先解除急停再启动遥操作。", code="ESTOP_LATCHED")
         self._sync_process_state()
         await self._ensure_idle()
         self.last_error = None
@@ -994,15 +1037,13 @@ class WorkflowManager:
 
     async def stop_teleop(self) -> dict[str, Any]:
         if self.active_workflow == "teleop":
-            if self.bridge.direction == "teleop_bidirectional":
-                await asyncio.to_thread(
-                    self.bridge.disconnect, return_to_rest=False, keep_torque=False
-                )
             self._stop_active_process()
             await self._cancel_background_task()
             self.active_workflow = "idle"
             self.state = "idle"
-            self.log("Teleoperation stopped (servo torque safely released).")
+            if self.hardware.active_mode == "real":
+                await self.resume_real_monitor_if_idle()
+            self.log("Teleoperation stopped (servo torque released, 3D monitor active).")
         return {"status": "stopped", "workflow": "teleop"}
 
     def update_teleop_joints(self, raw_joints: dict[str, Any]) -> dict[str, Any]:
@@ -1298,6 +1339,8 @@ class WorkflowManager:
         duration_s: float = 30.0,
         fps: int = 30,
     ) -> dict[str, Any]:
+        if self.simulator.estop_latched:
+            raise WorkflowConflictError("急停已锁定 (E-STOP)，请先解除急停再开始连续示教。", code="ESTOP_LATCHED")
         self._sync_process_state()
         safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.strip() or "demo_linear_01")
         is_real = self.hardware.active_mode == "real"
@@ -1592,25 +1635,68 @@ class WorkflowManager:
         ctx["saved_episodes"] = int(ctx.get("saved_episodes", 0)) + 1
         return int(ctx["saved_episodes"])
 
+    def _resolve_active_cameras_for_collect(self) -> list[tuple[str, int | str]]:
+        """Return configured & available (logical_name, index_or_path) cameras for in-process collection."""
+        out: list[tuple[str, int | str]] = []
+        probe_cams = self.hardware.last_probe.get("cameras", [])
+        for logical, configured_raw in (
+            ("front", self.config.front_camera_id),
+            ("wrist", self.config.wrist_camera_id),
+        ):
+            if configured_raw is not None and configured_raw.lower() == "none":
+                continue
+            for cam in probe_cams:
+                if not cam.get("available"):
+                    continue
+                cam_raw = str(cam.get("raw_id", cam.get("index_or_path", "")))
+                matched = (
+                    cam_raw == configured_raw
+                    if configured_raw is not None
+                    else str(cam.get("id")) == logical
+                )
+                if matched:
+                    out.append((logical, cam["index_or_path"]))
+                    break
+        return out
+
+    def collect_episode_action(
+        self, action: Literal["next", "rerecord", "stop"]
+    ) -> dict[str, Any]:
+        if self.active_workflow != "collect":
+            raise WorkflowConflictError("当前未在执行数据采集。", code="NOT_COLLECTING")
+        self._collect_action_cmd = action
+        if self._collect_action_ev is not None:
+            self._collect_action_ev.set()
+        self.log(f"[COLLECT] Episode action triggered: {action}")
+        return {"status": "ok", "action": action, "collect_stage": self._collect_stage}
+
     async def start_collect(
         self,
         *,
         dataset_name: str,
         single_task: str,
         num_episodes: int = 2,
-        episode_time_s: float = 5.0,
-        reset_time_s: float = 1.0,
+        episode_time_s: float = 30.0,
+        reset_time_s: float = 3.0,
         fps: int = 30,
         push_to_hub: bool = False,
     ) -> dict[str, Any]:
+        if self.simulator.estop_latched:
+            raise WorkflowConflictError("急停已锁定 (E-STOP)，请先解除急停再开始数据采集。", code="ESTOP_LATCHED")
         self._sync_process_state()
         await self._ensure_idle()
         self.last_error = None
+        self._collect_action_ev = asyncio.Event()
+        self._collect_action_cmd = None
 
         if self.hardware.active_mode == "real":
-            self.bridge.disconnect(return_to_rest=False, keep_torque=False)
+            # In-process official LeRobotDataset v3.0 recorder on top of live 30Hz SO101RealBridge + CameraHub.
+            # Instant (~0.2s) start, never disconnects 3D viewport or USB cameras, 100% official Parquet + MP4 format.
+            safe_ds = re.sub(r"[^a-zA-Z0-9_\-]", "_", dataset_name.strip()) or "so101_dataset"
+            out_dir = self.config.datasets_dir / safe_ds
+            self.config.datasets_dir.mkdir(parents=True, exist_ok=True)
             cmd = self.build_record_cmd(
-                dataset_name=dataset_name,
+                dataset_name=safe_ds,
                 single_task=single_task,
                 num_episodes=num_episodes,
                 episode_time_s=episode_time_s,
@@ -1618,24 +1704,252 @@ class WorkflowManager:
                 fps=fps,
                 push_to_hub=push_to_hub,
             )
-            proc_id = "workflow_collect"
-            self.process_registry.spawn(
-                proc_id, "lerobot_record", cmd, cwd=self.config.workspace_root, on_line=self.log
-            )
-            self._active_proc_id = proc_id
+
             self.active_workflow = "collect"
             self.state = "running"
             self.current_episode = 0
             self.target_episodes = num_episodes
-            out_dir = self.config.datasets_dir / dataset_name
-            self.log(f"Started real data collection -> {out_dir}")
+            self.current_step = 0
+            self._collect_stage = "preparing"
+            self._collect_stage_text = "正在开启双臂遥操作并初始化 LeRobotDataset v3.0..."
+            self._notify_motion()
+
+            try:
+                await asyncio.to_thread(self.bridge.start_bidirectional_teleop, fps=fps)
+                with self.bridge._lock:
+                    self.bridge._ui_control_latched = False
+                self.simulator.clear_follower_cmd_target()
+            except Exception as exc:
+                self.active_workflow = "idle"
+                self.state = "idle"
+                self._collect_stage = "idle"
+                self._collect_stage_text = ""
+                self.last_error = f"开启双臂遥操作失败: {exc}"
+                raise WorkflowConflictError(self.last_error, code="BRIDGE_ERROR") from exc
+
+            active_cams = self._resolve_active_cameras_for_collect()
+            for _, cam_idx in active_cams:
+                self._camera_hub.get_frame(cam_idx)
+
+            def _init_dataset() -> Any:
+                from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+                repo_id = f"local/{safe_ds}"
+                info_json = out_dir / "meta" / "info.json"
+                if out_dir.exists() and not info_json.is_file():
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                if info_json.is_file():
+                    return LeRobotDataset.resume(
+                        repo_id=repo_id,
+                        root=out_dir,
+                        streaming_encoding=True,
+                    )
+                joint_feat_names = [f"{j}.pos" for j in JOINT_NAMES]
+                features: dict[str, dict[str, Any]] = {
+                    "observation.state": {
+                        "dtype": "float32",
+                        "shape": (6,),
+                        "names": joint_feat_names,
+                    },
+                    "action": {
+                        "dtype": "float32",
+                        "shape": (6,),
+                        "names": joint_feat_names,
+                    },
+                }
+                for cam_name, _ in active_cams:
+                    features[f"observation.images.{cam_name}"] = {
+                        "dtype": "video",
+                        "shape": (480, 640, 3),
+                        "names": ["height", "width", "channels"],
+                    }
+                return LeRobotDataset.create(
+                    repo_id=repo_id,
+                    fps=fps,
+                    features=features,
+                    root=out_dir,
+                    robot_type="so101_follower",
+                    use_videos=bool(active_cams),
+                    streaming_encoding=True,
+                )
+
+            try:
+                dataset = await asyncio.to_thread(_init_dataset)
+            except Exception as exc:
+                self.active_workflow = "idle"
+                self.state = "idle"
+                self._collect_stage = "idle"
+                self._collect_stage_text = ""
+                self.last_error = f"初始化 LeRobotDataset v3.0 失败: {exc}"
+                self.log(self.last_error)
+                raise WorkflowConflictError(self.last_error, code="DATASET_INIT_ERROR") from exc
+
+            self._collect_ctx = {
+                "mode": "real",
+                "dataset_name": safe_ds,
+                "single_task": single_task,
+                "fps": fps,
+                "saved_episodes": 0,
+            }
+            self.log(
+                f"Started in-process LeRobotDataset v3.0 collection -> {out_dir} "
+                f"(cams={[c[0] for c in active_cams]}, {num_episodes} eps @ {fps}Hz)"
+            )
+
+            async def _real_collect() -> None:
+                import numpy as np
+
+                period = 1.0 / max(1, fps)
+                stop_all = False
+                try:
+                    for ep_num in range(1, num_episodes + 1):
+                        if stop_all:
+                            break
+                        while True:
+                            self.current_episode = ep_num
+                            self._collect_stage = "recording_ep"
+                            self._collect_stage_text = (
+                                f"正在录制第 {ep_num}/{num_episodes} 条 · 摆动主臂即可录制"
+                                f"（点「完成本条」或按 → 提前结束）"
+                            )
+                            self._collect_action_cmd = None
+                            if self._collect_action_ev is not None:
+                                self._collect_action_ev.clear()
+
+                            ep_frames = 0
+                            t_ep_start = time.monotonic()
+                            unlimited = episode_time_s <= 0
+                            while unlimited or (time.monotonic() - t_ep_start) < episode_time_s:
+                                if self._collect_action_ev is not None and self._collect_action_ev.is_set():
+                                    break
+                                t_tick = time.monotonic()
+                                elapsed_ep = t_tick - t_ep_start
+                                if ep_frames % max(1, fps // 3) == 0:
+                                    if unlimited:
+                                        self._collect_stage_text = (
+                                            f"录制第 {ep_num}/{num_episodes} 条 · 已录 {elapsed_ep:.1f}s（手动模式，按 → 完成本条）"
+                                        )
+                                    else:
+                                        rem_ep = max(0.0, episode_time_s - elapsed_ep)
+                                        self._collect_stage_text = (
+                                            f"录制第 {ep_num}/{num_episodes} 条 · 剩余 {rem_ep:.1f}s/{episode_time_s:.0f}s（按 → 提前完成）"
+                                        )
+                                leader, follower, _ = self.simulator.snapshot()
+                                frame: dict[str, Any] = {
+                                    "observation.state": np.array(
+                                        [float(follower[j]) for j in JOINT_NAMES],
+                                        dtype=np.float32,
+                                    ),
+                                    "action": np.array(
+                                        [float(leader[j]) for j in JOINT_NAMES],
+                                        dtype=np.float32,
+                                    ),
+                                    "task": single_task,
+                                }
+                                for cam_name, cam_idx in active_cams:
+                                    rgb = self._camera_hub.get_latest_rgb(cam_idx)
+                                    if rgb is None:
+                                        rgb = np.zeros((480, 640, 3), dtype=np.uint8)
+                                    frame[f"observation.images.{cam_name}"] = rgb
+                                await asyncio.to_thread(dataset.add_frame, frame)
+                                ep_frames += 1
+                                self.current_step += 1
+                                rem = period - (time.monotonic() - t_tick)
+                                if rem > 0.002:
+                                    await asyncio.sleep(rem)
+                                else:
+                                    await asyncio.sleep(0)
+
+                            cmd_act = self._collect_action_cmd
+                            self._collect_action_cmd = None
+                            if self._collect_action_ev is not None:
+                                self._collect_action_ev.clear()
+
+                            if cmd_act == "rerecord":
+                                self._collect_stage = "resetting"
+                                self._collect_stage_text = f"已丢弃第 {ep_num} 条，准备重录..."
+                                await asyncio.to_thread(
+                                    dataset.clear_episode_buffer, delete_images=True
+                                )
+                                self.log(f"[COLLECT] Discarded ep {ep_num}, re-recording...")
+                                await asyncio.sleep(0.25)
+                                continue
+
+                            if ep_frames > 0:
+                                self._collect_stage = "saving"
+                                self._collect_stage_text = (
+                                    f"正在保存第 {ep_num}/{num_episodes} 条 ({ep_frames} 帧 Parquet+MP4)..."
+                                )
+                                await asyncio.to_thread(dataset.save_episode)
+                                if self._collect_ctx is not None:
+                                    self._collect_ctx["saved_episodes"] = (
+                                        int(self._collect_ctx.get("saved_episodes", 0)) + 1
+                                    )
+                                self.log(
+                                    f"[COLLECT] Saved episode {ep_num}/{num_episodes} "
+                                    f"({ep_frames} frames) -> {safe_ds}"
+                                )
+                            else:
+                                await asyncio.to_thread(
+                                    dataset.clear_episode_buffer, delete_images=True
+                                )
+
+                            if cmd_act == "stop":
+                                stop_all = True
+                            break
+
+                        if not stop_all and ep_num < num_episodes and reset_time_s > 0:
+                            self._collect_stage = "resetting"
+                            t_rst = time.monotonic()
+                            while (time.monotonic() - t_rst) < reset_time_s:
+                                rem_s = max(0.0, reset_time_s - (time.monotonic() - t_rst))
+                                self._collect_stage_text = (
+                                    f"复位间隔 {rem_s:.1f}s（准备第 {ep_num + 1}/{num_episodes} 条，按 → 跳过）"
+                                )
+                                if self._collect_action_ev is not None and self._collect_action_ev.is_set():
+                                    if self._collect_action_cmd == "stop":
+                                        stop_all = True
+                                    self._collect_action_cmd = None
+                                    self._collect_action_ev.clear()
+                                    break
+                                await asyncio.sleep(0.1)
+
+                    self._collect_stage = "completed"
+                    self._collect_stage_text = f"采集完成：{safe_ds}（已落盘标准 LeRobotDataset v3.0）"
+                except asyncio.CancelledError:
+                    try:
+                        if getattr(dataset, "episode_buffer", None) and dataset.episode_buffer.get("size", 0) > 0:
+                            await asyncio.to_thread(dataset.save_episode)
+                    except Exception:
+                        pass
+                    self.log("[COLLECT] Real collection cancelled & flushed.")
+                    raise
+                except Exception as exc:
+                    self.last_error = f"实时采集异常: {exc}"
+                    self._collect_stage = "idle"
+                    self._collect_stage_text = self.last_error
+                    self.log(self.last_error)
+                finally:
+                    try:
+                        await asyncio.to_thread(dataset.finalize)
+                    except Exception as fin_exc:
+                        self.log(f"[COLLECT] finalize note: {fin_exc}")
+                    if self.active_workflow == "collect":
+                        self.active_workflow = "idle"
+                        self.state = "idle"
+                        if self._collect_stage != "completed":
+                            self._collect_stage = "idle"
+                    await self.resume_real_monitor_if_idle()
+
+            self._task = asyncio.create_task(_real_collect())
             return {
                 "status": "started",
                 "workflow": "collect",
                 "mode": "real",
-                "dataset_name": dataset_name,
+                "dataset_name": safe_ds,
                 "output_dir": str(out_dir),
                 "command": cmd,
+                "in_process": True,
             }
 
         ds_dir = self.config.dry_run_dir / "datasets" / dataset_name
@@ -1676,53 +1990,85 @@ class WorkflowManager:
         self.current_episode = 0
         self.target_episodes = num_episodes
         self.current_step = 0
+        self._collect_stage = "recording_ep"
+        self._collect_stage_text = f"[DRY-RUN] 正在录制 {dataset_name} (0/{num_episodes})"
         self.log(
             f"Started dry_run collection '{dataset_name}' ({num_episodes} episodes @ {fps} FPS)."
         )
 
         async def _sim_collect() -> None:
             tick = max(0.03, min(0.1, 1.0 / max(1, fps)))
-            frames_per_ep = max(6, min(60, int(episode_time_s * 5)))
+            unlimited = episode_time_s <= 0
+            frames_per_ep = 100000 if unlimited else max(6, min(60, int(episode_time_s * 5)))
             self.simulator.set_linked_arms(True)
+            stop_all = False
             try:
                 for ep_num in range(1, num_episodes + 1):
-                    self.current_episode = ep_num
-                    for frame_i in range(frames_per_ep):
-                        progress = frame_i / max(1, frames_per_ep - 1)
-                        wave = math.sin(progress * math.pi)
-                        pan = round(-24.0 + 52.0 * progress, 2)
-                        lift = round(30.0 * wave, 2)
-                        elbow = round(26.0 * wave, 2)
-                        wrist = round(-44.0 * wave, 2)
-                        grip = 72.0 if progress < 0.35 or progress > 0.82 else 14.0
-                        target_pose = {
-                            "shoulder_pan": pan,
-                            "shoulder_lift": lift,
-                            "elbow_flex": elbow,
-                            "wrist_flex": wrist,
-                            "wrist_roll": round(15.0 * math.sin(progress * math.pi * 2), 2),
-                            "gripper": grip,
-                        }
-                        self.simulator.set_leader_joints(target_pose, step_immediately=False)
-                        self.simulator.step(max(0.08, tick))
-                        leader, follower, _ = self.simulator.snapshot()
-                        if self._collect_ctx is not None:
-                            self._collect_ctx["frames"].append(
-                                {
-                                    "frame_index": frame_i,
-                                    "timestamp": round(frame_i / max(1, fps), 4),
-                                    "observation.state": [follower[j] for j in JOINT_NAMES],
-                                    "action": [leader[j] for j in JOINT_NAMES],
-                                }
-                            )
-                        self.current_step += 1
-                        await asyncio.sleep(tick)
-                    saved = self._flush_dry_run_episode()
-                    self.log(
-                        f"[dry_run] Saved episode {ep_num}/{num_episodes} to {dataset_name} (total={saved})."
-                    )
-                    if ep_num < num_episodes:
+                    if stop_all:
+                        break
+                    while True:
+                        self.current_episode = ep_num
+                        self._collect_stage = "recording_ep"
+                        self._collect_stage_text = (
+                            f"[DRY-RUN] 正在录制第 {ep_num}/{num_episodes} 条"
+                            + ("（手动不限时，按 → 完成本条）" if unlimited else "...")
+                        )
+                        self._collect_action_cmd = None
+                        if self._collect_action_ev is not None:
+                            self._collect_action_ev.clear()
+                        for frame_i in range(frames_per_ep):
+                            if self._collect_action_ev is not None and self._collect_action_ev.is_set():
+                                break
+                            cycle_len = 60 if unlimited else max(1, frames_per_ep - 1)
+                            progress = (frame_i % cycle_len) / cycle_len
+                            wave = math.sin(progress * math.pi)
+                            pan = round(-24.0 + 52.0 * progress, 2)
+                            lift = round(30.0 * wave, 2)
+                            elbow = round(26.0 * wave, 2)
+                            wrist = round(-44.0 * wave, 2)
+                            grip = 72.0 if progress < 0.35 or progress > 0.82 else 14.0
+                            target_pose = {
+                                "shoulder_pan": pan,
+                                "shoulder_lift": lift,
+                                "elbow_flex": elbow,
+                                "wrist_flex": wrist,
+                                "wrist_roll": round(15.0 * math.sin(progress * math.pi * 2), 2),
+                                "gripper": grip,
+                            }
+                            self.simulator.set_leader_joints(target_pose, step_immediately=False)
+                            self.simulator.step(max(0.08, tick))
+                            leader, follower, _ = self.simulator.snapshot()
+                            if self._collect_ctx is not None:
+                                self._collect_ctx["frames"].append(
+                                    {
+                                        "frame_index": frame_i,
+                                        "timestamp": round(frame_i / max(1, fps), 4),
+                                        "observation.state": [follower[j] for j in JOINT_NAMES],
+                                        "action": [leader[j] for j in JOINT_NAMES],
+                                    }
+                                )
+                            self.current_step += 1
+                            await asyncio.sleep(tick)
+                        cmd_act = self._collect_action_cmd
+                        self._collect_action_cmd = None
+                        if self._collect_action_ev is not None:
+                            self._collect_action_ev.clear()
+                        if cmd_act == "rerecord":
+                            if self._collect_ctx is not None:
+                                self._collect_ctx["frames"] = []
+                            continue
+                        saved = self._flush_dry_run_episode()
+                        self.log(
+                            f"[dry_run] Saved episode {ep_num}/{num_episodes} to {dataset_name} (total={saved})."
+                        )
+                        if cmd_act == "stop":
+                            stop_all = True
+                        break
+                    if not stop_all and ep_num < num_episodes:
+                        self._collect_stage = "resetting"
                         await asyncio.sleep(min(0.3, reset_time_s))
+                self._collect_stage = "completed"
+                self._collect_stage_text = f"[DRY-RUN] 采集完成：{dataset_name}"
             except asyncio.CancelledError:
                 self._flush_dry_run_episode()
                 self.log("[dry_run] Collection stopped and flushed.")
@@ -1731,6 +2077,8 @@ class WorkflowManager:
                 if self.active_workflow == "collect":
                     self.active_workflow = "idle"
                     self.state = "idle"
+                    if self._collect_stage != "completed":
+                        self._collect_stage = "idle"
 
         self._task = asyncio.create_task(_sim_collect())
         try:
@@ -1748,12 +2096,19 @@ class WorkflowManager:
     async def stop_collect(self) -> dict[str, Any]:
         saved_episodes = 0
         if self.active_workflow == "collect":
+            ctx = self._collect_ctx
             self._stop_active_process()
             await self._cancel_background_task()
-            saved_episodes = self._flush_dry_run_episode()
+            if ctx is not None and ctx.get("mode") == "real":
+                saved_episodes = int(ctx.get("saved_episodes", 0))
+            else:
+                saved_episodes = self._flush_dry_run_episode()
             self._collect_ctx = None
             self.active_workflow = "idle"
             self.state = "idle"
+            self._collect_stage = "idle"
+            self._collect_stage_text = ""
+            await self.resume_real_monitor_if_idle()
             self.log(f"Data collection stopped (saved={saved_episodes}).")
         return {
             "status": "stopped",
@@ -1763,6 +2118,73 @@ class WorkflowManager:
 
     def list_episodes(self) -> dict[str, Any]:
         episodes: list[dict[str, Any]] = []
+        # 1. Real official LeRobotDataset v3.0 folders under data/datasets/<name>/
+        if self.config.datasets_dir.exists():
+            for ds_dir in sorted(self.config.datasets_dir.iterdir()):
+                if not ds_dir.is_dir() or ds_dir.name == "linear_teach":
+                    continue
+                info_p = ds_dir / "meta" / "info.json"
+                if not info_p.is_file():
+                    continue
+                try:
+                    info = json.loads(info_p.read_text(encoding="utf-8"))
+                    fps = int(info.get("fps", 30))
+                    total_eps = int(info.get("total_episodes", 0))
+                    total_frames = int(info.get("total_frames", 0))
+                    features = info.get("features") or {}
+                    video_cams = [
+                        k.removeprefix("observation.images.")
+                        for k, v in features.items()
+                        if k.startswith("observation.images.") and isinstance(v, dict)
+                    ]
+                    ep_lengths: dict[int, int] = {}
+                    ep_tasks: dict[int, str] = {}
+                    ep_meta_files = sorted((ds_dir / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
+                    if ep_meta_files:
+                        try:
+                            import pyarrow.parquet as pq
+
+                            for mf in ep_meta_files:
+                                tbl = pq.read_table(mf)
+                                for row in tbl.to_pylist():
+                                    eidx = int(row.get("episode_index", 0))
+                                    ep_lengths[eidx] = int(row.get("length", 0))
+                                    tval = row.get("tasks")
+                                    if isinstance(tval, list) and tval:
+                                        ep_tasks[eidx] = str(tval[0])
+                                    elif isinstance(tval, str):
+                                        ep_tasks[eidx] = tval
+                        except Exception:
+                            pass
+                    try:
+                        rel_ds = str(ds_dir.relative_to(self.config.workspace_root)).replace("\\", "/")
+                    except ValueError:
+                        rel_ds = str(ds_dir)
+                    created_ts = datetime.fromtimestamp(
+                        info_p.stat().st_mtime, tz=timezone.utc
+                    ).isoformat()
+                    for ep_idx in range(total_eps):
+                        n_frames = ep_lengths.get(
+                            ep_idx, total_frames // max(1, total_eps)
+                        )
+                        episodes.append(
+                            {
+                                "dataset": ds_dir.name,
+                                "episode_index": ep_idx,
+                                "task": ep_tasks.get(ep_idx, ""),
+                                "num_frames": n_frames,
+                                "fps": fps,
+                                "created_at": created_ts,
+                                "path": rel_ds,
+                                "source": "real",
+                                "has_video": bool(video_cams),
+                                "video_cams": video_cams,
+                            }
+                        )
+                except Exception:
+                    continue
+
+        # 2. Dry-run episodes under data/dry_run/datasets/<name>/episodes/
         dry_datasets = self.config.dry_run_dir / "datasets"
         if dry_datasets.exists():
             for ep_file in sorted(dry_datasets.glob("*/episodes/episode_*.json")):
@@ -1783,14 +2205,17 @@ class WorkflowManager:
                             "fps": data.get("fps", 30),
                             "created_at": data.get("created_at", ""),
                             "path": rel,
+                            "source": "dry_run",
+                            "has_video": False,
+                            "video_cams": [],
                         }
                     )
                 except Exception:
                     continue
         try:
-            root_str = str(dry_datasets.relative_to(self.config.workspace_root)).replace("\\", "/")
+            root_str = str(self.config.datasets_dir.relative_to(self.config.workspace_root)).replace("\\", "/")
         except ValueError:
-            root_str = str(dry_datasets)
+            root_str = str(self.config.datasets_dir)
         return {
             "mode": self.hardware.active_mode,
             "root": root_str,
@@ -1827,7 +2252,7 @@ class WorkflowManager:
 
         if (
             self.hardware.active_mode == "real"
-            and self.active_workflow in ("idle", "calibrate", "teleop")
+            and self.active_workflow in ("idle", "calibrate", "teleop", "collect", "linear_teach")
             and (configured_raw is None or configured_raw.lower() != "none")
         ):
             for cam in self.hardware.last_probe.get("cameras", []):
@@ -1942,6 +2367,8 @@ class WorkflowManager:
 
     def set_linked_arms(self, linked: bool) -> dict[str, Any]:
         val = self.simulator.set_linked_arms(linked)
+        if val:
+            self.bridge.disable_leader_torque()
         self._notify_motion()
         self.log(f"Leader-Follower link {'enabled' if val else 'disabled'}.")
         return {
@@ -1973,10 +2400,13 @@ class WorkflowManager:
             self._record_dry_cal_live_table(leader if cal_target == "leader" else follower)
         self._notify_motion()
         real_dispatched = False
-        if not in_dry_cal and (
-            arm in ("follower", "both") or (arm == "leader" and self.simulator.linked_arms)
-        ):
-            real_dispatched = self.bridge.send_follower_target_deg(follower)
+        if not in_dry_cal:
+            if arm in ("follower", "both") or (arm == "leader" and self.simulator.linked_arms):
+                real_dispatched = self.bridge.send_follower_target_deg(follower)
+            if arm == "leader" and not self.simulator.linked_arms:
+                real_dispatched = self.bridge.send_leader_target_deg(leader)
+            elif arm == "both" and not self.simulator.linked_arms:
+                real_dispatched = self.bridge.send_leader_target_deg(leader) or real_dispatched
         return {
             "status": "ok",
             "arm": arm,
@@ -2023,6 +2453,8 @@ class WorkflowManager:
         real_dispatched = False
         if effective_arm in ("follower", "both"):
             real_dispatched = self.bridge.send_follower_target_deg(follower)
+        if effective_arm == "leader" and not self.simulator.linked_arms:
+            real_dispatched = self.bridge.send_leader_target_deg(leader)
         return {
             "status": "ok",
             "arm": arm,
@@ -2226,6 +2658,74 @@ class WorkflowManager:
     def get_episode_frames(self, dataset_name: str, episode_index: int) -> dict[str, Any]:
         if ".." in dataset_name or "/" in dataset_name or "\\" in dataset_name:
             raise ValueError("Invalid dataset_name.")
+
+        # 1. Check real official LeRobotDataset v3.0 folder under data/datasets/<dataset_name>/
+        real_ds = self.config.datasets_dir / dataset_name
+        info_p = real_ds / "meta" / "info.json"
+        if info_p.is_file():
+            info = json.loads(info_p.read_text(encoding="utf-8"))
+            fps = int(info.get("fps", 30))
+            frames: list[dict[str, Any]] = []
+            task_name = ""
+            parquet_files = sorted((real_ds / "data").glob("chunk-*/file-*.parquet"))
+            if parquet_files:
+                import pyarrow.parquet as pq
+
+                for pf in parquet_files:
+                    tbl = pq.read_table(pf)
+                    for row in tbl.to_pylist():
+                        if int(row.get("episode_index", -1)) != episode_index:
+                            continue
+                        obs = row.get("observation.state") or [0.0] * 6
+                        act = row.get("action") or [0.0] * 6
+                        frames.append(
+                            {
+                                "frame_index": int(row.get("frame_index", len(frames))),
+                                "timestamp": round(float(row.get("timestamp", len(frames) / max(1, fps))), 4),
+                                "observation.state": [round(float(v), 3) for v in obs],
+                                "action": [round(float(v), 3) for v in act],
+                            }
+                        )
+            # Extract task description from meta/episodes if available
+            for mf in sorted((real_ds / "meta" / "episodes").glob("chunk-*/file-*.parquet")):
+                try:
+                    import pyarrow.parquet as pq
+
+                    for row in pq.read_table(mf).to_pylist():
+                        if int(row.get("episode_index", -1)) == episode_index:
+                            tval = row.get("tasks")
+                            if isinstance(tval, list) and tval:
+                                task_name = str(tval[0])
+                            elif isinstance(tval, str):
+                                task_name = tval
+                            break
+                except Exception:
+                    pass
+            # Discover video URLs
+            video_urls: dict[str, str] = {}
+            vid_root = real_ds / "videos"
+            if vid_root.is_dir():
+                for cam_dir in sorted(vid_root.iterdir()):
+                    if not cam_dir.is_dir() or not cam_dir.name.startswith("observation.images."):
+                        continue
+                    cam_key = cam_dir.name.removeprefix("observation.images.")
+                    mp4s = sorted(cam_dir.glob("chunk-*/file-*.mp4"))
+                    if mp4s:
+                        video_urls[cam_key] = (
+                            f"/api/workflows/collect/video/{dataset_name}/{cam_key}/{episode_index}"
+                        )
+            return {
+                "dataset": dataset_name,
+                "episode_index": episode_index,
+                "task": task_name,
+                "fps": fps,
+                "num_frames": len(frames),
+                "source": "real",
+                "video_urls": video_urls,
+                "frames": frames,
+            }
+
+        # 2. Fallback to dry_run episode JSON
         ep_file = (
             self.config.dry_run_dir
             / "datasets"
@@ -2236,4 +2736,52 @@ class WorkflowManager:
         if not ep_file.is_file():
             raise FileNotFoundError(f"Episode {episode_index} not found in dataset '{dataset_name}'.")
         data = json.loads(ep_file.read_text(encoding="utf-8"))
+        data.setdefault("source", "dry_run")
+        data.setdefault("video_urls", {})
         return data
+
+    def get_episode_video_path(
+        self, dataset_name: str, cam_key: str, episode_index: int
+    ) -> Path:
+        for seg in (dataset_name, cam_key):
+            if ".." in seg or "/" in seg or "\\" in seg:
+                raise ValueError("Invalid dataset or camera name.")
+        cam_dir = (
+            self.config.datasets_dir
+            / dataset_name
+            / "videos"
+            / f"observation.images.{cam_key}"
+        )
+        if not cam_dir.is_dir():
+            raise FileNotFoundError(f"No videos found for camera '{cam_key}'.")
+        mp4s = sorted(cam_dir.glob("chunk-*/file-*.mp4"))
+        if not mp4s:
+            raise FileNotFoundError(f"No MP4 files for '{dataset_name}/{cam_key}'.")
+        # In LeRobot v3.0 multiple episodes may share file-000.mp4; pick indexed or first available
+        return mp4s[episode_index] if episode_index < len(mp4s) else mp4s[0]
+
+    def delete_episode(self, dataset_name: str, episode_index: int) -> dict[str, Any]:
+        if ".." in dataset_name or "/" in dataset_name or "\\" in dataset_name:
+            raise ValueError("Invalid dataset_name.")
+        dry_ep = (
+            self.config.dry_run_dir
+            / "datasets"
+            / dataset_name
+            / "episodes"
+            / f"episode_{episode_index:04d}.json"
+        )
+        if dry_ep.is_file():
+            dry_ep.unlink()
+            self.log(f"[COLLECT] Deleted dry_run episode {dataset_name} #{episode_index}")
+            return {"status": "deleted", "dataset": dataset_name, "episode_index": episode_index}
+        real_ds = self.config.datasets_dir / dataset_name
+        if real_ds.is_dir():
+            # For LeRobot v3.0 Parquet chunks, removing the dataset folder cleanly avoids corrupting episode indices
+            shutil.rmtree(real_ds, ignore_errors=True)
+            self.log(f"[COLLECT] Deleted real dataset folder {dataset_name}")
+            return {
+                "status": "deleted_dataset",
+                "dataset": dataset_name,
+                "episode_index": episode_index,
+            }
+        raise FileNotFoundError(f"Episode {episode_index} not found in '{dataset_name}'.")

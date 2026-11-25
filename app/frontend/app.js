@@ -210,10 +210,15 @@ function syncArmControlMutexUI() {
     stageViews.leader?.setState({ label: ikAllowed ? "Leader 主臂 (红圈IK · 联动)" : "Leader 主臂 (联动)" });
     stageViews.follower?.setState({ label: "Follower 从臂 (跟随主臂)" });
   } else {
-    stageViews.leader?.setIkEnabled(false);
+    stageViews.leader?.setIkEnabled(ikAllowed);
     stageViews.follower?.setIkEnabled(ikAllowed);
-    stageViews.leader?.setState({ label: "Leader 主臂 (独立)" });
-    stageViews.follower?.setState({ label: ikAllowed ? "Follower 从臂 (红圈IK)" : "Follower 从臂 (独立)" });
+    stageViews.leader?.setState({ label: ikAllowed ? "Leader 主臂 (红圈IK · 真机可驱动)" : "Leader 主臂 (真机可驱动)" });
+    stageViews.follower?.setState({ label: ikAllowed ? "Follower 从臂 (红圈IK · 独立)" : "Follower 从臂 (独立)" });
+  }
+  const ikArmSel = $("sim-ik-arm-select");
+  if (ikArmSel) {
+    ikArmSel.disabled = linked;
+    if (linked) ikArmSel.value = "leader";
   }
 }
 
@@ -234,6 +239,16 @@ function updateTeleopButtonsUI() {
   }
   if (camCard) {
     camCard.classList.toggle("teleop-running-card", running);
+  }
+  const collecting = state.activeWorkflow === "collect";
+  const btnColStart = $("btn-start-collect");
+  const btnColStop = $("btn-stop-collect");
+  if (btnColStart) {
+    btnColStart.disabled = collecting;
+    btnColStart.textContent = collecting ? "采集中..." : "开始采集";
+  }
+  if (btnColStop) {
+    btnColStop.disabled = !collecting;
   }
 }
 
@@ -1057,8 +1072,8 @@ function initJointSliders() {
       slider.addEventListener("input", (ev) => {
         const key = ev.target.dataset.joint;
         const val = Number(ev.target.value);
-        state.sliderCooldownTs[slider.id] = performance.now() + 280;
-        state.leaderJoints[key] = val;
+        state.sliderCooldownTs[slider.id] = performance.now() + 350;
+        state.followerJoints[key] = val;
         state.pendingJoints[key] = val;
         const jMeta = JOINTS.find((x) => x.key === key);
         const valEl = $(`teleop-val-${key}`);
@@ -1134,6 +1149,13 @@ async function flushPendingJoints() {
   if (res.ok && res.data) {
     updateJointGauges(res.data.leader_joints, res.data.follower_joints, false);
     if (isTeleopPanelVisible()) refreshCameraImagesOnce();
+    if (state.mode === "real" && res.data.real_dispatched === false && !state.torqueEnabled) {
+      const now = performance.now();
+      if (!state._lastTorqueWarnTs || now - state._lastTorqueWarnTs > 4000) {
+        state._lastTorqueWarnTs = now;
+        showFeedbackToast("当前从臂已卸力（仅更新仿真），点顶栏「点击上力」即可驱动真机", "warn");
+      }
+    }
   }
 }
 
@@ -1167,7 +1189,7 @@ function updateJointGauges(leader, follower, syncSliders = false) {
       if (tVal) tVal.textContent = formatJointReadout(j.key, fv, j.unit);
       if (syncSliders) {
         const sl = $(tSliderId);
-        if (sl) sl.value = String(lv);
+        if (sl) sl.value = String(fv);
       }
     }
 
@@ -1203,30 +1225,51 @@ function isTeleopPanelVisible() {
   return Boolean(panel && !panel.hidden);
 }
 
-let _activeCamStreamTheme = null;
+function isCollectPanelVisible() {
+  const panel = $("panel-collect");
+  return Boolean(panel && !panel.hidden);
+}
+
+let _activeTeleopCamTheme = null;
+let _activeCollectCamTheme = null;
 
 function refreshCameraImagesOnce(forceRestart = false) {
-  const front = $("camera-preview-front");
-  const wrist = $("camera-preview-wrist");
-  if (!front && !wrist) return;
-
-  if (!isTeleopPanelVisible()) {
-    if (_activeCamStreamTheme !== null) {
-      _activeCamStreamTheme = null;
-      if (front) front.removeAttribute("src");
-      if (wrist) wrist.removeAttribute("src");
-    }
-    return;
-  }
-
   const theme = state.theme || "light";
-  if (!forceRestart && _activeCamStreamTheme === theme) {
-    return; // Already streaming live MJPEG for this theme
-  }
-  _activeCamStreamTheme = theme;
   const ts = Date.now();
-  if (front) front.src = `/api/cameras/front/stream?theme=${theme}&t=${ts}`;
-  if (wrist) wrist.src = `/api/cameras/wrist/stream?theme=${theme}&t=${ts}`;
+
+  // 1. Tab 2 Teleop Cameras
+  const tFront = $("camera-preview-front");
+  const tWrist = $("camera-preview-wrist");
+  if (tFront || tWrist) {
+    if (!isTeleopPanelVisible()) {
+      if (_activeTeleopCamTheme !== null) {
+        _activeTeleopCamTheme = null;
+        if (tFront) tFront.removeAttribute("src");
+        if (tWrist) tWrist.removeAttribute("src");
+      }
+    } else if (forceRestart || _activeTeleopCamTheme !== theme) {
+      _activeTeleopCamTheme = theme;
+      if (tFront) tFront.src = `/api/cameras/front/stream?theme=${theme}&t=${ts}`;
+      if (tWrist) tWrist.src = `/api/cameras/wrist/stream?theme=${theme}&t=${ts}`;
+    }
+  }
+
+  // 2. Tab 5 Data Collection 1:1 Permanent Dual Cameras
+  const cFront = $("collect-cam-front");
+  const cWrist = $("collect-cam-wrist");
+  if (cFront || cWrist) {
+    if (!isCollectPanelVisible()) {
+      if (_activeCollectCamTheme !== null) {
+        _activeCollectCamTheme = null;
+        if (cFront) cFront.removeAttribute("src");
+        if (cWrist) cWrist.removeAttribute("src");
+      }
+    } else if (forceRestart || _activeCollectCamTheme !== theme) {
+      _activeCollectCamTheme = theme;
+      if (cFront) cFront.src = `/api/cameras/front/stream?theme=${theme}&t=${ts}`;
+      if (cWrist) cWrist.src = `/api/cameras/wrist/stream?theme=${theme}&t=${ts}`;
+    }
+  }
 }
 
 function scheduleCameraLoop() {
@@ -1246,8 +1289,17 @@ function applyWorkflowStatus(statusObj) {
   if (statusObj.mode) setModeUI(statusObj.mode);
   const colProg = $("collect-progress-text");
   if (colProg) {
-    colProg.textContent = `进度: ${statusObj.current_episode || 0} / ${statusObj.target_episodes || 0} 回合 (步数: ${statusObj.current_step || 0})`;
+    if (wf === "collect") {
+      const stageTxt = statusObj.collect_stage_text ? ` · ${statusObj.collect_stage_text}` : "";
+      colProg.textContent = `采集中: ${statusObj.current_episode || 0}/${statusObj.target_episodes || 0} 回合 (${statusObj.current_step || 0} 帧)${stageTxt}`;
+    } else if (statusObj.collect_stage === "completed" && statusObj.collect_stage_text) {
+      colProg.textContent = statusObj.collect_stage_text;
+    } else {
+      colProg.textContent = "待机（未在采集）";
+    }
   }
+  const colLive = $("collect-live-actions");
+  if (colLive) colLive.hidden = wf !== "collect";
   if (Array.isArray(statusObj.logs)) renderLogs(statusObj.logs);
   if (statusObj.calibration) renderCalibrationState(statusObj.calibration);
   if (wf !== "idle") scheduleCameraLoop();
@@ -1437,30 +1489,277 @@ async function replayEpisodeOnStick(dataset, episodeIndex) {
   }, 60);
 }
 
+const WAVEFORM_COLORS = ["#2563EB", "#16A34A", "#EA580C", "#9333EA", "#0891B2", "#DC2626"];
+
+function drawEpisodeWaveform(canvas, frames) {
+  if (!canvas || !Array.isArray(frames) || frames.length === 0) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cssW = Math.max(260, canvas.clientWidth || 520);
+  const cssH = 175;
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const dark = state.theme === "dark";
+  ctx.fillStyle = dark ? "#14181F" : "#FAFBFD";
+  ctx.fillRect(0, 0, cssW, cssH);
+
+  const padL = 34;
+  const padR = 10;
+  const padT = 22;
+  const padB = 20;
+  const plotW = cssW - padL - padR;
+  const plotH = cssH - padT - padB;
+
+  let minV = -90;
+  let maxV = 100;
+  for (const f of frames) {
+    for (const arr of [f["observation.state"], f.action]) {
+      if (!Array.isArray(arr)) continue;
+      for (const v of arr) {
+        const n = Number(v);
+        if (Number.isFinite(n)) {
+          if (n < minV) minV = n;
+          if (n > maxV) maxV = n;
+        }
+      }
+    }
+  }
+  const span = Math.max(10, maxV - minV);
+  const yOf = (v) => padT + plotH - ((v - minV) / span) * plotH;
+  const xOf = (i) => padL + (frames.length <= 1 ? 0 : (i / (frames.length - 1)) * plotW);
+
+  // Grid lines
+  ctx.strokeStyle = dark ? "rgba(255,255,255,0.08)" : "rgba(15,23,42,0.08)";
+  ctx.lineWidth = 1;
+  ctx.fillStyle = dark ? "#94A3B8" : "#64748B";
+  ctx.font = "10px monospace";
+  for (const val of [maxV, 0, minV]) {
+    const y = yOf(val);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(cssW - padR, y);
+    ctx.stroke();
+    ctx.fillText(Math.round(val).toString(), 4, y + 3);
+  }
+
+  // Draw 6-DOF observation.state (solid) & action (dashed)
+  const step = Math.max(1, Math.floor(frames.length / 320));
+  for (let j = 0; j < 6; j++) {
+    const color = WAVEFORM_COLORS[j % WAVEFORM_COLORS.length];
+    // Action (dashed)
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = 0.42;
+    ctx.setLineDash([4, 3]);
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    for (let i = 0; i < frames.length; i += step) {
+      const v = Number(frames[i].action?.[j] ?? 0);
+      const x = xOf(i);
+      const y = yOf(v);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // State (solid)
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < frames.length; i += step) {
+      const v = Number(frames[i]["observation.state"]?.[j] ?? 0);
+      const x = xOf(i);
+      const y = yOf(v);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  // Compact top legend (never clips at narrow inspector widths)
+  const labels = ["J1", "J2", "J3", "J4", "J5", "Grip"];
+  let lx = padL;
+  ctx.font = "10px sans-serif";
+  for (let j = 0; j < 6; j++) {
+    ctx.fillStyle = WAVEFORM_COLORS[j];
+    ctx.fillRect(lx, 7, 7, 6);
+    ctx.fillStyle = dark ? "#CBD5E1" : "#334155";
+    ctx.fillText(labels[j], lx + 9, 13);
+    lx += j === 5 ? 36 : 28;
+  }
+  ctx.fillStyle = dark ? "#94A3B8" : "#64748B";
+  ctx.textAlign = "right";
+  ctx.fillText("实线=State 虚线=Action", cssW - padR, cssH - 5);
+  ctx.textAlign = "left";
+}
+
+function switchInspectorToLive() {
+  state.inspectorMode = "live";
+  state.selectedEpisode = null;
+  document.querySelectorAll("#episodes-tbody tr.ep-row-clickable").forEach((tr) => {
+    tr.classList.remove("ep-row-selected");
+  });
+  const btnLive = $("btn-inspector-live");
+  if (btnLive) btnLive.hidden = true;
+  const acts = $("ep-inspector-actions");
+  if (acts) acts.hidden = true;
+  const videoBox = $("ep-video-box");
+  if (videoBox) {
+    videoBox.hidden = true;
+    videoBox.innerHTML = "";
+  }
+  renderLiveCollectWaveform();
+}
+
+function renderLiveCollectWaveform() {
+  if (state.inspectorMode && state.inspectorMode !== "live") return;
+  const frames = state.liveCollectFrames || [];
+  const metaEl = $("ep-inspector-meta");
+  const isCol = state.activeWorkflow === "collect";
+  if (metaEl) {
+    const modeLabel = isCol ? "采集中 · 实时动态曲线" : "待机 · 实时 6-DOF 波形";
+    metaEl.innerHTML = `
+      <span class="chip ${isCol ? "chip-ok" : ""}">${modeLabel}</span>
+      <span class="chip">缓冲 ${frames.length} 帧 (实线=从臂State / 虚线=主臂Action)</span>
+    `;
+  }
+  const canvas = $("ep-waveform-canvas");
+  if (canvas && frames.length > 0 && isCollectPanelVisible()) {
+    drawEpisodeWaveform(canvas, frames);
+  }
+}
+
+function pushLiveCollectFrame(leader, follower, wfStatus) {
+  if (!leader && !follower) return;
+  if (!Array.isArray(state.liveCollectFrames)) state.liveCollectFrames = [];
+  const curEp = Number(wfStatus?.current_episode || 0);
+  if (state.activeWorkflow === "collect" && curEp !== state._lastLiveEpNum) {
+    state._lastLiveEpNum = curEp;
+    state.liveCollectFrames = [];
+  }
+  const obs = JOINTS.map((j) => Number(follower?.[j.key] ?? 0));
+  const act = JOINTS.map((j) => Number(leader?.[j.key] ?? obs[JOINTS.indexOf(j)] ?? 0));
+  state.liveCollectFrames.push({
+    frame_index: state.liveCollectFrames.length,
+    "observation.state": obs,
+    action: act,
+  });
+  if (state.liveCollectFrames.length > 240) {
+    state.liveCollectFrames.shift();
+  }
+  if ((state.inspectorMode || "live") === "live" && isCollectPanelVisible()) {
+    const now = performance.now();
+    if (!state._lastWaveDrawTs || now - state._lastWaveDrawTs >= 55) {
+      state._lastWaveDrawTs = now;
+      renderLiveCollectWaveform();
+    }
+  }
+}
+
+async function inspectEpisode(dataset, episodeIndex) {
+  state.inspectorMode = "history";
+  state.selectedEpisode = { dataset, episodeIndex };
+  document.querySelectorAll("#episodes-tbody tr.ep-row-clickable").forEach((tr) => {
+    const match = tr.dataset.dataset === dataset && Number(tr.dataset.ep) === episodeIndex;
+    tr.classList.toggle("ep-row-selected", match);
+  });
+
+  const bodyEl = $("ep-inspector-body");
+  const metaEl = $("ep-inspector-meta");
+  const videoBox = $("ep-video-box");
+  const btnLive = $("btn-inspector-live");
+  const acts = $("ep-inspector-actions");
+  if (!bodyEl || !metaEl) return;
+
+  const res = await apiFetch(
+    `/api/workflows/collect/episodes/${encodeURIComponent(dataset)}/${episodeIndex}`
+  );
+  if (!res.ok || !res.data) {
+    showAnomalyToast(res.error || `无法加载 ${dataset} #${episodeIndex}`);
+    return;
+  }
+  const ep = res.data;
+  const frames = ep.frames || [];
+  const fps = Number(ep.fps || 30);
+  const durS = (frames.length / Math.max(1, fps)).toFixed(1);
+  if (btnLive) btnLive.hidden = false;
+  if (acts) acts.hidden = false;
+
+  metaEl.innerHTML = `
+    <span class="chip chip-ok">${ep.dataset} #${ep.episode_index}</span>
+    <span class="chip">${ep.source === "real" ? "真机 Parquet" : "Dry-Run JSON"}</span>
+    <span class="chip">${frames.length} 帧 · ${fps}Hz · ${durS}s</span>
+    <span class="chip" title="${ep.task || ""}">${(ep.task || "未标注任务").slice(0, 42)}</span>
+  `;
+
+  drawEpisodeWaveform($("ep-waveform-canvas"), frames);
+
+  if (videoBox) {
+    const vUrls = ep.video_urls || {};
+    const cams = Object.keys(vUrls);
+    if (cams.length > 0) {
+      videoBox.hidden = false;
+      videoBox.innerHTML = cams
+        .map(
+          (cam) => `<div>
+            <div class="mono-meta" style="font-size:10.5px;margin-bottom:2px">cam: ${cam}</div>
+            <video src="${vUrls[cam]}" controls muted playsinline preload="metadata"></video>
+          </div>`
+        )
+        .join("");
+    } else {
+      videoBox.hidden = true;
+      videoBox.innerHTML = "";
+    }
+  }
+}
+
 async function refreshEpisodes() {
   const res = await apiFetch("/api/workflows/collect/episodes");
   const tbody = $("episodes-tbody");
   if (!res.ok || !tbody) return;
   const eps = res.data.episodes || [];
+  state.episodesList = eps;
+  if (typeof syncVLADatasetSelect === "function") syncVLADatasetSelect(eps);
   if (!eps.length) {
     tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无已保存的 Episode。</td></tr>';
     return;
   }
   tbody.innerHTML = eps
-    .map(
-      (ep) => `<tr>
-        <td>${ep.dataset}</td>
-        <td>#${ep.episode_index}</td>
-        <td>${ep.task}</td>
-        <td>${ep.num_frames} / ${ep.fps}Hz</td>
-        <td class="joint-values">${ep.path}</td>
-        <td><button type="button" class="btn btn-xs btn-primary btn-ep-stick-replay" data-dataset="${ep.dataset}" data-ep="${ep.episode_index}">火柴棍回放</button></td>
-      </tr>`
-    )
+    .map((ep) => {
+      const isSelected =
+        state.selectedEpisode &&
+        state.selectedEpisode.dataset === ep.dataset &&
+        state.selectedEpisode.episodeIndex === ep.episode_index;
+      const srcTag =
+        ep.source === "real"
+          ? `<span class="status-tag tag-ok">真机${ep.has_video ? "+MP4" : ""}</span>`
+          : `<span class="status-tag tag-mono">仿真</span>`;
+      return `<tr class="ep-row-clickable${isSelected ? " ep-row-selected" : ""}" data-dataset="${ep.dataset}" data-ep="${ep.episode_index}">
+        <td class="ep-cell-nowrap"><strong>${ep.dataset}</strong></td>
+        <td class="ep-cell-nowrap">#${ep.episode_index}</td>
+        <td class="ep-cell-task" title="${ep.task || ""}">${ep.task || "-"}</td>
+        <td class="joint-values ep-cell-nowrap">${ep.num_frames}/${ep.fps}Hz</td>
+        <td class="ep-cell-nowrap">${srcTag}</td>
+        <td class="ep-cell-nowrap"><button type="button" class="btn btn-xs btn-primary btn-ep-stick-replay" data-dataset="${ep.dataset}" data-ep="${ep.episode_index}">回放</button></td>
+      </tr>`;
+    })
     .join("");
 
+  tbody.querySelectorAll("tr.ep-row-clickable").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      inspectEpisode(tr.dataset.dataset, Number(tr.dataset.ep));
+    });
+  });
+
   tbody.querySelectorAll(".btn-ep-stick-replay").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      inspectEpisode(btn.dataset.dataset, Number(btn.dataset.ep));
       replayEpisodeOnStick(btn.dataset.dataset, Number(btn.dataset.ep));
     });
   });
@@ -1814,8 +2113,10 @@ async function refreshPlugins() {
       });
       if (r.ok) {
         appendLocalLog(`外部插件进程 ${id} 启动成功。`);
+        showFeedbackToast(`外部工具 ${id} 已启动`, "ok");
       } else {
-        showAnomalyToast(r.detail || `插件 ${id} 启动失败`);
+        const msg = r.error || r.data?.detail || r.data?.install_hint || `插件 ${id} 启动失败`;
+        showAnomalyToast(msg);
       }
       await refreshPlugins();
     });
@@ -1826,6 +2127,107 @@ async function refreshPlugins() {
       const id = btn.dataset.id;
       await apiFetch(`/api/plugins/${id}/stop`, { method: "POST" });
       await refreshPlugins();
+    });
+  });
+}
+
+function syncVLADatasetSelect(episodes) {
+  const sel = $("vla-dataset-select");
+  if (!sel) return;
+  const prev = sel.value;
+  const seen = new Map();
+  for (const ep of episodes || []) {
+    if (!ep.dataset) continue;
+    const prevRec = seen.get(ep.dataset) || { count: 0, source: ep.source || "dry_run", task: ep.task || "" };
+    prevRec.count += 1;
+    if (ep.source === "real") prevRec.source = "real";
+    if (!prevRec.task && ep.task) prevRec.task = ep.task;
+    seen.set(ep.dataset, prevRec);
+  }
+  const collectVal = ($("collect-dataset")?.value || "").trim();
+  if (collectVal && !seen.has(collectVal)) {
+    seen.set(collectVal, { count: 0, source: "config", task: $("collect-task")?.value || "" });
+  }
+  if (seen.size === 0) {
+    seen.set("yyzmiao_pick_cube_demo", { count: 0, source: "default", task: "Pick up the cube" });
+  }
+  sel.innerHTML = Array.from(seen.entries())
+    .map(([ds, info]) => {
+      const tag =
+        info.source === "real"
+          ? `真机 ${info.count}条`
+          : info.source === "dry_run"
+          ? `仿真 ${info.count}条`
+          : "当前配置";
+      return `<option value="${ds}" data-task="${(info.task || "").replace(/"/g, "&quot;")}">${ds} (${tag})</option>`;
+    })
+    .join("");
+  if (prev && seen.has(prev)) sel.value = prev;
+  renderVLAConfigCards();
+}
+
+function renderVLAConfigCards() {
+  const grid = $("vla-configs-grid");
+  const cfgs = state.vlaConfigs || [];
+  if (!grid || !cfgs.length) return;
+  const ds = ($("vla-dataset-select")?.value || "yyzmiao_pick_cube_demo").trim();
+  const taskPrompt = ($("vla-prompt")?.value || "Pick up the cube and place it in the bin").trim();
+  const repoArg = ds.includes("/") ? ds : `local/${ds}`;
+
+  grid.innerHTML = cfgs
+    .map((c, idx) => {
+      const rawCmd = String(c.command || "");
+      let trainCmd = rawCmd
+        .replace(/--dataset\.repo_id=\S+/g, `--dataset.repo_id=${repoArg}`)
+        .replace(/--dataset\.root=\S+/g, `--dataset.root=./data/datasets/${ds}`);
+      if (!trainCmd.includes("--dataset.repo_id=")) {
+        trainCmd = `${trainCmd} --dataset.repo_id=${repoArg} --dataset.root=./data/datasets/${ds}`;
+      }
+      const policySlug = String(c.id || c.title || "policy")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_");
+      const evalCmd =
+        `lerobot-record --robot.type=so101_follower --robot.port=/dev/ttyACM0 --robot.id=so101_follower ` +
+        `--dataset.repo_id=local/eval_${ds} --dataset.single_task="${taskPrompt}" ` +
+        `--policy.path=./outputs/train/${policySlug}_${ds}/checkpoints/last/pretrained_model`;
+
+      return `
+        <div class="card">
+          <div class="panel-header">
+            <h3>${c.title}</h3>
+            <div class="btn-group">
+              <button type="button" class="btn btn-xs btn-primary btn-copy-vla" data-kind="train" data-idx="${idx}">复制训练命令</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-copy-vla" data-kind="eval" data-idx="${idx}">复制真机推理命令</button>
+            </div>
+          </div>
+          <div class="chip-row mt-6">
+            <span class="chip">${c.path}</span>
+            <span class="chip chip-ok">显存: ${c.vram}</span>
+            <span class="chip">数据集: ${ds}</span>
+          </div>
+          <p class="muted mt-6">平台: ${c.platform}</p>
+          <pre class="code-box mt-6" id="vla-train-cmd-${idx}">${trainCmd}</pre>
+          <pre class="code-box mt-6" id="vla-eval-cmd-${idx}" hidden>${evalCmd}</pre>
+        </div>
+      `;
+    })
+    .join("");
+
+  grid.querySelectorAll(".btn-copy-vla").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const idx = btn.dataset.idx;
+      const kind = btn.dataset.kind;
+      const el = $(kind === "eval" ? `vla-eval-cmd-${idx}` : `vla-train-cmd-${idx}`);
+      const text = el?.textContent || "";
+      try {
+        await navigator.clipboard.writeText(text);
+        showFeedbackToast(
+          kind === "eval" ? "已复制真机推理评估命令到剪贴板" : "已复制 Ubuntu 训练命令到剪贴板",
+          "ok"
+        );
+      } catch {
+        showFeedbackToast("已选中命令（浏览器未授权剪贴板，请手动复制）", "info");
+      }
     });
   });
 }
@@ -1842,25 +2244,8 @@ async function loadVLAConfigs() {
       <p class="muted mt-6">${notice.recommendation || ""}</p>
     `;
   }
-  const grid = $("vla-configs-grid");
-  if (grid) {
-    const cfgs = res.data.configs || [];
-    grid.innerHTML = cfgs
-      .map(
-        (c) => `
-        <div class="card">
-          <h3>${c.title}</h3>
-          <div class="chip-row mt-6">
-            <span class="chip">${c.path}</span>
-            <span class="chip chip-ok">显存: ${c.vram}</span>
-          </div>
-          <p class="muted mt-6">平台: ${c.platform}</p>
-          <pre class="code-box mt-6">${c.command}</pre>
-        </div>
-      `
-      )
-      .join("");
-  }
+  state.vlaConfigs = res.data.configs || [];
+  renderVLAConfigCards();
 }
 
 /* ==========================================================================
@@ -1908,6 +2293,7 @@ function initTabs() {
       if (target === "collect") {
         validateCollectSpecUI();
         refreshEpisodes();
+        setTimeout(() => renderLiveCollectWaveform(), 40);
       }
       if (target === "plugins") {
         refreshPlugins();
@@ -2000,15 +2386,26 @@ function connectTelemetryBus() {
       if (!isDraggingIk) {
         updateJointGauges(msg.leader_joints, msg.follower_joints, shouldSyncSliders);
       }
+      pushLiveCollectFrame(msg.leader_joints, msg.follower_joints, msg.workflow_status);
       if (msg.workflow_status) {
         const colProg = $("collect-progress-text");
         if (colProg) {
           if (wf === "collect") {
-            colProg.textContent = `采集中: ${msg.workflow_status.current_episode || 0} / ${msg.workflow_status.target_episodes || 0} 回合 (步数: ${msg.workflow_status.current_step || 0})`;
+            const stTxt = msg.workflow_status.collect_stage_text
+              ? ` · ${msg.workflow_status.collect_stage_text}`
+              : "";
+            colProg.textContent = `采集中: ${msg.workflow_status.current_episode || 0}/${msg.workflow_status.target_episodes || 0} 回合 (${msg.workflow_status.current_step || 0} 帧)${stTxt}`;
+          } else if (
+            msg.workflow_status.collect_stage === "completed" &&
+            msg.workflow_status.collect_stage_text
+          ) {
+            colProg.textContent = msg.workflow_status.collect_stage_text;
           } else {
             colProg.textContent = "待机（未在采集）";
           }
         }
+        const colLive = $("collect-live-actions");
+        if (colLive) colLive.hidden = wf !== "collect";
       }
       if (Array.isArray(msg.log_tail)) renderLogs(msg.log_tail);
       if (msg.calibration) renderCalibrationState(msg.calibration);
@@ -2188,10 +2585,15 @@ function bindActions() {
   });
 
   $("btn-quick-rest")?.addEventListener("click", async () => {
-    await apiFetch("/api/workflows/teaching/pose", {
+    const res = await apiFetch("/api/workflows/teaching/pose", {
       method: "POST",
       body: JSON.stringify({ pose: "rest", duration_s: 1.5 }),
     });
+    if (res.ok) {
+      showFeedbackToast("正在缓慢回到蜷缩休眠位并自动卸力", "ok");
+    } else {
+      showAnomalyToast(res.error || res.data?.detail || "无法执行休眠动作");
+    }
   });
 
   $("mode-select")?.addEventListener("change", async (ev) => {
@@ -2291,6 +2693,9 @@ function bindActions() {
     if (res.ok) {
       const st = await apiFetch("/api/workflows/status");
       if (st.ok) applyWorkflowStatus(st.data);
+      showFeedbackToast("已启动标定向导，请按下方提示操作", "ok");
+    } else {
+      showAnomalyToast(res.error || res.data?.detail || "启动标定失败");
     }
   });
 
@@ -2302,6 +2707,8 @@ function bindActions() {
     if (res.ok) {
       const st = await apiFetch("/api/workflows/status");
       if (st.ok) applyWorkflowStatus(st.data);
+    } else {
+      showAnomalyToast(res.error || res.data?.detail || "标定确认失败");
     }
   });
 
@@ -2313,6 +2720,9 @@ function bindActions() {
     if (res.ok) {
       const st = await apiFetch("/api/workflows/status");
       if (st.ok) applyWorkflowStatus(st.data);
+      showFeedbackToast("已选择重新标定", "info");
+    } else {
+      showAnomalyToast(res.error || res.data?.detail || "重新标定指令失败");
     }
   });
 
@@ -2321,14 +2731,6 @@ function bindActions() {
     if ($("calibrate-status")) $("calibrate-status").textContent = "标定已停止。";
     const st = await apiFetch("/api/workflows/status");
     if (st.ok) applyWorkflowStatus(st.data);
-  });
-
-  $("btn-save-home-pose")?.addEventListener("click", async () => {
-    const r = await apiFetch("/api/workflows/teaching/save_pose", {
-      method: "POST",
-      body: JSON.stringify({ target: "home" }),
-    });
-    if (r.ok) appendLocalLog("已保存当前姿态至 upright_pose.json");
   });
 
   $("btn-save-rest-pose")?.addEventListener("click", async () => {
@@ -2518,16 +2920,16 @@ function bindActions() {
     const y_mm = Number($("ik-y")?.value || 0);
     const z_mm = Number($("ik-z")?.value || 226);
     const gripper = Number($("ik-grip")?.value || 20);
-    const targetArm = state.linkedArms ? "leader" : "follower";
+    const targetArm = state.linkedArms ? "leader" : ($("sim-ik-arm-select")?.value || "follower");
     const res = await apiFetch("/api/sim/ik", {
       method: "POST",
       body: JSON.stringify({ arm: targetArm, x_mm, y_mm, z_mm, gripper }),
     });
     if (res.ok && res.data) {
       updateJointGauges(res.data.leader_joints, res.data.follower_joints, true);
-      showFeedbackToast(`IK 逆解完成 (${targetArm})`, "ok");
+      showFeedbackToast(`IK 逆解完成 (${targetArm === "leader" ? "主臂" : "从臂"})`, "ok");
     } else {
-      showFeedbackToast(res.detail || "目标坐标超出物理工作空间", "warn");
+      showFeedbackToast(res.error || res.data?.detail || "目标坐标超出物理工作空间", "warn");
     }
   });
 
@@ -2664,6 +3066,9 @@ function bindActions() {
     });
     if (res.ok) {
       state.activeWorkflow = "teaching_replay";
+      showFeedbackToast("开始回放示教航点队列", "ok");
+    } else {
+      showAnomalyToast(res.error || res.data?.detail || "无法回放（请先记录至少 1 个示教点）");
     }
   });
 
@@ -2675,20 +3080,30 @@ function bindActions() {
   document.querySelectorAll(".btn-preset").forEach((btn) => {
     btn.addEventListener("click", async () => {
       ensureStageVisibleForAction();
-      await apiFetch("/api/workflows/teaching/pose", {
+      const res = await apiFetch("/api/workflows/teaching/pose", {
         method: "POST",
         body: JSON.stringify({ pose: btn.dataset.pose, duration_s: 1.2 }),
       });
+      if (res.ok) {
+        showFeedbackToast(`正在平滑移动到预设姿态: ${btn.dataset.pose}`, "info");
+      } else {
+        showAnomalyToast(res.error || res.data?.detail || "无法执行预设姿态");
+      }
     });
   });
 
   document.querySelectorAll(".btn-routine").forEach((btn) => {
     btn.addEventListener("click", async () => {
       ensureStageVisibleForAction();
-      await apiFetch("/api/workflows/teaching/routine", {
+      const res = await apiFetch("/api/workflows/teaching/routine", {
         method: "POST",
         body: JSON.stringify({ routine: btn.dataset.routine }),
       });
+      if (res.ok) {
+        showFeedbackToast(`开始执行示范动作: ${btn.dataset.routine}`, "ok");
+      } else {
+        showAnomalyToast(res.error || res.data?.detail || "无法执行示范动作");
+      }
     });
   });
 
@@ -2704,32 +3119,299 @@ function bindActions() {
   }
 
   $("btn-start-collect")?.addEventListener("click", async () => {
+    if (state.activeWorkflow === "collect") return;
+    const dataset_name = ($("collect-dataset")?.value || "").trim() || "yyzmiao_pick_cube_demo";
+    if (dataset_name.startsWith("eval_") || /[\s\u4e00-\u9fff/\\]/.test(dataset_name)) {
+      showAnomalyToast("数据集名称不能以 eval_ 开头，且只能包含英文字母、数字和下划线。");
+      return;
+    }
     ensureStageVisibleForAction();
-    const dataset_name = $("collect-dataset")?.value || "yyzmiao_pick_cube_demo";
-    const single_task = $("collect-task")?.value || "Pick up the red cube and place it into the tray";
-    const num_episodes = Number($("collect-episodes")?.value || 2);
+    const single_task = ($("collect-task")?.value || "").trim() || "Pick up the red cube and place it into the tray";
+    const num_episodes = Number($("collect-episodes")?.value || 5);
+    const episode_time_s = Number($("collect-ep-time")?.value ?? 30);
+    const reset_time_s = Number($("collect-reset-time")?.value ?? 3);
     const fps = Number($("collect-fps")?.value || 30);
+    state.liveCollectFrames = [];
+    switchInspectorToLive();
+    const colProg = $("collect-progress-text");
+    if (colProg) colProg.textContent = "正在初始化数据采集与双臂遥操作...";
     const res = await apiFetch("/api/workflows/collect/start", {
       method: "POST",
-      body: JSON.stringify({ dataset_name, single_task, num_episodes, fps }),
+      body: JSON.stringify({ dataset_name, single_task, num_episodes, episode_time_s, reset_time_s, fps }),
     });
     if (res.ok) {
       state.activeWorkflow = "collect";
+      updateTeleopButtonsUI();
+      const colLive = $("collect-live-actions");
+      if (colLive) colLive.hidden = false;
       updateAllStickViews();
+      refreshCameraImagesOnce();
+      showFeedbackToast(`已启动 LeRobotDataset v3.0 采集: ${dataset_name}`, "ok");
+    } else {
+      if (colProg) colProg.textContent = "待机（启动失败）";
+      showAnomalyToast(res.error || res.data?.detail || "启动数据采集失败");
     }
   });
+
+  $("btn-inspector-live")?.addEventListener("click", switchInspectorToLive);
 
   $("btn-stop-collect")?.addEventListener("click", async () => {
     await apiFetch("/api/workflows/collect/stop", { method: "POST" });
     state.activeWorkflow = "idle";
+    const colLive = $("collect-live-actions");
+    if (colLive) colLive.hidden = true;
     await refreshEpisodes();
     updateAllStickViews();
+    showFeedbackToast("已停止采集并落盘数据集", "info");
   });
+
+  $("btn-collect-next")?.addEventListener("click", async () => {
+    const res = await apiFetch("/api/workflows/collect/episode_action", {
+      method: "POST",
+      body: JSON.stringify({ action: "next" }),
+    });
+    if (res.ok) showFeedbackToast("已触发「完成本条」保存", "ok");
+  });
+
+  $("btn-collect-rerecord")?.addEventListener("click", async () => {
+    const res = await apiFetch("/api/workflows/collect/episode_action", {
+      method: "POST",
+      body: JSON.stringify({ action: "rerecord" }),
+    });
+    if (res.ok) showFeedbackToast("已丢弃本条，准备重录", "warn");
+  });
+
+  document.addEventListener("keydown", (ev) => {
+    if (state.activeWorkflow !== "collect") return;
+    const tag = (document.activeElement?.tagName || "").toUpperCase();
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (ev.key === "ArrowRight") {
+      ev.preventDefault();
+      $("btn-collect-next")?.click();
+    } else if (ev.key === "ArrowLeft") {
+      ev.preventDefault();
+      $("btn-collect-rerecord")?.click();
+    }
+  });
+
+  $("btn-inspector-replay")?.addEventListener("click", () => {
+    if (!state.selectedEpisode) return;
+    replayEpisodeOnStick(state.selectedEpisode.dataset, state.selectedEpisode.episodeIndex);
+  });
+
+  $("btn-inspector-delete")?.addEventListener("click", async () => {
+    if (!state.selectedEpisode) return;
+    const { dataset, episodeIndex } = state.selectedEpisode;
+    const res = await apiFetch("/api/workflows/collect/episodes/delete", {
+      method: "POST",
+      body: JSON.stringify({ dataset_name: dataset, episode_index: episodeIndex }),
+    });
+    if (res.ok) {
+      switchInspectorToLive();
+      await refreshEpisodes();
+      showFeedbackToast(`已删除 ${dataset} #${episodeIndex}`, "info");
+    } else {
+      showAnomalyToast(res.error || "删除失败");
+    }
+  });
+
+  // Tab 5 Vertical Camera Strip Resizer (#collect-cam-resizer)
+  (() => {
+    const resizer = $("collect-cam-resizer");
+    const strip = $("collect-cameras-strip");
+    if (!resizer || !strip) return;
+    let dragging = false;
+    let startY = 0;
+    let startH = 230;
+    resizer.addEventListener("pointerdown", (ev) => {
+      dragging = true;
+      startY = ev.clientY;
+      startH = strip.getBoundingClientRect().height || 230;
+      resizer.classList.add("dragging");
+      resizer.setPointerCapture?.(ev.pointerId);
+      ev.preventDefault();
+    });
+    window.addEventListener("pointermove", (ev) => {
+      if (!dragging) return;
+      const nextH = Math.max(150, Math.min(620, startH + (ev.clientY - startY)));
+      strip.style.height = `${Math.round(nextH)}px`;
+    });
+    window.addEventListener("pointerup", () => {
+      if (!dragging) return;
+      dragging = false;
+      resizer.classList.remove("dragging");
+    });
+  })();
+
+  // Per-Camera Zoom (+/- / Wheel / Pan) & Full-View Lightbox Modal
+  (() => {
+    const zoomState = new Map();
+    const getZ = (id) => {
+      if (!zoomState.has(id)) zoomState.set(id, { scale: 1, tx: 0, ty: 0 });
+      return zoomState.get(id);
+    };
+    const applyZ = (id) => {
+      const img = $(id);
+      if (!img) return;
+      const z = getZ(id);
+      if (z.scale <= 1.01) {
+        z.scale = 1;
+        z.tx = 0;
+        z.ty = 0;
+      }
+      img.style.transform = `translate(${z.tx}px, ${z.ty}px) scale(${z.scale.toFixed(2)})`;
+      img.parentElement?.classList.toggle("is-zoomed", z.scale > 1.01);
+      document
+        .querySelectorAll(`.cam-zoom-tools[data-cam-target="${id}"] .btn-cam-zoom-reset`)
+        .forEach((b) => {
+          b.textContent = `${Math.round(z.scale * 100)}%`;
+        });
+    };
+
+    const modal = $("cam-lightbox-modal");
+    const modalImg = $("cam-lightbox-img");
+    const modalTitle = $("cam-lightbox-title");
+    const openLightbox = (targetId, title) => {
+      const srcImg = $(targetId);
+      if (!modal || !modalImg || !srcImg) return;
+      if (modalTitle) modalTitle.textContent = `${title || "相机实时视图"} (滚轮缩放 · 拖拽平移)`;
+      modalImg.src = srcImg.src || "";
+      const z = getZ("cam-lightbox-img");
+      z.scale = 1;
+      z.tx = 0;
+      z.ty = 0;
+      applyZ("cam-lightbox-img");
+      modal.hidden = false;
+    };
+    const closeLightbox = () => {
+      if (!modal || modal.hidden) return;
+      modal.hidden = true;
+      if (modalImg) modalImg.removeAttribute("src");
+    };
+
+    $("btn-cam-lightbox-close")?.addEventListener("click", closeLightbox);
+    modal?.addEventListener("click", (ev) => {
+      if (ev.target === modal) closeLightbox();
+    });
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape" && modal && !modal.hidden) closeLightbox();
+    });
+
+    document.querySelectorAll(".cam-zoom-tools").forEach((bar) => {
+      const targetId = bar.dataset.camTarget;
+      const title = bar.dataset.camTitle || "";
+      bar.querySelector(".btn-cam-zoom-in")?.addEventListener("click", () => {
+        const z = getZ(targetId);
+        z.scale = Math.min(4, z.scale + 0.25);
+        applyZ(targetId);
+      });
+      bar.querySelector(".btn-cam-zoom-out")?.addEventListener("click", () => {
+        const z = getZ(targetId);
+        z.scale = Math.max(1, z.scale - 0.25);
+        applyZ(targetId);
+      });
+      bar.querySelector(".btn-cam-zoom-reset")?.addEventListener("click", () => {
+        const z = getZ(targetId);
+        z.scale = 1;
+        z.tx = 0;
+        z.ty = 0;
+        applyZ(targetId);
+      });
+      bar.querySelector(".btn-cam-expand")?.addEventListener("click", () => {
+        openLightbox(targetId, title);
+      });
+    });
+
+    document.querySelectorAll(".cam-zoom-viewport").forEach((vp) => {
+      const targetId = vp.dataset.camTarget;
+      const title = vp.dataset.camTitle || "";
+      vp.addEventListener(
+        "wheel",
+        (ev) => {
+          ev.preventDefault();
+          const z = getZ(targetId);
+          const delta = ev.deltaY < 0 ? 0.2 : -0.2;
+          z.scale = Math.max(1, Math.min(4, z.scale + delta));
+          applyZ(targetId);
+        },
+        { passive: false }
+      );
+      if (targetId !== "cam-lightbox-img") {
+        vp.addEventListener("dblclick", () => openLightbox(targetId, title));
+      }
+      let panStart = null;
+      vp.addEventListener("pointerdown", (ev) => {
+        const z = getZ(targetId);
+        if (z.scale <= 1.01) return;
+        panStart = { x: ev.clientX - z.tx, y: ev.clientY - z.ty };
+        vp.setPointerCapture?.(ev.pointerId);
+        ev.preventDefault();
+      });
+      vp.addEventListener("pointermove", (ev) => {
+        if (!panStart) return;
+        const z = getZ(targetId);
+        const maxOff = 220 * (z.scale - 1);
+        z.tx = Math.max(-maxOff, Math.min(maxOff, ev.clientX - panStart.x));
+        z.ty = Math.max(-maxOff, Math.min(maxOff, ev.clientY - panStart.y));
+        applyZ(targetId);
+      });
+      const endPan = () => {
+        panStart = null;
+      };
+      vp.addEventListener("pointerup", endPan);
+      vp.addEventListener("pointercancel", endPan);
+    });
+  })();
+
+  // Tab 5 Horizontal Split Resizer (#collect-split-resizer)
+  (() => {
+    const resizer = $("collect-split-resizer");
+    const wrap = $("collect-split-wrap");
+    const leftCard = $("collect-episodes-card");
+    const rightCard = $("data-spec-card");
+    if (!resizer || !wrap || !leftCard || !rightCard) return;
+    let dragging = false;
+    resizer.addEventListener("pointerdown", (ev) => {
+      dragging = true;
+      resizer.classList.add("dragging");
+      resizer.setPointerCapture?.(ev.pointerId);
+      ev.preventDefault();
+    });
+    window.addEventListener("pointermove", (ev) => {
+      if (!dragging) return;
+      const rect = wrap.getBoundingClientRect();
+      if (rect.width < 400) return;
+      const pct = Math.max(30, Math.min(72, ((ev.clientX - rect.left) / rect.width) * 100));
+      leftCard.style.flex = `0 0 ${pct.toFixed(1)}%`;
+      rightCard.style.flex = "1 1 0%";
+    });
+    window.addEventListener("pointerup", () => {
+      if (!dragging) return;
+      dragging = false;
+      resizer.classList.remove("dragging");
+      if (state.selectedEpisode) {
+        inspectEpisode(state.selectedEpisode.dataset, state.selectedEpisode.episodeIndex);
+      } else {
+        renderLiveCollectWaveform();
+      }
+    });
+  })();
 
   $("btn-refresh-episodes")?.addEventListener("click", refreshEpisodes);
   $("btn-refresh-plugins")?.addEventListener("click", refreshPlugins);
 
-  // VLA 5-Step Prediction
+  // VLA Dataset Linkage & 5-Step Prediction
+  $("vla-dataset-select")?.addEventListener("change", (ev) => {
+    const opt = ev.target.selectedOptions?.[0];
+    const optTask = opt?.dataset?.task || "";
+    if (optTask && $("vla-prompt")) {
+      $("vla-prompt").value = optTask;
+    }
+    renderVLAConfigCards();
+  });
+
+  $("vla-prompt")?.addEventListener("input", renderVLAConfigCards);
+
   $("btn-vla-preview")?.addEventListener("click", async () => {
     ensureStageVisibleForAction();
     const endpoint = $("vla-endpoint")?.value || "ws://127.0.0.1:8000";

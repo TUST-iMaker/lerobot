@@ -278,7 +278,7 @@ class LeRobotStudioAdapter(ToolAdapter):
         }
 
     def build_launch_cmd(self, args: dict[str, Any]) -> list[str]:
-        display_mode = str(args.get("display_mode") or "rerun")
+        cal_dir = str(self.config.calibration_dir)
         return [
             sys.executable,
             "-m",
@@ -286,11 +286,12 @@ class LeRobotStudioAdapter(ToolAdapter):
             "--robot.type=so101_follower",
             f"--robot.port={self.config.follower_port}",
             f"--robot.id={self.config.follower_id}",
+            f"--robot.calibration_dir={cal_dir}",
             "--teleop.type=so101_leader",
             f"--teleop.port={self.config.leader_port}",
             f"--teleop.id={self.config.leader_id}",
+            f"--teleop.calibration_dir={cal_dir}",
             "--display_data=true",
-            f"--display_mode={display_mode}",
         ]
 
 

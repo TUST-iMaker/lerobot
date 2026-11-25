@@ -235,8 +235,7 @@
                     </select>
                     <button type="button" class="btn btn-xs btn-primary" data-testid="btn-start-calibrate" id="btn-start-calibrate">开始标定</button>
                     <button type="button" class="btn btn-xs btn-danger" data-testid="btn-stop-calibrate" id="btn-stop-calibrate">停止标定</button>
-                    <button type="button" class="btn btn-xs btn-secondary" id="btn-save-home-pose">存中位</button>
-                    <button type="button" class="btn btn-xs btn-secondary" id="btn-save-rest-pose">存休眠位</button>
+                    <button type="button" class="btn btn-xs btn-secondary" id="btn-save-rest-pose" title="将当前从臂折叠姿态保存为安全休眠位 (rest_pose.json)">存休眠位</button>
                   </div>
                 </div>
 
@@ -266,6 +265,20 @@
                       <tbody id="calibrate-live-tbody"></tbody>
                     </table>
                   </div>
+                </div>
+
+                <div class="cal-ascii-ref" data-testid="cal-ascii-ref">
+                  <div class="cal-ascii-header">
+                    <span>第 1 步 · 官方 URDF 标准中位 (0°) 侧视示意</span>
+                    <span class="mono-meta">大臂竖直向上 · 小臂与夹爪水平向前平直</span>
+                  </div>
+                  <pre class="cal-ascii-art">       [肘部 0°]━━━━━━━━[腕部 0°]━━━[夹爪水平向前]
+           ┃
+     大臂垂直向上 (0°)
+           ┃
+       [肩部 0°]
+         ┌─┴─┐
+     ════╧═══╧════  桌面 (底座居中 0°)</pre>
                 </div>
 
                 <div class="grid-3-compact mt-auto">
@@ -338,14 +351,30 @@
               </div>
               <div class="camera-grid-2">
                 <figure class="cam-box">
-                  <figcaption>Front Camera (前置全局)</figcaption>
-                  <div class="cam-frame">
+                  <figcaption class="cam-caption-bar">
+                    <span>Front Camera (前置全局)</span>
+                    <span class="cam-zoom-tools" data-cam-target="camera-preview-front" data-cam-title="前置相机 (Front)">
+                      <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-out" title="缩小">-</button>
+                      <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-reset" title="重置 100%">100%</button>
+                      <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-in" title="放大">+</button>
+                      <button type="button" class="btn btn-xs btn-secondary btn-cam-expand" title="大窗查看">放大</button>
+                    </span>
+                  </figcaption>
+                  <div class="cam-frame cam-zoom-viewport" data-cam-target="camera-preview-front" data-cam-title="前置相机 (Front)">
                     <img data-testid="camera-preview-front" id="camera-preview-front" alt="Front Camera Live Stream" />
                   </div>
                 </figure>
                 <figure class="cam-box">
-                  <figcaption>Wrist Camera (腕部手眼)</figcaption>
-                  <div class="cam-frame">
+                  <figcaption class="cam-caption-bar">
+                    <span>Wrist Camera (腕部手眼)</span>
+                    <span class="cam-zoom-tools" data-cam-target="camera-preview-wrist" data-cam-title="腕部相机 (Wrist)">
+                      <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-out" title="缩小">-</button>
+                      <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-reset" title="重置 100%">100%</button>
+                      <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-in" title="放大">+</button>
+                      <button type="button" class="btn btn-xs btn-secondary btn-cam-expand" title="大窗查看">放大</button>
+                    </span>
+                  </figcaption>
+                  <div class="cam-frame cam-zoom-viewport" data-cam-target="camera-preview-wrist" data-cam-title="腕部相机 (Wrist)">
                     <img data-testid="camera-preview-wrist" id="camera-preview-wrist" alt="Wrist Camera Live Stream" />
                   </div>
                 </figure>
@@ -422,6 +451,10 @@
             <div class="card ik-bar-card">
               <div class="ik-coord-bar">
                 <strong id="ik-target-arm-label">末端 XYZ 坐标 IK (mm)</strong>
+                <select id="sim-ik-arm-select" aria-label="IK Target Arm" style="width:92px">
+                  <option value="follower">从臂</option>
+                  <option value="leader">主臂</option>
+                </select>
                 <label><span>X</span><input id="ik-x" type="number" value="391" step="5" /></label>
                 <label><span>Y</span><input id="ik-y" type="number" value="0" step="5" /></label>
                 <label><span>Z</span><input id="ik-z" type="number" value="226" step="5" /></label>
@@ -535,12 +568,16 @@
                   <span id="collect-progress-text" class="mono-meta">待机（未在采集）</span>
                 </div>
                 <div class="btn-group">
+                  <span id="collect-live-actions" class="btn-group" hidden>
+                    <button type="button" class="btn btn-xs btn-secondary" id="btn-collect-next" title="提前保存当前回合 (快捷键 →)">完成本条 (→)</button>
+                    <button type="button" class="btn btn-xs btn-secondary" id="btn-collect-rerecord" title="丢弃当前回合重录 (快捷键 ←)">重录本条 (←)</button>
+                  </span>
                   <button type="button" class="btn btn-xs btn-primary" data-testid="btn-start-collect" id="btn-start-collect">开始采集</button>
                   <button type="button" class="btn btn-xs btn-danger" data-testid="btn-stop-collect" id="btn-stop-collect">停止采集</button>
                 </div>
               </div>
 
-              <div class="form-grid-4">
+              <div class="form-grid-6">
                 <label>
                   <span>数据集名称 (禁用 eval_)</span>
                   <input id="collect-dataset" type="text" value="yyzmiao_pick_cube_demo" />
@@ -551,7 +588,15 @@
                 </label>
                 <label>
                   <span>回合数</span>
-                  <input id="collect-episodes" type="number" min="1" max="100" value="2" />
+                  <input id="collect-episodes" type="number" min="1" max="100" value="5" />
+                </label>
+                <label>
+                  <span>单回合时长(s, 0=不限)</span>
+                  <input id="collect-ep-time" type="number" min="0" max="600" value="30" />
+                </label>
+                <label>
+                  <span>复位间隔(s)</span>
+                  <input id="collect-reset-time" type="number" min="0" max="60" value="3" />
                 </label>
                 <label>
                   <span>帧率 (FPS)</span>
@@ -561,8 +606,42 @@
               <div id="collect-stick-data" class="telemetry-strip-wrap"></div>
             </div>
 
-            <div class="cockpit-split">
-              <div class="card flex-card">
+            <!-- Permanent Non-Collapsible 1:1 Native Aspect-Ratio Dual Camera Strip (Resizable + Zoomable) -->
+            <div class="collect-cameras-grid" id="collect-cameras-strip" data-testid="collect-cameras-strip">
+              <div class="card collect-cam-card">
+                <div class="panel-header">
+                  <h4>前置相机 (Front · 原比例)</h4>
+                  <span class="cam-zoom-tools" data-cam-target="collect-cam-front" data-cam-title="前置相机 (Front)">
+                    <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-out" title="缩小">-</button>
+                    <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-reset" title="重置 100%">100%</button>
+                    <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-in" title="放大">+</button>
+                    <button type="button" class="btn btn-xs btn-secondary btn-cam-expand" title="全屏大窗查看">放大</button>
+                  </span>
+                </div>
+                <div class="collect-cam-frame cam-zoom-viewport" data-cam-target="collect-cam-front" data-cam-title="前置相机 (Front)">
+                  <img id="collect-cam-front" data-testid="collect-cam-front" alt="前置相机实时画面" />
+                </div>
+              </div>
+              <div class="card collect-cam-card">
+                <div class="panel-header">
+                  <h4>腕部相机 (Wrist · 原比例)</h4>
+                  <span class="cam-zoom-tools" data-cam-target="collect-cam-wrist" data-cam-title="腕部相机 (Wrist)">
+                    <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-out" title="缩小">-</button>
+                    <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-reset" title="重置 100%">100%</button>
+                    <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-in" title="放大">+</button>
+                    <button type="button" class="btn btn-xs btn-secondary btn-cam-expand" title="全屏大窗查看">放大</button>
+                  </span>
+                </div>
+                <div class="collect-cam-frame cam-zoom-viewport" data-cam-target="collect-cam-wrist" data-cam-title="腕部相机 (Wrist)">
+                  <img id="collect-cam-wrist" data-testid="collect-cam-wrist" alt="腕部相机实时画面" />
+                </div>
+              </div>
+            </div>
+
+            <div class="split-resizer-h" id="collect-cam-resizer" data-testid="collect-cam-resizer" title="拖拽上下调整双路相机画面高度"></div>
+
+            <div class="collect-split-wrap" id="collect-split-wrap">
+              <div class="card flex-card" id="collect-episodes-card" style="flex:1 1 52%;min-width:280px">
                 <div class="panel-header">
                   <h3>已落盘 Episode 列表</h3>
                   <button type="button" class="btn btn-xs btn-secondary" id="btn-refresh-episodes">刷新列表</button>
@@ -570,7 +649,7 @@
                 <div class="table-wrap flex-table">
                   <table>
                     <thead>
-                      <tr><th>数据集</th><th>Episode</th><th>任务指令</th><th>帧数/FPS</th><th>路径</th><th>操作</th></tr>
+                      <tr><th>数据集</th><th>Episode</th><th>任务指令</th><th>帧数/FPS</th><th>来源</th><th>操作</th></tr>
                     </thead>
                     <tbody id="episodes-tbody">
                       <tr><td colspan="6" class="muted">暂无已保存的 Episode。</td></tr>
@@ -579,22 +658,47 @@
                 </div>
               </div>
 
-              <div class="card spec-box" data-testid="data-spec-card" id="data-spec-card">
+              <div class="split-resizer-v" id="collect-split-resizer" data-testid="collect-split-resizer" title="拖拽调整 Episode 列表与数据检视器的左右宽度"></div>
+
+              <div class="card flex-card ep-inspector-card" data-testid="data-spec-card" id="data-spec-card" style="flex:1 1 48%;min-width:260px">
                 <div class="panel-header">
-                  <strong>LeRobotDataset v3.0 规范 (v0.7.1)</strong>
-                  <span id="spec-check-badge" class="status-tag tag-ok">规范校验: 通过</span>
+                  <div class="btn-group">
+                    <h3>6-DOF 数据波形与检视器</h3>
+                    <span class="mono-meta" style="font-size:11px">LeRobotDataset v3.0 · Parquet + MP4</span>
+                  </div>
+                  <div class="btn-group">
+                    <button type="button" class="btn btn-xs btn-secondary" id="btn-inspector-live" hidden>切回实时曲线</button>
+                    <span id="spec-check-badge" class="status-tag tag-ok">规范校验: 通过</span>
+                  </div>
                 </div>
-                <ul class="spec-list">
-                  <li><strong>目录结构</strong>：<code>meta/info.json</code> + <code>meta/stats.json</code> + <code>meta/tasks.parquet</code> + <code>data/chunk-000/file-000.parquet</code> + <code>videos/&lt;key&gt;/chunk-000/file-000.mp4</code>。</li>
-                  <li><strong>6-DOF 特征</strong>：<code>observation.state</code> &amp; <code>action</code> (<code>float32[6]</code>: <code>shoulder_pan..wrist_roll</code> 角度 + <code>gripper</code> <code>0..100%</code>)。</li>
-                  <li><strong>云端协同</strong>：<code>repo_id="${HF_USER}/&lt;name&gt;"</code>，严禁 <code>eval_</code> 前缀。</li>
-                </ul>
+                <div id="ep-inspector-body" class="ep-inspector-body">
+                  <div class="ep-inspector-meta" id="ep-inspector-meta">
+                    <span class="chip chip-ok" id="ep-inspector-mode-chip">实时曲线 (Live)</span>
+                    <span class="chip" id="ep-inspector-live-stat">等待采集帧...</span>
+                  </div>
+                  <div class="ep-waveform-wrap">
+                    <canvas id="ep-waveform-canvas" class="ep-waveform-canvas" width="520" height="175"></canvas>
+                  </div>
+                  <div id="ep-video-box" class="ep-video-grid" hidden></div>
+                  <div class="btn-group mt-6" id="ep-inspector-actions" hidden>
+                    <button type="button" class="btn btn-xs btn-primary" id="btn-inspector-replay">3D 舞台回放</button>
+                    <button type="button" class="btn btn-xs btn-danger" id="btn-inspector-delete">删除此条</button>
+                  </div>
+                </div>
               </div>
             </div>
           </section>
 
           <!-- 6. Open-Source Datasets & Servo Diagnostics / External Plugins (Cleanly Decoupled) -->
           <section id="panel-plugins" class="tab-panel" role="tabpanel" hidden>
+            <div class="workflow-guide-bar" data-testid="plugins-guide-bar">
+              <strong>使用流程:</strong>
+              <span>1. 在下方选开源数据集点「3D 演练」验证动作</span>
+              <span>→</span>
+              <span>2. 点「填入配置」同步至「5. 数据采集」与「7. VLA 训练」</span>
+              <span>→</span>
+              <span>3. 需要高级工具时点下方「启动」（启动真机插件会自动让出串口，停止后自动恢复）</span>
+            </div>
             <!-- Section A: Open-Source Dataset Library & 3D Trajectory Player -->
             <div class="card">
               <div class="panel-header">
@@ -643,12 +747,27 @@
 
           <!-- 7. VLA Policy & Cloud Training -->
           <section id="panel-vla" class="tab-panel" role="tabpanel" hidden>
+            <div class="workflow-guide-bar" data-testid="vla-guide-bar">
+              <strong>训练闭环:</strong>
+              <span>1. 下拉选择 Tab 5 已采数据集</span>
+              <span>→</span>
+              <span>2. 点「复制训练命令」到 Ubuntu GPU 运行（ACT / SmolVLA / π0 / π0.5）</span>
+              <span>→</span>
+              <span>3. 训练完成后点「复制真机推理命令」在机械臂上闭环评估</span>
+            </div>
+
             <div class="card">
               <div class="panel-header">
-                <h3>VLA / OpenPI 5 步 Action Chunk 预测预演</h3>
+                <h3>1. 选择训练数据集 &amp; 5 步 Action Chunk 预演</h3>
                 <button type="button" class="btn btn-xs btn-primary" data-testid="btn-vla-preview" id="btn-vla-preview">生成 5 步 6-DOF 预测预览</button>
               </div>
-              <div class="form-grid-3">
+              <div class="form-grid-4">
+                <label>
+                  <span>已采数据集 (自动联动下方命令)</span>
+                  <select id="vla-dataset-select" data-testid="vla-dataset-select">
+                    <option value="yyzmiao_pick_cube_demo">yyzmiao_pick_cube_demo (默认)</option>
+                  </select>
+                </label>
                 <label>
                   <span>策略服务端点 (WebSocket)</span>
                   <input id="vla-endpoint" type="text" value="ws://127.0.0.1:8000" />
@@ -723,8 +842,27 @@
       </div>
       <pre data-testid="log-console" id="log-console" class="log-console"></pre>
     </aside>
+    <!-- Fixed Overlay 3: Camera Lightbox Full-View Zoom Modal -->
+    <div id="cam-lightbox-modal" class="cam-lightbox" hidden>
+      <div class="cam-lightbox-panel">
+        <div class="panel-header">
+          <strong id="cam-lightbox-title">相机大窗实时视图</strong>
+          <div class="btn-group">
+            <span class="cam-zoom-tools" data-cam-target="cam-lightbox-img" data-cam-title="">
+              <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-out" title="缩小">-</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-reset" title="重置 100%">100%</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-cam-zoom-in" title="放大">+</button>
+            </span>
+            <button type="button" class="btn btn-xs btn-danger" id="btn-cam-lightbox-close">关闭 (ESC)</button>
+          </div>
+        </div>
+        <div class="cam-lightbox-viewport cam-zoom-viewport" data-cam-target="cam-lightbox-img">
+          <img id="cam-lightbox-img" alt="Camera Full View" />
+        </div>
+      </div>
+    </div>
   </div>
 
-  <script type="module" src="/static/app.js?v=2026112305"></script>
+  <script type="module" src="/static/app.js?v=2026112403"></script>
 </body>
 </html>
