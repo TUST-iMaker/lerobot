@@ -480,7 +480,7 @@ export class StickArmCanvas {
       if (ev.button === 0 && this.enableIkDrag && this._lastTcpScreen) {
         const dx = pos.x - this._lastTcpScreen.x;
         const dy = pos.y - this._lastTcpScreen.y;
-        if (Math.hypot(dx, dy) <= 26) {
+        if (Math.hypot(dx, dy) <= 36) {
           const fk = computeStickFK(this.joints);
           this._dragMode = "ik";
           this._dragStartMouse = pos;
@@ -755,16 +755,17 @@ export class StickArmCanvas {
       const targetCenter = { x: pTcp.x, y: pTcp.y };
       this._lastTcpScreen = targetCenter;
       if (this.enableIkDrag) {
+        const ringR = Math.max(18, 22 * zScale);
         ctx.beginPath();
-        ctx.arc(targetCenter.x, targetCenter.y, 13 * zScale, 0, Math.PI * 2);
-        ctx.fillStyle = isDark ? "rgba(239, 68, 68, 0.20)" : "rgba(220, 38, 38, 0.12)";
+        ctx.arc(targetCenter.x, targetCenter.y, ringR, 0, Math.PI * 2);
+        ctx.fillStyle = isDark ? "rgba(239, 68, 68, 0.22)" : "rgba(220, 38, 38, 0.14)";
         ctx.fill();
-        ctx.lineWidth = 1.75;
+        ctx.lineWidth = 2.4;
         ctx.strokeStyle = isDark ? "#EF4444" : "#DC2626";
         ctx.stroke();
 
         ctx.beginPath();
-        ctx.arc(targetCenter.x, targetCenter.y, 3, 0, Math.PI * 2);
+        ctx.arc(targetCenter.x, targetCenter.y, 4.5, 0, Math.PI * 2);
         ctx.fillStyle = isDark ? "#EF4444" : "#DC2626";
         ctx.fill();
       }
