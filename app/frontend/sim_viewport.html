@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Arm101 Virtual Hardware Twin — 独立仿真机械臂</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http%3A//www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%230284c7'/%3E%3Cpath d='M4 19h16M7 19v-4l4-6 4 3 3-5' fill='none' stroke='%23ffffff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='11' cy='9' r='1.8' fill='%23ffffff'/%3E%3Ccircle cx='18' cy='7' r='1.8' fill='%23ffffff'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/styles.css?v=2026112304" />
+  <link rel="stylesheet" href="/static/styles.css?v=2026112305" />
 </head>
 <body class="sim-twin-body">
   <div class="sim-twin-shell">
@@ -23,8 +23,12 @@
         <span id="twin-sync-badge" class="status-tag tag-ok">与主程序实时联动中</span>
       </div>
 
-      <!-- Shared 3D Camera Control Bar -->
+      <!-- Layout Switcher + Shared 3D Camera Control Bar -->
       <div class="stage-cam-bar" role="toolbar" aria-label="3D Camera View Controls">
+        <button type="button" class="btn btn-xs btn-primary btn-twin-layout" data-testid="btn-layout-dual" data-layout="dual">双臂视图</button>
+        <button type="button" class="btn btn-xs btn-secondary btn-twin-layout" data-testid="btn-layout-quad-follower" data-layout="quad-follower">从臂四视图</button>
+        <button type="button" class="btn btn-xs btn-secondary btn-twin-layout" data-testid="btn-layout-quad-leader" data-layout="quad-leader">主臂四视图</button>
+        <span class="sb-sep">|</span>
         <button type="button" class="btn btn-xs btn-secondary btn-cam-preset" data-view="iso">轴测</button>
         <button type="button" class="btn btn-xs btn-secondary btn-cam-preset" data-view="front">正视</button>
         <button type="button" class="btn btn-xs btn-secondary btn-cam-preset" data-view="side">侧视</button>
@@ -48,9 +52,9 @@
       </div>
     </header>
 
-    <!-- Full-Height Dual-Arm 3D Interactive Stage -->
+    <!-- Full-Height Interactive Stage: Dual-Arm OR Single-Arm 4-View Quad -->
     <main class="sim-twin-main">
-      <div class="sim-twin-grid">
+      <div id="sim-twin-dual" class="sim-twin-grid">
         <section class="card sim-twin-pane">
           <div class="panel-header">
             <h3>Leader Arm (主臂操控端)</h3>
@@ -73,6 +77,58 @@
           <div id="twin-follower-strip" class="telemetry-strip-wrap"></div>
         </section>
       </div>
+
+      <div id="sim-twin-quad" class="sim-twin-quad-wrap" hidden>
+        <div class="sim-twin-quad-grid">
+          <section class="card sim-twin-pane">
+            <div class="panel-header">
+              <h3>轴测视图 (Iso)</h3>
+              <span class="status-tag tag-mono">X/Y 水平拖曳 · Shift+Z</span>
+            </div>
+            <div class="viewport-box viewport-box-flex">
+              <canvas id="canvas-quad-iso" data-testid="canvas-quad-iso" class="stick-canvas" width="480" height="320"></canvas>
+            </div>
+          </section>
+
+          <section class="card sim-twin-pane">
+            <div class="panel-header">
+              <h3>正视图 (Front)</h3>
+              <span class="status-tag tag-mono">Y/Z 平面拖曳</span>
+            </div>
+            <div class="viewport-box viewport-box-flex">
+              <canvas id="canvas-quad-front" data-testid="canvas-quad-front" class="stick-canvas" width="480" height="320"></canvas>
+            </div>
+          </section>
+
+          <section class="card sim-twin-pane">
+            <div class="panel-header">
+              <h3>侧视图 (Side)</h3>
+              <span class="status-tag tag-mono">X/Z 平面拖曳</span>
+            </div>
+            <div class="viewport-box viewport-box-flex">
+              <canvas id="canvas-quad-side" data-testid="canvas-quad-side" class="stick-canvas" width="480" height="320"></canvas>
+            </div>
+          </section>
+
+          <section class="card sim-twin-pane">
+            <div class="panel-header">
+              <h3>俯视图 (Top)</h3>
+              <span class="status-tag tag-mono">X/Y 平面拖曳</span>
+            </div>
+            <div class="viewport-box viewport-box-flex">
+              <canvas id="canvas-quad-top" data-testid="canvas-quad-top" class="stick-canvas" width="480" height="320"></canvas>
+            </div>
+          </section>
+        </div>
+
+        <div class="card sim-twin-quad-footer">
+          <div class="sim-twin-quad-meta">
+            <strong id="quad-arm-title">Follower 从臂 · 四视图同步</strong>
+            <span id="quad-tcp-readout" class="status-tag tag-mono">TCP 391, 0, 226 mm</span>
+          </div>
+          <div id="quad-telemetry-strip" class="telemetry-strip-wrap"></div>
+        </div>
+      </div>
     </main>
 
     <footer class="statusbar">
@@ -91,6 +147,6 @@
     </footer>
   </div>
 
-  <script type="module" src="/static/sim_viewport.js?v=2026112304"></script>
+  <script type="module" src="/static/sim_viewport.js?v=2026112305"></script>
 </body>
 </html>

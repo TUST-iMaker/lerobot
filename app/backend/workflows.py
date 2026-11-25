@@ -205,6 +205,7 @@ class WorkflowManager:
             "live_table": {},
             "saved_path": None,
         }
+        self._linear_teach_ctx: dict[str, Any] | None = None
 
     def get_calibration_snapshot(self) -> dict[str, Any]:
         table_rows = [
@@ -565,6 +566,30 @@ class WorkflowManager:
             cmd.append(f"--robot.cameras={json.dumps(cams, separators=(',', ':'))}")
         return cmd
 
+    def build_replay_cmd(
+        self,
+        *,
+        dataset_name: str,
+        episode: int = 0,
+        fps: int = 30,
+    ) -> list[str]:
+        f_cal = str(self.config.calibration_dir / "robots" / "so_follower")
+        ds_root = self.config.datasets_dir / dataset_name
+        return [
+            sys.executable,
+            "-m",
+            "lerobot.scripts.lerobot_replay",
+            "--robot.type=so101_follower",
+            f"--robot.port={self.config.follower_port}",
+            f"--robot.id={self.config.follower_id}",
+            f"--robot.calibration_dir={f_cal}",
+            f"--dataset.repo_id=local/{dataset_name}",
+            f"--dataset.root={ds_root}",
+            f"--dataset.episode={episode}",
+            f"--dataset.fps={fps}",
+            "--play_sounds=false",
+        ]
+
     # ------------------------------------------------------------------
     # Calibrate
     # ------------------------------------------------------------------
@@ -620,7 +645,7 @@ class WorkflowManager:
                 self._cal_state["stage"] = "waiting_middle"
                 self._cal_state["allow_recalibrate"] = False
                 self._cal_state["prompt"] = (
-                    "第 1 步（中位归零）：请用手将机械臂所有关节摆到活动范围正中间，"
+                    "第 1 步（中位归零）：请用手将机械臂摆成官方中位——底座居中、大臂垂直向上、小臂与夹爪水平向前平直（与灰虚线一致），"
                     "然后点击【确认 / 下一步 (Enter)】。"
                 )
             else:
@@ -700,6 +725,7 @@ class WorkflowManager:
             "live_table": {},
             "saved_path": None,
         }
+        self._linear_teach_ctx: dict[str, Any] | None = None
 
         if self.hardware.active_mode == "real":
             self.bridge.disconnect(return_to_rest=False, keep_torque=False)
@@ -1123,6 +1149,339 @@ class WorkflowManager:
         self._notify_motion()
         self.log("Cleared all teaching waypoints.")
         return {"status": "cleared", "count": 0}
+
+    # ------------------------------------------------------------------
+    # Official Continuous Trajectory Teaching & Linear Replay (lerobot-record / lerobot-replay)
+    # ------------------------------------------------------------------
+    def _linear_dry_dir(self) -> Path:
+        p = self.config.dry_run_dir / "linear_teach"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def list_linear_trajectories(self) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        # 1. Real official LeRobot datasets under data/datasets/
+        if self.config.datasets_dir.exists():
+            for ds_dir in sorted(self.config.datasets_dir.iterdir()):
+                if not ds_dir.is_dir():
+                    continue
+                info_p = ds_dir / "meta" / "info.json"
+                total_eps = 1
+                fps = 30
+                total_frames = 0
+                if info_p.exists():
+                    try:
+                        info = json.loads(info_p.read_text(encoding="utf-8"))
+                        total_eps = max(1, int(info.get("total_episodes", 1)))
+                        fps = int(info.get("fps", 30))
+                        total_frames = int(info.get("total_frames", 0))
+                    except Exception:
+                        pass
+                for ep in range(total_eps):
+                    cmd = self.build_replay_cmd(dataset_name=ds_dir.name, episode=ep, fps=fps)
+                    items.append(
+                        {
+                            "name": ds_dir.name,
+                            "episode": ep,
+                            "mode": "real",
+                            "fps": fps,
+                            "frames": total_frames,
+                            "path": str(ds_dir),
+                            "replay_cmd": " ".join(cmd),
+                        }
+                    )
+
+        # 2. Dry-run continuous trajectories under data/dry_run/linear_teach/
+        dry_dir = self._linear_dry_dir()
+        for f in sorted(dry_dir.glob("*.json")):
+            try:
+                payload = json.loads(f.read_text(encoding="utf-8"))
+                name = str(payload.get("name") or f.stem)
+                ep = int(payload.get("episode", 0))
+                fps = int(payload.get("fps", 20))
+                frames = len(payload.get("frames", []))
+                cmd = self.build_replay_cmd(dataset_name=name, episode=ep, fps=fps)
+                items.append(
+                    {
+                        "name": name,
+                        "episode": ep,
+                        "mode": "dry_run",
+                        "fps": fps,
+                        "frames": frames,
+                        "path": str(f),
+                        "replay_cmd": " ".join(cmd),
+                    }
+                )
+            except Exception:
+                continue
+
+        return {
+            "mode": self.hardware.active_mode,
+            "active_workflow": self.active_workflow,
+            "trajectories": items,
+            "count": len(items),
+        }
+
+    def _flush_linear_dry_trajectory(self) -> dict[str, Any] | None:
+        ctx = self._linear_teach_ctx
+        if not ctx:
+            return None
+        frames = ctx.get("frames", [])
+        if not frames:
+            return None
+        name = str(ctx["name"])
+        ep = int(ctx.get("episode", 0))
+        fps = int(ctx.get("fps", 20))
+        out_file = self._linear_dry_dir() / f"{name}_ep{ep:04d}.json"
+        payload = {
+            "name": name,
+            "episode": ep,
+            "fps": fps,
+            "num_frames": len(frames),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "frames": frames,
+        }
+        out_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._linear_teach_ctx = None
+        return {
+            "name": name,
+            "episode": ep,
+            "fps": fps,
+            "frames": len(frames),
+            "path": str(out_file),
+        }
+
+    async def start_linear_teach(
+        self,
+        *,
+        name: str = "demo_linear_01",
+        duration_s: float = 30.0,
+        fps: int = 30,
+    ) -> dict[str, Any]:
+        self._sync_process_state()
+        safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.strip() or "demo_linear_01")
+        await self._ensure_idle()
+        self.last_error = None
+        self.active_workflow = "linear_teach"
+        self.state = "running"
+        self.current_step = 0
+
+        if self.hardware.active_mode == "real":
+            if not self.hardware.dual_arm_ready:
+                self.active_workflow = "idle"
+                self.state = "idle"
+                raise WorkflowConflictError(
+                    "真机连续示教需要主臂与从臂同时连接。", code="DUAL_ARM_REQUIRED"
+                )
+            self._camera_hub.release_all()
+            self.bridge.disconnect(return_to_rest=False, keep_torque=False)
+            cmd = self.build_record_cmd(
+                dataset_name=safe_name,
+                single_task="linear teaching demo",
+                num_episodes=1,
+                episode_time_s=duration_s,
+                reset_time_s=3.0,
+                fps=fps,
+                push_to_hub=False,
+            )
+            env = {
+                "PYTHONPATH": str(self.config.repos_dir / "lerobot" / "src"),
+                "PYTHONUNBUFFERED": "1",
+            }
+            managed = self.process_registry.spawn(
+                "linear_teach",
+                "lerobot-record (linear teach)",
+                cmd,
+                cwd=self.config.workspace_root,
+                env=env,
+                on_line=self.log,
+            )
+            self._active_proc_id = "linear_teach"
+            self.log(f"Started official lerobot-record linear teaching '{safe_name}' (pid={managed.proc.pid}).")
+            return {
+                "status": "recording",
+                "mode": "real",
+                "workflow": "linear_teach",
+                "name": safe_name,
+                "duration_s": duration_s,
+                "fps": fps,
+                "command": cmd,
+                "pid": managed.proc.pid,
+            }
+
+        # dry_run mode: continuous 20 Hz trajectory capture (follows user moves or gentle demo sweep)
+        sim_fps = min(20, max(10, int(fps)))
+        self._linear_teach_ctx = {
+            "name": safe_name,
+            "episode": 0,
+            "fps": sim_fps,
+            "frames": [],
+        }
+        self.log(f"Started dry_run linear teaching '{safe_name}' ({duration_s}s @ {sim_fps}Hz).")
+
+        async def _sim_linear_record() -> None:
+            dt = 1.0 / sim_fps
+            max_frames = max(10, int(duration_s * sim_fps))
+            try:
+                for i in range(max_frames):
+                    _, f_j, _ = self.simulator.snapshot()
+                    if self._linear_teach_ctx is not None:
+                        self._linear_teach_ctx["frames"].append(dict(f_j))
+                    self.current_step = i + 1
+                    await asyncio.sleep(dt)
+                saved = self._flush_linear_dry_trajectory()
+                if saved:
+                    self.log(f"Saved dry_run linear trajectory '{saved['name']}' ({saved['frames']} frames).")
+            except asyncio.CancelledError:
+                saved = self._flush_linear_dry_trajectory()
+                if saved:
+                    self.log(f"Stopped & saved dry_run linear trajectory '{saved['name']}' ({saved['frames']} frames).")
+                raise
+            finally:
+                if self.active_workflow == "linear_teach":
+                    self.active_workflow = "idle"
+                    self.state = "idle"
+
+        self._task = asyncio.create_task(_sim_linear_record())
+        return {
+            "status": "recording",
+            "mode": "dry_run",
+            "workflow": "linear_teach",
+            "name": safe_name,
+            "duration_s": duration_s,
+            "fps": sim_fps,
+            "command": self.build_record_cmd(
+                dataset_name=safe_name,
+                single_task="linear teaching demo",
+                num_episodes=1,
+                episode_time_s=duration_s,
+                reset_time_s=3.0,
+                fps=fps,
+                push_to_hub=False,
+            ),
+        }
+
+    async def stop_linear_teach(self) -> dict[str, Any]:
+        saved: dict[str, Any] | None = None
+        if self._active_proc_id == "linear_teach":
+            self.process_registry.terminate("linear_teach")
+            self._active_proc_id = None
+        if self.active_workflow == "linear_teach":
+            await self._cancel_background_task()
+            saved = self._flush_linear_dry_trajectory()
+            self.active_workflow = "idle"
+            self.state = "idle"
+        self.log("Stopped linear teaching.")
+        return {"status": "stopped", "workflow": "idle", "saved": saved}
+
+    async def replay_linear_teach(
+        self,
+        *,
+        name: str,
+        episode: int = 0,
+        fps: int = 30,
+    ) -> dict[str, Any]:
+        self._sync_process_state()
+        safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.strip())
+        if not safe_name:
+            raise WorkflowConflictError("请先选择要线性回放的轨迹名称。", code="NO_TRAJECTORY")
+        await self._ensure_idle()
+        self.last_error = None
+
+        if self.hardware.active_mode == "real":
+            ds_dir = self.config.datasets_dir / safe_name
+            if not ds_dir.exists():
+                raise WorkflowConflictError(
+                    f"未找到真机轨迹数据集目录: {ds_dir}，请先在真机模式下完成一次连续示教录制。",
+                    code="TRAJECTORY_NOT_FOUND",
+                )
+            self._camera_hub.release_all()
+            self.bridge.disconnect(return_to_rest=False, keep_torque=False)
+            cmd = self.build_replay_cmd(dataset_name=safe_name, episode=episode, fps=fps)
+            env = {
+                "PYTHONPATH": str(self.config.repos_dir / "lerobot" / "src"),
+                "PYTHONUNBUFFERED": "1",
+            }
+            managed = self.process_registry.spawn(
+                "linear_replay",
+                "lerobot-replay",
+                cmd,
+                cwd=self.config.workspace_root,
+                env=env,
+                on_line=self.log,
+            )
+            self._active_proc_id = "linear_replay"
+            self.active_workflow = "linear_replay"
+            self.state = "running"
+            self.log(f"Started official lerobot-replay '{safe_name}' ep={episode} (pid={managed.proc.pid}).")
+            return {
+                "status": "replaying",
+                "mode": "real",
+                "workflow": "linear_replay",
+                "name": safe_name,
+                "episode": episode,
+                "command": cmd,
+                "pid": managed.proc.pid,
+            }
+
+        # dry_run mode: linear frame-by-frame playback on 3D simulator
+        dry_file = self._linear_dry_dir() / f"{safe_name}_ep{episode:04d}.json"
+        if not dry_file.exists():
+            raise WorkflowConflictError(
+                f"未找到模拟连续轨迹文件: {dry_file.name}，请先点击「开始连续示教」录制一段轨迹。",
+                code="TRAJECTORY_NOT_FOUND",
+            )
+        payload = json.loads(dry_file.read_text(encoding="utf-8"))
+        frames = payload.get("frames", [])
+        rec_fps = max(5, int(payload.get("fps", fps)))
+        if not frames:
+            raise WorkflowConflictError("该轨迹文件帧数为 0，无法回放。", code="EMPTY_TRAJECTORY")
+
+        self.active_workflow = "linear_replay"
+        self.state = "running"
+        self.current_step = 0
+        self.log(f"Replaying dry_run linear trajectory '{safe_name}' ({len(frames)} frames @ {rec_fps}Hz).")
+
+        async def _sim_linear_replay() -> None:
+            dt = 1.0 / rec_fps
+            try:
+                for i, frame in enumerate(frames):
+                    self.simulator.set_leader_joints(frame, step_immediately=False)
+                    self.simulator.set_follower_joints(frame)
+                    self._notify_motion()
+                    self.current_step = i + 1
+                    await asyncio.sleep(dt)
+                self.log(f"Finished dry_run linear replay '{safe_name}'.")
+            except asyncio.CancelledError:
+                self.log("Stopped linear replay.")
+                raise
+            finally:
+                if self.active_workflow == "linear_replay":
+                    self.active_workflow = "idle"
+                    self.state = "idle"
+
+        self._task = asyncio.create_task(_sim_linear_replay())
+        return {
+            "status": "replaying",
+            "mode": "dry_run",
+            "workflow": "linear_replay",
+            "name": safe_name,
+            "episode": episode,
+            "frames": len(frames),
+            "fps": rec_fps,
+            "command": self.build_replay_cmd(dataset_name=safe_name, episode=episode, fps=fps),
+        }
+
+    async def stop_linear_replay(self) -> dict[str, Any]:
+        if self._active_proc_id == "linear_replay":
+            self.process_registry.terminate("linear_replay")
+            self._active_proc_id = None
+        if self.active_workflow == "linear_replay":
+            await self._cancel_background_task()
+            self.active_workflow = "idle"
+            self.state = "idle"
+        self.log("Stopped linear replay.")
+        return {"status": "stopped", "workflow": "idle"}
 
     # ------------------------------------------------------------------
     # Data Collection
